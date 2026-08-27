@@ -1,0 +1,7 @@
+{
+  "name": "enprato-site",
+  "private": true,
+  "scripts": {
+    "build": "npm --prefix frontend ci && npm --prefix frontend run build"
+  }
+}
