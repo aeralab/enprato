@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Enprato</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <header class="topbar">
+        <div>
+          <h1>Enprato</h1>
+          <p>英语视频逐句听写、核对、生词标注与跟读评分</p>
+        </div>
+        <div class="import-row">
+          <label class="file-button">
+            <span>导入视频</span>
+            <input id="videoInput" type="file" accept="video/*" />
+          </label>
+          <label class="file-button">
+            <span>导入字幕</span>
+            <input id="subtitleInput" type="file" accept=".srt,.vtt,text/vtt,text/plain" />
+          </label>
+        </div>
+      </header>
+
+      <section class="workspace" aria-label="听写工作区">
+        <section class="video-pane">
+          <div class="video-frame">
+            <video id="video" controls playsinline></video>
+            <div id="subtitleOverlay" class="subtitle-overlay" aria-live="polite"></div>
+            <div id="emptyVideo" class="empty-video">
+              <strong>导入英语视频开始练习</strong>
+              <span>建议同时导入 SRT 或 VTT 英文字幕，用于自动逐句暂停和核对。</span>
+            </div>
+          </div>
+
+          <div class="transport">
+            <button id="playSentenceBtn" type="button">播放本句</button>
+            <button id="repeatBtn" type="button">重复本句</button>
+            <button id="prevBtn" type="button">上一句</button>
+            <button id="nextBtn" type="button">下一句</button>
+            <label class="toggle">
+              <input id="autoPauseToggle" type="checkbox" checked />
+              <span>每句结束自动暂停</span>
+            </label>
+          </div>
+
+          <div class="cue-strip">
+            <span id="cueCounter">0 / 0</span>
+            <p id="currentCue">导入字幕后会在这里显示当前句子。第一遍默认隐藏视频字幕。</p>
+          </div>
+        </section>
+
+        <aside class="study-pane">
+          <div class="tabs" role="tablist" aria-label="练习模式">
+            <button id="dictationTab" class="tab active" type="button">听写</button>
+            <button id="shadowTab" class="tab" type="button">跟读评分</button>
+          </div>
+
+          <section id="dictationPanel" class="panel active" aria-label="听写">
+            <div class="panel-head">
+              <div>
+                <h2>听写输入</h2>
+                <p>先隐藏字幕听写，完成后再显示英文字幕核对。</p>
+              </div>
+              <button id="speechBtn" class="primary" type="button">开始语音输入</button>
+            </div>
+
+            <textarea id="dictationInput" spellcheck="true" placeholder="听完一句后，用语音输入或手动输入你听到的英文。"></textarea>
+
+            <div class="action-grid">
+              <button id="revealBtn" type="button">显示字幕核对</button>
+              <button id="compareBtn" type="button">比较本句</button>
+              <button id="clearBtn" type="button">清空输入</button>
+            </div>
+
+            <div id="compareResult" class="compare-result" aria-live="polite"></div>
+
+            <div class="subtitle-text">
+              <div class="mini-head">
+                <span>英文字幕</span>
+                <small>选中陌生单词可标注并查询释义</small>
+              </div>
+              <p id="subtitleText"></p>
+            </div>
+
+            <div class="word-panel">
+              <div class="mini-head">
+                <span>生词本</span>
+                <button id="clearWordsBtn" type="button">清空</button>
+              </div>
+              <div id="wordList" class="word-list"></div>
+              <div id="definitionBox" class="definition-box">选中字幕中的单词后，会显示释义、音标和发音按钮。</div>
+            </div>
+          </section>
+
+          <section id="shadowPanel" class="panel" aria-label="跟读评分">
+            <div class="panel-head">
+              <div>
+                <h2>完整跟读</h2>
+                <p>播放原视频后跟读，系统按文本匹配度和语速贴合度评分。</p>
+              </div>
+              <button id="shadowRecordBtn" class="primary" type="button">开始跟读录音</button>
+            </div>
+
+            <div class="shadow-controls">
+              <button id="playAllBtn" type="button">播放完整视频</button>
+              <button id="stopAllBtn" type="button">停止</button>
+            </div>
+
+            <textarea id="shadowInput" spellcheck="true" placeholder="跟读识别结果会出现在这里，也可以手动修正后重新评分。"></textarea>
+            <button id="scoreBtn" type="button">生成评分</button>
+            <div id="scoreCard" class="score-card">
+              <strong>尚未评分</strong>
+              <span>导入字幕并完成跟读后生成结果。</span>
+            </div>
+          </section>
+        </aside>
+      </section>
+    </main>
+
+    <script src="./app.js"></script>
+  </body>
+</html>

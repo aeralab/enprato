@@ -1,0 +1,7 @@
+{
+  "version": "0.2.0",
+  "download_url": "https://example.com/download/Enprato-0.2.0.zip",
+  "notes": "修复听写编辑问题，增加付费授权和更新提示。",
+  "published_at": "2026-08-27T00:00:00Z",
+  "min_version": "0.1.0"
+}
