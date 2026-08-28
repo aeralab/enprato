@@ -10,3 +10,8 @@ backend/app/__pycache__/
 *.wav
 *.mp4
 !frontend/public/.gitkeep
+/dist/
+/enprato-sites-build.tar.gz
+/网上备份.txt
+/视频目录.txt
+/网上备案.txt
