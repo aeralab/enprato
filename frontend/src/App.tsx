@@ -39,11 +39,13 @@ import type {
 
 const LAST_SESSION_KEY = "enprato.lastSession";
 const DRAFTS_CACHE_PREFIX = "enprato.drafts.";
+const ENABLE_SERVER_SPEAKER = import.meta.env.VITE_ENABLE_SERVER_SPEAKER === "1";
+
 
 function backendHint(err: unknown): string {
   const msg = err instanceof Error ? err.message : String(err);
   if (/failed to fetch|network|500|502|503|504|internal server error/i.test(msg)) {
-    return "后端未启动。请在项目目录运行 .\\start.ps1（或 start-backend.ps1），看到 Backend https://0.0.0.0:18787 后刷新本页。";
+    return "\u540e\u7aef\u6682\u65f6\u65e0\u6cd5\u8fde\u63a5\uff0c\u8bf7\u7a0d\u540e\u5237\u65b0\u91cd\u8bd5\u3002";
   }
   return msg || "无法连接后端";
 }
@@ -1647,9 +1649,10 @@ function Studio({
     userPausedRef.current = false;
     setUserPaused(false);
     setError("");
-    // 画面 + 片源声；同时 speaker-play。若会叠音，片源静音只留 speaker
-    video.muted = true;
-    video.defaultMuted = true;
+
+    video.muted = false;
+    video.defaultMuted = false;
+    video.volume = Math.max(0.01, Math.min(1, volume));
     try {
       video.currentTime = time;
     } catch {
@@ -1660,21 +1663,26 @@ function Studio({
       void playPromise.catch((err: unknown) => {
         const name = err instanceof DOMException ? err.name : "";
         if (name === "NotAllowedError") {
-          setError("浏览器拦住了播放，请再点一次「重复本句」。");
+          setError("\u6d4f\u89c8\u5668\u62e6\u4f4f\u4e86\u64ad\u653e\uff0c\u8bf7\u518d\u70b9\u4e00\u6b21\u300c\u91cd\u590d\u672c\u53e5\u300d\u3002");
         } else if (err instanceof Error && err.message) {
-          setError(`播放失败：${err.message}`);
+          setError("\u64ad\u653e\u5931\u8d25\uff1a" + err.message);
         }
       });
     }
+
+    const canUseServerSpeaker =
+      ENABLE_SERVER_SPEAKER && ["localhost", "127.0.0.1"].includes(window.location.hostname);
+    if (!canUseServerSpeaker) return;
+
+    video.muted = true;
+    video.defaultMuted = true;
     void speakerPlay(sessionId, time, end, volume)
       .then(() => {
         if (token !== playTokenRef.current) return;
-        // speaker 成功：保持画面静音，避免回音
         video.muted = true;
       })
       .catch(() => {
         if (token !== playTokenRef.current) return;
-        // speaker 失败：改用片源声，保证能听见原音频
         video.muted = false;
         video.defaultMuted = false;
         video.volume = Math.max(0.01, Math.min(1, volume));
@@ -1890,7 +1898,7 @@ function Studio({
       const lan = await fetchLanLinks();
       const base = lan.links[0] || (lan.ips[0] ? `https://${lan.ips[0]}:${lan.port}/remote` : "");
       if (!base) {
-        setError("没找到局域网地址。请确认电脑已连 WiFi，并用 start.ps1 启动。");
+        setError("\u65e0\u6cd5\u83b7\u53d6\u624b\u673a\u5f55\u97f3\u5165\u53e3\uff0c\u8bf7\u5237\u65b0\u540e\u91cd\u8bd5\u3002");
         return;
       }
       remoteAfterRef.current = 0;
@@ -1921,7 +1929,7 @@ function Studio({
         lan.links[0]?.replace(/\/remote$/, `/ipad/${build}`) ||
         (lan.ips[0] ? `https://${lan.ips[0]}:${lan.port}/ipad/${build}` : "");
       if (!base) {
-        setError("没找到局域网地址。请确认电脑已连 WiFi，并用 start.ps1 启动。");
+        setError("\u65e0\u6cd5\u83b7\u53d6\u624b\u673a\u5f55\u97f3\u5165\u53e3\uff0c\u8bf7\u5237\u65b0\u540e\u91cd\u8bd5\u3002");
         return;
       }
       remoteAfterRef.current = 0;
@@ -2209,8 +2217,9 @@ function Studio({
                 onLoadedMetadata={() => {
                   const node = videoRef.current;
                   if (!node) return;
-                  node.muted = true;
-                  node.defaultMuted = true;
+                  node.muted = false;
+                  node.defaultMuted = false;
+                  node.volume = Math.max(0.01, Math.min(1, volume));
                   try {
                     localStorage.removeItem("enprato.audioOut");
                   } catch {

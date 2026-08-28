@@ -10,7 +10,7 @@ from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
@@ -162,12 +162,22 @@ def health() -> dict[str, str]:
 
 
 @app.get("/api/lan")
-def api_lan() -> dict[str, Any]:
+def api_lan(request: Request) -> dict[str, Any]:
     ips = lan_ipv4s()
     port = 18787
-    # iPhone 开麦必须用 https
-    links = [f"https://{ip}:{port}/remote" for ip in ips]
-    ipad_links = [f"https://{ip}:{port}/ipad/{IPAD_BUILD}" for ip in ips]
+    proto = (request.headers.get("x-forwarded-proto") or request.url.scheme or "https").split(",")[0].strip()
+    host = (request.headers.get("x-forwarded-host") or request.headers.get("host") or "").split(",")[0].strip()
+    public_origin = ""
+    if host and not host.startswith(("localhost", "127.0.0.1")) and not host.endswith(f":{port}"):
+        public_origin = f"{proto}://{host}".rstrip("/")
+
+    links = []
+    ipad_links = []
+    if public_origin:
+        links.append(f"{public_origin}/remote")
+        ipad_links.append(f"{public_origin}/ipad/{IPAD_BUILD}")
+    links.extend(f"https://{ip}:{port}/remote" for ip in ips)
+    ipad_links.extend(f"https://{ip}:{port}/ipad/{IPAD_BUILD}" for ip in ips)
     return {
         "ips": ips,
         "port": port,
@@ -698,11 +708,23 @@ def session_audio(session_id: str) -> FileResponse:
             ".ogg": "audio/ogg",
             ".opus": "audio/ogg",
         }.get(suffix, "application/octet-stream")
-        return FileResponse(playback, media_type=mime, filename=playback.name)
+        return FileResponse(
+            playback,
+            media_type=mime,
+            filename=playback.name,
+            content_disposition_type="inline",
+            headers={"Accept-Ranges": "bytes", "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
+        )
     wav = folder / "audio.wav"
     if not wav.is_file():
         raise HTTPException(404, "没有音轨")
-    return FileResponse(wav, media_type="audio/wav", filename="audio.wav")
+    return FileResponse(
+        wav,
+        media_type="audio/wav",
+        filename="audio.wav",
+        content_disposition_type="inline",
+        headers={"Accept-Ranges": "bytes", "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
+    )
 
 
 @app.get("/api/session/{session_id}/thumb")
@@ -720,7 +742,8 @@ def session_thumb(session_id: str) -> FileResponse:
         thumb,
         media_type="image/jpeg",
         filename="thumb.jpg",
-        headers={"Cache-Control": "public, max-age=86400"},
+        content_disposition_type="inline",
+        headers={"Cache-Control": "public, max-age=86400", "X-Content-Type-Options": "nosniff"},
     )
 
 
@@ -748,7 +771,8 @@ def session_video(session_id: str) -> FileResponse:
         media,
         media_type=mime,
         filename=media.name,
-        headers={"Cache-Control": "no-store"},
+        content_disposition_type="inline",
+        headers={"Accept-Ranges": "bytes", "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
     )
 
 

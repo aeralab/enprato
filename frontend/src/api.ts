@@ -10,7 +10,7 @@ async function readError(res: Response): Promise<string> {
   } catch {
     const status = res.statusText || "";
     if (res.status >= 500 || /internal server error/i.test(status)) {
-      return "后端未就绪或请求失败。请确认已运行 .\\start.ps1，看到 Backend https://0.0.0.0:18787 后刷新本页。";
+      return "\u540e\u7aef\u6682\u65f6\u65e0\u6cd5\u8fde\u63a5\uff0c\u8bf7\u7a0d\u540e\u5237\u65b0\u91cd\u8bd5\u3002";
     }
     return status || `请求失败（${res.status}）`;
   }
@@ -64,7 +64,7 @@ export async function fetchLicense(): Promise<LicenseStatus> {
   try {
     res = await fetch("/api/license");
   } catch {
-    throw new Error("无法连接后端。请确认已运行 .\\start.ps1 或 .\\restart-backend.ps1。");
+    throw new Error("\u540e\u7aef\u6682\u65f6\u65e0\u6cd5\u8fde\u63a5\uff0c\u8bf7\u7a0d\u540e\u5237\u65b0\u91cd\u8bd5\u3002");
   }
   if (!res.ok) throw new Error(await readError(res));
   return res.json();
@@ -89,11 +89,11 @@ export async function checkoutLicense(plan: "monthly" | "lifetime"): Promise<Lic
       body: JSON.stringify({ plan }),
     });
   } catch {
-    throw new Error("无法连接后端。请先运行 .\\start.ps1，看到 Backend 启动后刷新页面。");
+    throw new Error("\u540e\u7aef\u6682\u65f6\u65e0\u6cd5\u8fde\u63a5\uff0c\u8bf7\u7a0d\u540e\u5237\u65b0\u91cd\u8bd5\u3002");
   }
   if (!res.ok) {
     if (res.status === 404) {
-      throw new Error("当前后端版本不支持一键开通，请执行 .\\restart-backend.ps1 后重试。");
+      throw new Error("\u540e\u7aef\u6682\u65f6\u65e0\u6cd5\u8fde\u63a5\uff0c\u8bf7\u7a0d\u540e\u5237\u65b0\u91cd\u8bd5\u3002");
     }
     throw new Error(await readError(res));
   }

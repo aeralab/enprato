@@ -11,7 +11,7 @@ import urllib.request
 from pathlib import Path
 from urllib.parse import urlparse
 
-from .media import ensure_playback_audio, extract_wav, find_ffmpeg, is_browser_video, make_browser_mp4, media_has_audio, run_ffmpeg, stream_codec
+from .media import ensure_playback_audio, extract_wav, find_ffmpeg, is_browser_media, is_browser_video, make_browser_mp4, media_has_audio, run_ffmpeg, stream_codec
 
 VIDEO_EXTS = {".mp4", ".webm", ".mkv", ".m4v", ".mov", ".avi"}
 AUDIO_EXTS = {".m4a", ".mp3", ".opus", ".ogg", ".wav", ".aac"}
@@ -324,12 +324,12 @@ def find_session_media(folder: Path) -> Path | None:
 
 def _ensure_playable(folder: Path) -> Path | None:
     merged = folder / "playable.mp4"
-    if merged.is_file() and media_has_audio(merged) and is_browser_video(merged):
+    if merged.is_file() and is_browser_media(merged):
         return merged
     picked = _pick_media(folder)
     if picked is None:
         return None
-    if picked.suffix.lower() in VIDEO_EXTS and media_has_audio(picked) and is_browser_video(picked):
+    if picked.suffix.lower() in VIDEO_EXTS and is_browser_media(picked):
         return picked
     audios = [
         p
@@ -357,7 +357,7 @@ def _ensure_playable(folder: Path) -> Path | None:
                     str(merged),
                 ]
             )
-            if merged.is_file() and media_has_audio(merged) and is_browser_video(merged):
+            if merged.is_file() and is_browser_media(merged):
                 return merged
         except Exception:
             pass
@@ -382,11 +382,11 @@ def _ensure_playable(folder: Path) -> Path | None:
                     str(merged),
                 ]
             )
-            if merged.is_file() and media_has_audio(merged) and is_browser_video(merged):
+            if merged.is_file() and is_browser_media(merged):
                 return merged
         except Exception:
             pass
-    if picked.suffix.lower() in VIDEO_EXTS and media_has_audio(picked) and not is_browser_video(picked):
+    if picked.suffix.lower() in VIDEO_EXTS and media_has_audio(picked) and not is_browser_media(picked):
         try:
             return make_browser_mp4(picked, merged)
         except Exception:

@@ -135,6 +135,7 @@ def stream_codec(src: Path, kind: str = "a") -> str:
 
 
 BROWSER_VIDEO_CODECS = {"h264", "avc1", "vp8", "vp9", "theora"}
+BROWSER_AUDIO_CODECS = {"aac", "mp3", "opus", "vorbis"}
 
 
 def is_browser_video(src: Path) -> bool:
@@ -144,9 +145,19 @@ def is_browser_video(src: Path) -> bool:
     return codec in BROWSER_VIDEO_CODECS
 
 
+def is_browser_audio(src: Path) -> bool:
+    codec = stream_codec(src, "a")
+    if not codec:
+        return False
+    return codec in BROWSER_AUDIO_CODECS
+
+
+def is_browser_media(src: Path) -> bool:
+    return is_browser_video(src) and media_has_audio(src) and is_browser_audio(src)
+
 def make_browser_mp4(src: Path, dest: Path) -> Path:
     dest.parent.mkdir(parents=True, exist_ok=True)
-    if dest.is_file() and dest.stat().st_size > 1000 and is_browser_video(dest) and media_has_audio(dest):
+    if dest.is_file() and dest.stat().st_size > 1000 and is_browser_media(dest):
         return dest
     tmp = dest.with_name(f"{dest.stem}.{os.getpid()}.tmp{dest.suffix}")
     video_attempts = [
