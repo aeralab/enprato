@@ -94,13 +94,13 @@ button {
 
 .stage.landscape .body {
   display: grid;
-  grid-template-columns: 1.22fr 0.78fr;
+  grid-template-columns: minmax(0, 1.12fr) minmax(360px, 0.88fr);
   min-height: 0;
 }
 
 .stage.portrait .body {
   display: grid;
-  grid-template-columns: 1.22fr 0.78fr;
+  grid-template-columns: minmax(0, 1.12fr) minmax(360px, 0.88fr);
   min-height: 0;
 }
 
@@ -722,6 +722,7 @@ button {
 .script-col {
   min-width: 0;
   min-height: 0;
+  overflow: auto;
   background: #fff;
   color: var(--en-text-body);
   display: grid;
@@ -731,6 +732,7 @@ button {
 
 .draft-stack {
   min-height: 0;
+  overflow: auto;
   display: grid;
   grid-template-rows: minmax(0, 1fr) auto;
   gap: 8px;
@@ -844,7 +846,7 @@ button {
 .voice-pad {
   display: flex;
   flex-direction: row;
-  flex-wrap: nowrap;
+  flex-wrap: wrap;
   align-items: stretch;
   gap: 8px;
   padding-top: 10px;
@@ -852,8 +854,8 @@ button {
 }
 
 .voice-pad > button {
-  flex: 1 1 0;
-  min-width: 0;
+  flex: 1 1 128px;
+  min-width: 112px;
   min-height: 48px;
   font-weight: 700;
   font-size: 13px;
