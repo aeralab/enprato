@@ -15,3 +15,11 @@ backend/app/__pycache__/
 /网上备份.txt
 /视频目录.txt
 /网上备案.txt
+/收款码/
+/frontend/public/pay/
+/frontend/dist/pay/
+/dist/pay/
+/营业执照*
+/**/营业执照*
+/*执照*
+/**/*执照*
