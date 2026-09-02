@@ -2,8 +2,8 @@ from __future__ import annotations
 
 _IPAD_BTN_SPEAK = "\u8bf4\u8bdd"
 _IPAD_BTN_STOP = "\u505c\u6b62"
-# 改 iPad 页后递增，二维码会带 ?b= 避免 Safari 继续用旧缓存
-IPAD_BUILD = "20260827d"
+# 改 iPad 页后递增；固定入口 /ipad 会跳到最新版，页内也会自动检测并刷新
+IPAD_BUILD = "20260902a"
 
 IPAD_PAGE = """<!DOCTYPE html>
 <html lang="zh-CN">
@@ -13,7 +13,15 @@ IPAD_PAGE = """<!DOCTYPE html>
   <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
   <meta http-equiv="Pragma" content="no-cache" />
   <meta http-equiv="Expires" content="0" />
-  <title>iPad 听写 · Enprato</title>
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black" />
+  <meta name="apple-mobile-web-app-title" content="Enprato" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="theme-color" content="#000000" />
+  <link rel="apple-touch-icon" sizes="180x180" href="/icon/enprato-180.png?v=__IPAD_BUILD__" />
+  <link rel="icon" type="image/png" sizes="192x192" href="/icon/enprato-192.png?v=__IPAD_BUILD__" />
+  <link rel="icon" type="image/png" sizes="512x512" href="/icon/enprato-512.png?v=__IPAD_BUILD__" />
+  <title>Enprato</title>
   <style>
     * { box-sizing: border-box; }
     html, body {
@@ -477,12 +485,12 @@ IPAD_PAGE = """<!DOCTYPE html>
   </style>
 </head>
 <body>
-  <div id="insecure" class="warn">请用 HTTPS 打开（扫描电脑二维码）</div>
+  <div id="insecure" class="warn">请用 HTTPS 打开。首次在 Safari 打开固定地址后，点分享 → 添加到主屏幕，以后每天点图标即可。</div>
   <div class="layout">
     <div class="play-col">
       <div id="videoWrap" class="video-wrap hide-burn-subs">
         <div class="video-clip">
-          <video id="video" playsinline webkit-playsinline preload="metadata"></video>
+          <video id="video" playsinline webkit-playsinline preload="none"></video>
         </div>
         <div class="burn-wipe" aria-hidden="true"></div>
         <div id="captionBurn" class="caption-burn">
@@ -532,7 +540,7 @@ IPAD_PAGE = """<!DOCTYPE html>
   </div>
   <div id="pageVer" class="page-ver" aria-hidden="true">__IPAD_BUILD__</div>
   <script>
-    let sessionId = new URLSearchParams(location.search).get('s') || '';
+    let sessionId = new URLSearchParams(location.search).get('s') || localStorage.getItem('enprato.ipad.lastSession') || '';
     const PAGE_BUILD = '__IPAD_BUILD__';
     (function ensurePageBuild() {
       const docProbe = document.getElementById('docTail');
@@ -547,6 +555,21 @@ IPAD_PAGE = """<!DOCTYPE html>
       u.searchParams.set('_', String(Date.now()));
       location.replace(u.href);
     })();
+    // 电脑更新后自动跟新：轮询 health，版本变了就刷新到最新 /ipad
+    setInterval(async () => {
+      try {
+        const res = await fetch('/api/health?_=' + Date.now(), { cache: 'no-store' });
+        if (!res.ok) return;
+        const data = await res.json();
+        const remote = String(data.ipad_build || '');
+        if (remote && remote !== PAGE_BUILD) {
+          const u = new URL(location.origin + '/ipad');
+          if (sessionId) u.searchParams.set('s', sessionId);
+          u.searchParams.set('_', String(Date.now()));
+          location.replace(u.href);
+        }
+      } catch (e) {}
+    }, 12000);
     let switchingSession = false;
     const videoEl = document.getElementById('video');
     const videoWrapEl = document.getElementById('videoWrap');
@@ -1149,14 +1172,36 @@ IPAD_PAGE = """<!DOCTYPE html>
 
     let boundVideoSession = '';
 
+    function clearVideoSrc(reason) {
+      try {
+        videoEl.removeAttribute('src');
+        videoEl.load();
+      } catch (e) {}
+      boundVideoSession = '';
+      if (reason) setStatus(reason, 'err');
+    }
+
     function updateVideoSrc() {
-      if (!sessionId) return;
+      if (!sessionId || !videoEl) return;
       if (boundVideoSession === sessionId && videoEl.getAttribute('src')) return;
       boundVideoSession = sessionId;
-      const url = '/api/session/' + sessionId + '/video';
-      videoEl.src = url;
-      videoEl.load();
+      // 延后到下一帧再挂视频，避免首屏就拉超大 mp4 把 Safari 进程打崩
+      const sid = sessionId;
+      requestAnimationFrame(() => {
+        if (sessionId !== sid) return;
+        try {
+          videoEl.src = '/api/session/' + sid + '/video';
+          videoEl.load();
+        } catch (e) {
+          clearVideoSrc('视频加载失败，请在电脑端换一门课再试');
+        }
+      });
     }
+
+    videoEl.addEventListener('error', () => {
+      if (!sessionId) return;
+      clearVideoSrc('这门课的视频 iPad 暂时播不了（文件过大或格式不兼容）。请在下方换一门课，或电脑端重新导入。');
+    });
 
     function clipTime(time) {
       const cap = (videoEl && Number.isFinite(videoEl.duration) && videoEl.duration > 0)
@@ -1387,6 +1432,7 @@ IPAD_PAGE = """<!DOCTYPE html>
           } catch (e) {}
         }
         sessionId = next;
+        try { localStorage.setItem('enprato.ipad.lastSession', sessionId); } catch (e) {}
         boundVideoSession = '';
         localIndexControl = false;
         drafts = {};
@@ -1497,13 +1543,19 @@ IPAD_PAGE = """<!DOCTYPE html>
         refreshCaption();
         renderStrip();
         updateSeekUi();
+        updateVideoSrc();
         if (prevIndex !== index) {
           repeatClick = { at: 0, baseIndex: index, count: 0 };
           captionsOffForNewSentence();
         }
         if (!typing) resetEditBaseline();
       } catch (e) {
-        setStatus('同步失败，请检查电脑端连接', 'err');
+        // 上次会话失效时清掉自动恢复，避免反复请求把页面拖崩
+        if (sessionId) {
+          try { localStorage.removeItem('enprato.ipad.lastSession'); } catch (err) {}
+          clearVideoSrc('');
+        }
+        setStatus('同步失败，请检查电脑端连接，或从下方重新选课', 'err');
       }
     }
 
@@ -2036,11 +2088,8 @@ IPAD_PAGE = """<!DOCTYPE html>
     });
 
     void loadSessionOptions();
-    fetch('/api/warmup', { method: 'POST' }).catch(() => {});
-    syncState();
-    if (sessionId) {
-      updateVideoSrc();
-    }
+    // 不在 iPad 首屏触发 /api/warmup（会拖慢甚至拖垮首屏）；电脑端打开课时再预热即可
+    void syncState();
     window.addEventListener('load', () => {
       resetEditBaseline();
       renderDocView(false);

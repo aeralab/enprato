@@ -291,6 +291,16 @@ def ingest_url(url: str, folder: Path) -> tuple[Path, Path, str | None]:
     ]
     if cookies:
         base.extend(["--cookies", cookies])
+    # B 站偶发 412/风控：补浏览器 UA + Referer；仍失败时提示升级 yt-dlp 或配置 cookies
+    if "bilibili.com" in url.lower() or "b23.tv" in url.lower():
+        base.extend(
+            [
+                "--user-agent",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                "--add-header",
+                "Referer:https://www.bilibili.com",
+            ]
+        )
 
     video_fmt = (
         "bv*[vcodec^=avc1][height<=720]+ba[ext=m4a]/"
@@ -299,12 +309,15 @@ def ingest_url(url: str, folder: Path) -> tuple[Path, Path, str | None]:
         "bv*+ba/b"
     )
     try:
-        _run(base + ["-f", video_fmt, url])
-    except RuntimeError:
         try:
-            _run(base + ["-f", "bestvideo+bestaudio/best", url])
+            _run(base + ["-f", video_fmt, url])
         except RuntimeError:
-            _run(base + ["-f", "ba/bestaudio/b", url])
+            try:
+                _run(base + ["-f", "bestvideo+bestaudio/best", url])
+            except RuntimeError:
+                _run(base + ["-f", "ba/bestaudio/b", url])
+    except RuntimeError as exc:
+        raise RuntimeError(_friendly_ytdlp_error(url, str(exc))) from exc
 
     media = _ensure_playable(folder)
     if media is None:
@@ -392,6 +405,20 @@ def _ensure_playable(folder: Path) -> Path | None:
         except Exception:
             return picked
     return picked
+
+
+def _friendly_ytdlp_error(url: str, detail: str) -> str:
+    text = (detail or "").strip()
+    low = text.lower()
+    is_bili = "bilibili.com" in url.lower() or "b23.tv" in url.lower() or "bilibili" in low
+    if is_bili and ("412" in text or "precondition failed" in low):
+        return (
+            "B站暂时拦截了下载（HTTP 412）。请先执行 pip install -U \"yt-dlp>=2026.8.19\"，"
+            "或在环境变量 ENPRATO_COOKIES 配置已登录浏览器导出的 cookies.txt 后重试。"
+        )
+    if "geo-restricted" in low or "deleted" in low:
+        return "视频可能已删除、需登录，或有地区限制。可换链接，或配置 ENPRATO_COOKIES 后重试。"
+    return text or "yt-dlp 拉取失败"
 
 
 def _run(cmd: list[str]) -> None:

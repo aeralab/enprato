@@ -1,0 +1,9 @@
+[Unit]
+Description=Backup Enprato database and course data
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/home/ubuntu/enprato
+EnvironmentFile=-/etc/enprato/backup.env
+ExecStart=/home/ubuntu/enprato/scripts/backup-data.sh

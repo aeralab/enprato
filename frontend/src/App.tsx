@@ -1,6 +1,9 @@
 ﻿import { useEffect, useRef, useState } from "react";
 import {
   activateLicense,
+  fetchCatalog,
+  fetchCurrentUser,
+  logoutAccount,
   checkUpdate,
   defineWord,
   deleteSession,
@@ -25,6 +28,8 @@ import { resumeTimeInSentence, splitWords } from "./diffWords";
 import { applyBurnWipeLayout } from "./videoBurnLayout";
 import type {
   CaptionMode,
+  CurrentUser,
+  CuratedLesson,
   Highlight,
   LicenseStatus,
   Orientation,
@@ -210,29 +215,15 @@ function mediaSrc(path: string): string {
   return path;
 }
 
-function ipadOpenUrl(base: string, sid: string, build?: string): string {
-  const ver = (build || "").trim();
+function ipadHomeUrl(base: string): string {
   try {
     const u = new URL(base);
-    const originPath = u.pathname.replace(/\/+$/, "");
-    if (ver) {
-      u.pathname = originPath.replace(/\/ipad(?:\/[^/]+)?$/, "") + "/ipad/" + ver;
-    } else if (!/\/ipad\/[^/]+/.test(originPath)) {
-      u.pathname = originPath.replace(/\/ipad$/, "") + "/ipad";
-    }
+    u.pathname = u.pathname.replace(/\/ipad(?:\/[^/]+)?\/?$/, "") + "/ipad";
     u.search = "";
-    u.searchParams.set("s", sid);
-    if (ver) u.searchParams.set("b", ver);
-    return u.toString();
+    u.hash = "";
+    return u.toString().replace(/\/$/, "");
   } catch {
-    const q = new URLSearchParams({ s: sid });
-    if (ver) q.set("b", ver);
-    const baseTrim = base.replace(/\/+$/, "");
-    const path = ver
-      ? baseTrim.replace(/\/ipad(?:\/[^/]+)?$/, "") + "/ipad/" + ver
-      : baseTrim.includes("/ipad") ? baseTrim : baseTrim + "/ipad";
-    const sep = path.includes("?") ? "&" : "?";
-    return `${path}${sep}${q.toString()}`;
+    return base.replace(/\/ipad(?:\/[^/]+)?\/?$/, "/ipad").split("?")[0];
   }
 }
 
@@ -298,9 +289,11 @@ export default function App() {
   const [resumeScore, setResumeScore] = useState<ShadowScore | null>(null);
   const [resumeHasVideo, setResumeHasVideo] = useState(true);
   const [license, setLicense] = useState<LicenseStatus | null>(null);
+  const [user, setUser] = useState<CurrentUser | null>(null);
   const [licenseBusy, setLicenseBusy] = useState(false);
   const [licenseLoadError, setLicenseLoadError] = useState("");
   const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null);
+  const [catalog, setCatalog] = useState<CuratedLesson[]>([]);
 
   useEffect(() => {
     const root = document.documentElement;
@@ -342,6 +335,13 @@ export default function App() {
         }
       }
     })();
+    void fetchCatalog()
+      .then((lessons) => {
+        if (!cancelled) setCatalog(lessons);
+      })
+      .catch(() => {
+        if (!cancelled) setCatalog([]);
+      });
     return () => {
       cancelled = true;
     };
@@ -350,6 +350,7 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    void fetchCurrentUser().then(setUser).catch(() => setUser(null));
     void refreshLicense();
     void checkUpdate().then(setUpdateInfo).catch(() => undefined);
   }, []);
@@ -433,6 +434,27 @@ export default function App() {
     }
   }
 
+  async function startCurated(url: string) {
+    const clean = url.trim();
+    if (!clean) return;
+    setVideoFile(null);
+    setSourceUrl(clean);
+    setError("");
+    setPhase("preparing");
+    try {
+      const prepared = await prepareSessionFromUrl(clean);
+      openDetail({ ...prepared, phase: prepared.phase === "listen" ? "listen" : prepared.phase });
+      await refreshHistory();
+      await refreshLicense();
+    } catch (err) {
+      setPhase("import");
+      const msg = err instanceof Error ? err.message : "准备失败";
+      setError(msg.replace(/^链接无法用于学习[:：]\s*/i, ""));
+      setVideoUrl("");
+      setAudioUrl("");
+    }
+  }
+
   async function resume(id: string) {
     setError("");
     try {
@@ -462,6 +484,7 @@ export default function App() {
             videoFile={videoFile}
             sourceUrl={sourceUrl}
             history={history}
+            catalog={catalog}
             onVideo={async (file) => {
               setVideoFile(file);
               setSourceUrl("");
@@ -482,8 +505,11 @@ export default function App() {
               }
             }}
             onStart={start}
+            onStartCurated={startCurated}
             onResume={resume}
             onDelete={removeHistory}
+            user={user}
+            onAuth={setUser}
             license={license}
             licenseBusy={licenseBusy}
             licenseLoadError={licenseLoadError}
@@ -535,9 +561,13 @@ function ImportScreen({
   videoFile,
   sourceUrl,
   history,
+  catalog,
+  user,
+  onAuth,
   onVideo,
   onSourceUrl,
   onStart,
+  onStartCurated,
   onResume,
   onDelete,
   license,
@@ -552,9 +582,13 @@ function ImportScreen({
   videoFile: File | null;
   sourceUrl: string;
   history: SessionSummary[];
+  catalog: CuratedLesson[];
+  user: CurrentUser | null;
+  onAuth: (user: CurrentUser | null) => void;
   onVideo: (file: File) => void | Promise<void>;
   onSourceUrl: (value: string) => void;
   onStart: () => void;
+  onStartCurated: (url: string) => void;
   onResume: (id: string) => void;
   onDelete: (id: string) => void;
   license: LicenseStatus | null;
@@ -570,8 +604,8 @@ function ImportScreen({
         <h1>抽音、分句</h1>
         <p>
           {sourceUrl.trim()
-            ? "正在从链接取可播放画面、英文字幕和音轨。下载不了完整文件时，也会尽量只取能练的音视频。"
-            : "第一遍不会显示字幕。有现成英文字幕会快很多；没有则用语音模型按句切开。"}
+            ? "正在下载视频 → 抽出音轨 → 按句切开。B站多数没有英文字幕，需要整段语音识别，视频越长越慢（约 1 小时片源通常要 1–3 分钟）。"
+            : "第一遍不会显示字幕。有现成英文字幕会快很多；没有则用语音模型整段识别后再按句切开，片源越长越慢。"}
         </p>
         <div className="pulse" />
       </div>
@@ -579,6 +613,7 @@ function ImportScreen({
   }
   const weixinLink = /weixin\.qq\.com|channels\.weixin\.qq\.com|\/sph\//i.test(sourceUrl);
   const canStart = Boolean(videoFile || (sourceUrl.trim() && !weixinLink));
+  const [historyMenu, setHistoryMenu] = useState<string | null>(null);
   return (
     <>
       <header className="topbar">
@@ -586,10 +621,7 @@ function ImportScreen({
           <strong>ENPRATO</strong>
           <span>dictation booth</span>
         </div>
-        <div className="cue-lamp">
-          <i />
-          idle
-        </div>
+        <AuthPanel user={user} onAuth={onAuth} />
       </header>
       <div className="import">
         <aside className="import-history">
@@ -611,9 +643,10 @@ function ImportScreen({
                     </span>
                   </span>
                 </button>
-                <button type="button" className="ghost" onClick={() => onDelete(item.session_id)}>
-                  删除
-                </button>
+                <div className="history-actions">
+                  <button type="button" className="icon-button" title="课程操作" aria-label="课程操作" onClick={() => setHistoryMenu(current => current === item.session_id ? null : item.session_id)}>...</button>
+                  {historyMenu === item.session_id ? <div className="history-menu"><button type="button" onClick={() => { if (window.confirm("确定删除这门课程吗？")) onDelete(item.session_id); setHistoryMenu(null); }}>删除课程</button></div> : null}
+                </div>
               </div>
             ))
           ) : (
@@ -622,13 +655,35 @@ function ImportScreen({
         </aside>
         <section className="import-source">
           {updateInfo ? <UpdateBanner info={updateInfo} /> : null}
-          <LicensePanel
-            status={license}
-            busy={licenseBusy}
-            loadError={licenseLoadError}
-            onActivate={onActivateLicense}
-            onRetry={onRetryLicense}
-          />
+          {user ? (
+            <section className="license-panel license-compat" aria-label="本机兼容授权">
+              <div className="license-summary">
+                <div>
+                  <strong>本机兼容授权</strong>
+                  <span>账号会员与免费次数以右上角「我的账号」为准；下方授权码仅影响本机/LAN 兼容层，不改变账号会员。</span>
+                </div>
+              </div>
+              <details className="license-compat-details">
+                <summary>展开本机授权码入口</summary>
+                <LicensePanel
+                  status={license}
+                  busy={licenseBusy}
+                  loadError={licenseLoadError}
+                  onActivate={onActivateLicense}
+                  onRetry={onRetryLicense}
+                  localCompat
+                />
+              </details>
+            </section>
+          ) : (
+            <LicensePanel
+              status={license}
+              busy={licenseBusy}
+              loadError={licenseLoadError}
+              onActivate={onActivateLicense}
+              onRetry={onRetryLicense}
+            />
+          )}
           <div
             className="intake"
             onDragOver={(e) => e.preventDefault()}
@@ -638,14 +693,15 @@ function ImportScreen({
               if (file) void onVideo(file);
             }}
           >
-            <input
+            <div className="intake-header"><span>学习入口</span><strong>粘贴链接或上传本地视频</strong></div>
+            <label className="intake-option"><span>粘贴视频链接</span><input
               className="intake-url"
               type="url"
               placeholder="粘贴 YouTube / B站 / mp4 链接"
               value={sourceUrl}
               onChange={(e) => onSourceUrl(e.target.value)}
               onClick={(e) => e.stopPropagation()}
-            />
+            /></label>
             <label className="intake-file">
               <input
                 type="file"
@@ -663,6 +719,45 @@ function ImportScreen({
           <button className="primary" disabled={!canStart} onClick={onStart}>
             进入听写室
           </button>
+          {catalog.length ? (
+            <section className="curated-lessons" aria-label="推荐课程">
+              <div className="curated-head">
+                <strong>推荐课 · VOA Level 2</strong>
+                <span>公开学习素材，点击即可进入听写室</span>
+              </div>
+              <div className="curated-list">
+                {catalog.map((lesson) => {
+                  const existing = history.find((item) => item.source_url === lesson.source_url);
+                  return (
+                    <button
+                      key={lesson.id}
+                      type="button"
+                      className="curated-item"
+                      onClick={() => {
+                        if (existing) onResume(existing.session_id);
+                        else onStartCurated(lesson.source_url);
+                      }}
+                    >
+                      <b>Lesson {lesson.lesson}</b>
+                      <span>{lesson.title.replace(/^Let's Learn English Level 2 ·\s*/i, "")}</span>
+                      <em>{existing ? "继续" : "开始"}</em>
+                    </button>
+                  );
+                })}
+              </div>
+            </section>
+          ) : null}
+          <aside className="home-notice" aria-label="产品说明">
+            <p>
+              Enprato 是一款英语学习工具，你可以使用自己选择的英语素材进行听写、跟读与练习。
+            </p>
+            <p>
+              英语素材推荐：BBC News、Bilibili、TED、YouTube 及各类英文 Podcast。
+            </p>
+            <p>
+              第三方内容的版权及使用规则归相应内容提供方所有，请遵守原平台及权利人的相关规定。
+            </p>
+          </aside>
         </section>
       </div>
     </>
@@ -683,18 +778,28 @@ function UpdateBanner({ info }: { info: UpdateInfo }) {
   );
 }
 
+function AuthPanel({ user, onAuth }: { user: CurrentUser | null; onAuth: (user: CurrentUser | null) => void }) {
+  const [open, setOpen] = useState(false);
+  const [message, setMessage] = useState("");
+  async function logout() { await logoutAccount(); onAuth(null); }
+  if (user) return <div className="account-compact"><button type="button" className="account-status" onClick={() => setOpen(!open)}><strong>{user.membership.status === "active" ? "Enprato Pro" : "免费版"}</strong><span>{user.membership.status === "active" ? "" : "剩余 " + user.trial.remaining + " 次"}</span><b>我的账号</b></button>{open ? <div className="account-popover"><p>{user.email}</p><p>会员状态：{user.membership.status === "active" ? "Enprato Pro" : "免费版"}</p><p>免费额度：{user.trial.remaining}/{user.trial.limit} 次</p>{user.membership.status === "active" ? <p>到期时间：{formatLicenseDate(user.membership.expires_at)}</p> : null}<button type="button" className="ghost" onClick={() => void logout()}>退出登录</button></div> : null}</div>;
+  return <div className="account-compact"><button type="button" className="account-link" onClick={() => { setMessage(""); setOpen(true); }}>登录</button>{open ? <div className="auth-modal-backdrop" onMouseDown={e => { if (e.target === e.currentTarget) setOpen(false); }}><section className="auth-modal wechat-auth-modal" role="dialog" aria-modal="true" aria-labelledby="wechat-auth-title"><button type="button" className="auth-modal-close" aria-label="关闭" onClick={() => setOpen(false)}>X</button><h2 id="wechat-auth-title">微信扫码登录</h2><div className="wechat-login-placeholder"><strong>使用微信扫码登录</strong><span>首次登录将自动创建 Enprato 账号</span><b>微信登录即将开放</b></div>{message ? <p className="err">{message}</p> : null}<p className="wechat-auth-note">登录后将自动恢复你的会员状态、免费额度和历史课程。</p></section></div> : null}</div>;
+}
+
 function LicensePanel({
   status,
   busy,
   loadError,
   onActivate,
   onRetry,
+  localCompat = false,
 }: {
   status: LicenseStatus | null;
   busy: boolean;
   loadError: string;
   onActivate: (key: string) => void | Promise<void>;
   onRetry: () => void | Promise<void>;
+  localCompat?: boolean;
 }) {
   const [key, setKey] = useState("");
   const [payError, setPayError] = useState("");
@@ -721,28 +826,25 @@ function LicensePanel({
       ? `/pay/${payMethod}-${payPlan === "lifetime" ? "lifetime" : "monthly"}.jpg`
       : "";
 
-  const plan =
-    status?.plan === "lifetime" ? "年付版" :
-      status?.plan === "monthly" ? "会员版" :
-        status?.active ? "试用版" : "未激活";
   const used = status
     ? `${status.trial_uses ?? status.trial_imports}/${status.trial_uses_limit ?? status.trial_imports_limit}`
     : "-";
-  const expiry = status?.expires_at || status?.trial_ends_at || "";
 
   return (
-    <section className={`license-panel ${status?.active ? "license-ok" : "license-locked"}`}>
-      <div className="license-summary">
-        <div>
-          <strong>{plan}</strong>
-          <span>
-            {status?.licensed
-              ? (expiry ? `有效期至 ${formatLicenseDate(expiry)}` : "永久有效")
-              : `免费听写 ${used} 次`}
-          </span>
-        </div>
-        <b>{status?.active ? "可用" : "需激活"}</b>
-      </div>
+    <section className={`license-panel ${localCompat ? "license-compat-inner" : ""} ${status?.active ? "license-ok" : "license-locked"}`}>
+      {!localCompat ? (
+        !status?.licensed ? (
+          <div className="license-summary">
+            <div>
+              <span>免费听写 {used} 次</span>
+            </div>
+            <b>{status?.active ? "可用" : "需激活"}</b>
+          </div>
+        ) : null
+      ) : (
+        <p className="meta license-compat-note">本机兼容授权 · {status?.active ? "可用" : "需激活"}</p>
+      )}
+      {!localCompat ? (
       <div className="price-grid">
         <button type="button" className="price-card" disabled={busy} onClick={() => void openPay("monthly")}>
           <strong>¥19.9/月</strong>
@@ -753,15 +855,20 @@ function LicensePanel({
           <span>适合长期练习，按年续费</span>
         </button>
       </div>
+      ) : null}
       {loadError ? <p className="err">{loadError}</p> : null}
       {!status && !loadError ? (
         <p className="err">正在读取授权状态…若长时间无响应，请点下方重新检测。</p>
       ) : null}
       {payError ? <p className="err">{payError}</p> : null}
+      {!localCompat ? (
       <p className="meta pay-hint">
         {payPlan ? "请选择付款方式，打开对应收款码" : "点上方套餐选择付款方式，付款后粘贴授权码激活"}
       </p>
-      {payPlan ? (
+      ) : (
+        <p className="meta pay-hint">仅用于本机/LAN 兼容；账号会员请走右上角账号体系。</p>
+      )}
+      {!localCompat && payPlan ? (
         <div className="pay-inline">
           <div className="pay-inline-head">
             <strong>{payTitle}</strong>
@@ -793,7 +900,7 @@ function LicensePanel({
           <p className="meta pay-modal-foot">付款后把截图发给客服获取授权码，收到后在下方输入并点击「激活」。</p>
         </div>
       ) : null}
-      {payPlan && payMethod ? (
+      {!localCompat && payPlan && payMethod ? (
         <div className="pay-modal-backdrop" role="presentation" onClick={() => setPayMethod(null)}>
           <div
             className="pay-modal"
@@ -829,7 +936,7 @@ function LicensePanel({
         <input
           value={key}
           onChange={(event) => setKey(event.target.value)}
-          placeholder="输入付款后获得的授权码"
+          placeholder={localCompat ? "输入本机兼容授权码（可选）" : "输入付款后获得的授权码"}
           spellCheck={false}
         />
         <button type="submit" className="primary" disabled={busy || !key.trim()}>
@@ -1132,6 +1239,7 @@ function Studio({
   const [phoneLink, setPhoneLink] = useState("");
   const [ipadStudio, setIpadStudio] = useState(false);
   const [ipadLink, setIpadLink] = useState("");
+  const [ipadHome, setIpadHome] = useState("");
   const [ipadBuild, setIpadBuild] = useState("");
   useEffect(() => {
     ipadStudioRef.current = ipadStudio;
@@ -1464,6 +1572,10 @@ function Studio({
         if (cancelled) return;
         const build = lan.ipad_build || "";
         if (build) setIpadBuild(build);
+        const home =
+          lan.ipad_home?.[0] ||
+          (lan.ips[0] ? `https://${lan.ips[0]}:${lan.port}/ipad` : "");
+        if (home) setIpadHome(home);
         const base =
           lan.ipad_links?.[0] ||
           lan.links[0]?.replace(/\/remote$/, `/ipad/${build}`) ||
@@ -1870,15 +1982,16 @@ function Studio({
   }
 
   function finishDictation() {
+    const currentIndex = indexRef.current;
     void saveProgress(sessionId, {
       phase: "check",
-      index,
+      index: currentIndex,
       drafts: draftsRef.current,
       highlights,
       score,
       orientation,
     });
-    writeDraftsCache(sessionId, draftsRef.current, index);
+    writeDraftsCache(sessionId, draftsRef.current, currentIndex);
     pauseMedia();
     setUserPaused(true);
     setCaptionMode("en");
@@ -1924,16 +2037,20 @@ function Studio({
     try {
       const lan = await fetchLanLinks();
       const build = lan.ipad_build || "";
+      const home =
+        lan.ipad_home?.[0] ||
+        (lan.ips[0] ? `https://${lan.ips[0]}:${lan.port}/ipad` : "");
       const base =
         lan.ipad_links?.[0] ||
         lan.links[0]?.replace(/\/remote$/, `/ipad/${build}`) ||
         (lan.ips[0] ? `https://${lan.ips[0]}:${lan.port}/ipad/${build}` : "");
-      if (!base) {
+      if (!base && !home) {
         setError("\u65e0\u6cd5\u83b7\u53d6\u624b\u673a\u5f55\u97f3\u5165\u53e3\uff0c\u8bf7\u5237\u65b0\u540e\u91cd\u8bd5\u3002");
         return;
       }
       remoteAfterRef.current = 0;
-      setIpadLink(base);
+      setIpadLink(base || home);
+      setIpadHome(home || ipadHomeUrl(base || ""));
       setIpadBuild(lan.ipad_build || "");
       setPhonePaired(false);
       setPhoneMic(false);
@@ -1948,14 +2065,15 @@ function Studio({
   function nextSentence() {
     repeatClickRef.current = { at: 0, baseIndex: indexRef.current, count: 0 };
     setSense(null);
-    if (index >= sentences.length - 1) {
+    const currentIndex = indexRef.current;
+    if (currentIndex >= sentences.length - 1) {
       setPhase("shadow");
       pauseMedia();
       setUserPaused(true);
       if (videoRef.current) videoRef.current.currentTime = 0;
       return;
     }
-    const next = index + 1;
+    const next = currentIndex + 1;
     indexRef.current = next;
     setIndex(next);
     pauseAtRef.current = sentences[next]?.start ?? 0;
@@ -2055,41 +2173,53 @@ function Studio({
           setError("没有录到声音。请允许麦克风后靠近再说；说完再点停止语音输入。");
           return;
         }
-        setBusy(true);
-        try {
-          const prevDraft = i > 0 ? String(draftsRef.current[i - 1] ?? "").trim() : "";
-          const context = prevDraft.length > 160 ? prevDraft.slice(-160) : prevDraft;
-          const text = await transcribeUtterance(blob, context, target);
-          const piece = String(text || "").trim();
+        const hasLiveDraft = Boolean(liveCur && liveCur !== base.trim());
+        if (hasLiveDraft && !manuallyEdited) {
           setDrafts((prev) => {
-            if ((draftManualEditAtRef.current[i] || 0) >= micStartedAtRef.current) return prev;
-            let merged = base.trim();
-            if (piece) {
-              merged = dedupeRepeatedClauses(mergeDictationPiece(base, piece, target));
-            } else if (liveCur && liveCur !== base.trim()) {
-              merged = liveCur;
-            }
-            if (!merged) return prev;
-            const next = { ...prev, [i]: merged };
+            const next = { ...prev, [i]: liveCur };
             draftsRef.current = next;
             return next;
           });
-          if (!piece) {
-            if (liveCur && liveCur !== base.trim()) {
-              setError("");
-            } else {
-              setError("没听清。请靠近麦克风，说完整句后再点停止；有口音也会按本句纠正拼写。");
-            }
-          } else {
-            setError("");
-          }
           setPhase("dictate");
+          setError("");
           window.setTimeout(() => revealDraftEnd(), 80);
-        } catch (err) {
-          setError(err instanceof Error ? err.message : "识别失败");
-        } finally {
-          setBusy(false);
+        } else {
+          setBusy(true);
         }
+
+        // Browser speech recognition gives us an immediate draft. Whisper refines it in the background.
+        void (async () => {
+          try {
+            const prevDraft = i > 0 ? String(draftsRef.current[i - 1] ?? "").trim() : "";
+            const context = prevDraft.length > 160 ? prevDraft.slice(-160) : prevDraft;
+            const text = await transcribeUtterance(blob, context, target);
+            const piece = String(text || "").trim();
+            setDrafts((prev) => {
+              if ((draftManualEditAtRef.current[i] || 0) >= micStartedAtRef.current) return prev;
+              let merged = base.trim();
+              if (piece) {
+                merged = dedupeRepeatedClauses(mergeDictationPiece(base, piece, target));
+              } else if (liveCur && liveCur !== base.trim()) {
+                merged = liveCur;
+              }
+              if (!merged) return prev;
+              const next = { ...prev, [i]: merged };
+              draftsRef.current = next;
+              return next;
+            });
+            if (!piece && !hasLiveDraft) {
+              setError("没听清。请靠近麦克风，说完整句后再点停止；有口音也会按本句纠正拼写。");
+            } else if (piece) {
+              setError("");
+            }
+            setPhase("dictate");
+            window.setTimeout(() => revealDraftEnd(), 80);
+          } catch (err) {
+            if (!hasLiveDraft) setError(err instanceof Error ? err.message : "识别失败");
+          } finally {
+            if (!hasLiveDraft) setBusy(false);
+          }
+        })();
       };
       recorderRef.current = recorder;
       recorder.start(250);
@@ -2508,35 +2638,39 @@ function Studio({
                           </div>
                         </div>
                       ) : null}
-                      {ipadStudio && ipadLink ? (
+                      {ipadStudio && (ipadHome || ipadLink) ? (
                         <div className="phone-mic-item">
                           <img
-                            alt="iPad 播放听写二维码"
+                            alt="iPad 固定入口二维码"
                             width={168}
                             height={168}
                             src={`https://api.qrserver.com/v1/create-qr-code/?size=168x168&data=${encodeURIComponent(
-                              ipadOpenUrl(ipadLink, sessionId, ipadBuild),
+                              ipadHome || ipadHomeUrl(ipadLink),
                             )}`}
                           />
                           <div>
-                            <strong>iPad 播放 + 听写</strong>
-                            <code>{ipadOpenUrl(ipadLink, sessionId, ipadBuild)}</code>
+                            <strong>iPad 固定入口（只需设置一次）</strong>
+                            <code>{ipadHome || ipadHomeUrl(ipadLink)}</code>
                             {ipadBuild ? (
                               <span className="ipad-build-hint">界面版本 {ipadBuild}</span>
                             ) : null}
                             <p className="ipad-build-hint">
-                              若 iPad 仍是旧界面：先重启电脑后端，关闭 iPad 上旧标签，再扫下面新二维码。左下角应显示版本 {ipadBuild || "未知"}。
+                              1. 用 Safari 扫码或打开上面地址（首次点「继续访问」信任证书）
+                              <br />
+                              2. 点分享 →「添加到主屏幕」
+                              <br />
+                              3. 以后每天点主屏幕图标即可；电脑点「iPad 播放+听写」后，iPad 会自动跟当前课
+                              <br />
+                              4. 电脑更新后，iPad 约十几秒内自动刷新到新界面，不用再扫码
                             </p>
                             <button
                               type="button"
                               className="ghost"
                               onClick={() =>
-                                void navigator.clipboard.writeText(
-                                  ipadOpenUrl(ipadLink, sessionId, ipadBuild),
-                                )
+                                void navigator.clipboard.writeText(ipadHome || ipadHomeUrl(ipadLink))
                               }
                             >
-                              复制链接
+                              复制固定地址
                             </button>
                           </div>
                         </div>

@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import secrets
 import shutil
 import threading
 import uuid
@@ -10,17 +12,31 @@ from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, Response, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel
 
 from .asr import transcribe_sentences, transcribe_speech, warmup
+from . import db
+from .auth import (
+    COOKIE_NAME,
+    auth_required,
+    cookie_secure,
+    current_user,
+    hash_password,
+    require_user,
+    require_user_or_local,
+    verify_password,
+)
+from .curated import list_curated_lessons
 from .dictionary import lookup_word, translate_en_zh
 from .ingest import fetch_media_title, find_session_media, ingest_url, validate_media_url
-from .license import activate_license, checkout_license, license_status, note_trial_use, require_active
+from .license import activate_license, checkout_license, license_status, note_trial_use
 from .media import convert_to_wav, ensure_playback_audio, extract_wav
+from .payment import PaymentConfigError, mock_provider_enabled, provider_for
+from .rate_limit import enforce as enforce_rate_limit
 from .ipad_studio import IPAD_BUILD, IPAD_PAGE
 from .remote_mic import (
     REMOTE_PAGE,
@@ -56,7 +72,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(title="Enprato", version="0.1.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[origin.strip() for origin in os.environ.get("ENPRATO_CORS_ORIGINS", "http://localhost:5173,https://enprato.site").split(",") if origin.strip()],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -65,6 +81,9 @@ app.add_middleware(
 
 @app.on_event("startup")
 def _startup_warm_asr() -> None:
+    db.migrate()
+    db.ensure_legacy_sessions(DATA)
+
     def _run() -> None:
         try:
             warmup()
@@ -156,9 +175,270 @@ class LicenseCheckoutBody(BaseModel):
     plan: str
 
 
+class AuthBody(BaseModel):
+    email: str
+    password: str
+
+
+class PhoneCodeBody(BaseModel):
+    phone: str
+
+
+class PhoneVerifyBody(BaseModel):
+    phone: str
+    challenge_id: str
+    code: str
+
+
+class OrderBody(BaseModel):
+    plan: str = "monthly_30d"
+    provider: str = "wechat"
+
+
+def public_user(user):
+    return {"id": user["id"], "email": user["email"], "status": user["status"], "membership": db.membership_status(user["id"]), "trial": db.trial_status(user["id"])}
+
+
+def require_member_or_trial(user: dict[str, Any]) -> None:
+    # iPad/手机局域网访问无账号：沿用本机 license.json（试用/买断）
+    if user.get("id") == "lan-local":
+        status = license_status(DATA)
+        if status.get("active"):
+            return
+        raise HTTPException(402, "免费听写次数已用完，请开通会员后继续")
+    # 已登录官网用户：只看 SQLite membership + usage_quotas，不混用 license.json
+    membership = db.membership_status(user["id"])
+    if membership.get("active"):
+        return
+    quota = db.trial_status(user["id"])
+    if quota["remaining"] <= 0:
+        raise HTTPException(402, "free quota exhausted")
+
+
+def require_session_access(session_id: str, request: Request) -> dict[str, Any]:
+    """PC 登录用户 / 远程 token；仅本机未强制登录时允许目录兜底为 lan-local。"""
+    user = current_user(request)
+    if user and db.owns_learning_session(session_id, user["id"]):
+        return dict(user)
+    token = request.cookies.get("enprato_remote_token", "") or request.query_params.get("token", "")
+    owner_id = db.remote_token_owner(token, session_id)
+    if owner_id:
+        owner = db.user_by_id(owner_id)
+        if owner:
+            return dict(owner)
+    # 家庭局域网单机：ENPRATO_REQUIRE_AUTH 未开时，iPad 无登录态可按会话目录放行
+    if not auth_required() and (DATA / session_id).is_dir():
+        return {"id": "lan-local", "email": "", "status": "active"}
+    raise HTTPException(401, "请先登录")
+
+
+def require_owned_session(session_id: str, user: dict[str, Any]) -> Path:
+    # lan-local 伪用户：本机会话即可
+    if user.get("id") == "lan-local":
+        folder = _session_dir(session_id)
+        return folder
+    if not db.owns_learning_session(session_id, user["id"]):
+        raise HTTPException(404, "session not found")
+    return _session_dir(session_id)
+
+
+def set_session_cookie(response, token):
+    response.set_cookie(COOKIE_NAME, token, httponly=True, secure=cookie_secure(), samesite="lax", max_age=30 * 24 * 60 * 60, path="/")
+
+
+@app.post("/api/auth/register")
+def auth_register(body: AuthBody, response: Response):
+    email = body.email.strip().lower()
+    if "@" not in email or len(email) > 254 or len(body.password) < 8:
+        raise HTTPException(400, "请输入有效邮箱，密码至少 8 位")
+    try:
+        user = db.create_user(email, hash_password(body.password))
+    except Exception as exc:
+        if "UNIQUE constraint failed" in str(exc):
+            raise HTTPException(409, "邮箱已注册") from exc
+        raise
+    set_session_cookie(response, db.create_auth_session(user["id"]))
+    return public_user(user)
+
+
+@app.post("/api/auth/login")
+def auth_login(body: AuthBody, response: Response):
+    row = db.find_user(body.email.strip().lower())
+    if not row or not verify_password(body.password, row["password_hash"]):
+        raise HTTPException(401, "邮箱或密码错误")
+    user = dict(row)
+    set_session_cookie(response, db.create_auth_session(user["id"]))
+    return public_user(user)
+
+
+@app.post("/api/auth/logout")
+def auth_logout(request: Request, response: Response):
+    token = request.cookies.get(COOKIE_NAME, "")
+    if token:
+        db.delete_auth_session(token)
+    response.delete_cookie(COOKIE_NAME, path="/")
+    return {"status": "ok"}
+
+
+@app.get("/api/auth/me")
+def auth_me(user = Depends(current_user)):
+    return {"user": public_user(user) if user else None}
+
+
+@app.post("/api/auth/phone/send")
+def auth_phone_send(body: PhoneCodeBody, request: Request):
+    try:
+        phone = db.normalize_phone(body.phone)
+    except ValueError:
+        raise HTTPException(400, "手机号格式不正确")
+    provider = os.environ.get("ENPRATO_SMS_PROVIDER", "disabled").lower()
+    is_dev = os.environ.get("ENPRATO_ENV", "development").lower() not in {"production", "prod"} and os.environ.get("ENPRATO_ALLOW_DEV_SMS", "0").lower() in {"1", "true", "yes"}
+    if provider != "dev" or not is_dev:
+        raise HTTPException(503, "短信登录尚未配置真实短信服务")
+    challenge_id = secrets.token_urlsafe(18)
+    code = f"{secrets.randbelow(1000000):06d}"
+    request_ip = request.client.host if request.client else "unknown"
+    if not db.create_phone_challenge(phone, db.hash_token(challenge_id + ":" + code), request_ip, challenge_id):
+        raise HTTPException(429, "验证码发送过于频繁，请稍后再试")
+    return {"challenge_id": challenge_id, "expires_in": 300, "provider": "dev", "dev_code": code}
+
+
+@app.post("/api/auth/phone/verify")
+def auth_phone_verify(body: PhoneVerifyBody, response: Response):
+    try:
+        phone = db.normalize_phone(body.phone)
+    except ValueError:
+        raise HTTPException(400, "手机号格式不正确")
+    if len(body.code) != 6 or not body.code.isdigit():
+        raise HTTPException(400, "验证码格式不正确")
+    user_id = db.consume_phone_challenge(body.challenge_id, phone, db.hash_token(body.challenge_id + ":" + body.code))
+    if not user_id:
+        raise HTTPException(401, "验证码错误或已失效")
+    set_session_cookie(response, db.create_auth_session(user_id))
+    user = db.user_by_id(user_id)
+    return public_user(user)
+
+
+@app.get("/api/plans")
+def api_plans(user: dict[str, Any] = Depends(require_user)):
+    conn = db.connect()
+    try: return {"plans": [dict(row) for row in conn.execute("SELECT code,name,price_fen,duration_days FROM plans WHERE active=1").fetchall()]}
+    finally: conn.close()
+
+
+@app.post("/api/payments/wechat/native")
+@app.post("/api/orders")
+def api_create_order(request: Request, body: OrderBody, user: dict[str, Any] = Depends(require_user)):
+    enforce_rate_limit(request, "payment-create")
+    if body.provider != "wechat": raise HTTPException(400, "当前仅支持微信支付")
+    try:
+        order = db.create_order(user["id"], body.plan, body.provider)
+        if mock_provider_enabled():
+            logger.warning("payment mock order created order=%s provider=mock", order["order_no"])
+            return {**order, "payment": {"provider": "mock", "code_url": "mock://" + order["order_no"]}}
+        payment = provider_for(body.provider).create_native_payment(order_no=order["order_no"], description="Enprato 月度会员 30 天", amount_fen=order["amount_fen"])
+        logger.info("payment order created order=%s provider=%s", order["order_no"], body.provider)
+        return {**order, "payment": payment}
+    except (ValueError, PaymentConfigError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(502, str(exc)) from exc
+
+
+@app.get("/api/payments/orders/{order_no}")
+@app.get("/api/orders/{order_no}")
+def api_get_order(order_no: str, user: dict[str, Any] = Depends(require_user)):
+    order = db.get_order(order_no, user["id"])
+    if not order: raise HTTPException(404, "订单不存在")
+    return order
+
+
+@app.post("/api/payments/wechat/notify")
+async def wechat_notify(request: Request):
+    enforce_rate_limit(request, "payment-notify")
+    body = await request.body()
+    try:
+        provider = provider_for("wechat")
+        payload = provider.verify_and_decode_notify(headers=dict(request.headers), body=body)
+        order_no = str(payload.get("out_trade_no") or "")
+        trade_no = str(payload.get("transaction_id") or "")
+        amount = int((payload.get("amount") or {}).get("total") or 0)
+        if not order_no or not trade_no or not payload.get("mchid") or not payload.get("appid"):
+            raise ValueError("invalid payment transaction")
+        result = db.complete_payment(provider="wechat", event_id=trade_no, payload_hash=hashlib.sha256(body).hexdigest(), order_no=order_no, trade_no=trade_no, amount_fen=amount, payment_status=str(payload.get("trade_state") or ""), merchant_id=str(payload.get("mchid")), app_id=str(payload.get("appid")))
+        logger.info("payment callback processed provider=wechat order=%s result=%s", order_no, result)
+        return {"code": "SUCCESS", "message": result}
+    except (ValueError, KeyError, PaymentConfigError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+@app.post("/api/payments/orders/{order_no}/sync")
+def sync_wechat_order(request: Request, order_no: str, user: dict[str, Any] = Depends(require_user)):
+    enforce_rate_limit(request, "payment-query")
+    order = db.get_order(order_no, user["id"])
+    if not order: raise HTTPException(404, "order not found")
+    if order["status"] in {"paid", "closed", "refunded"}: return order
+    try:
+        provider = provider_for("wechat")
+        payload = provider.query_order(order_no=order_no)
+        if str(payload.get("out_trade_no") or "") != order_no: raise ValueError("order number mismatch")
+        amount = int((payload.get("amount") or {}).get("total") or 0)
+        trade_no = str(payload.get("transaction_id") or "")
+        if str(payload.get("mchid") or "") != os.environ.get("WECHATPAY_MCH_ID", "").strip(): raise ValueError("merchant mismatch")
+        if payload.get("trade_state") == "SUCCESS" and (amount != 1990 or not trade_no): raise ValueError("payment transaction mismatch")
+        if payload.get("trade_state") == "SUCCESS": db.complete_payment(provider="wechat", event_id=trade_no, payload_hash="query", order_no=order_no, trade_no=trade_no, amount_fen=amount, payment_status="SUCCESS", merchant_id=str(payload.get("mchid")), app_id=str(payload.get("appid") or ""))
+    except (ValueError, PaymentConfigError, RuntimeError) as exc: raise HTTPException(400, str(exc)) from exc
+    return db.get_order(order_no, user["id"])
+
+@app.post("/api/dev/orders/{order_no}/pay")
+def dev_pay(order_no: str, user: dict[str, Any] = Depends(require_user)):
+    if not mock_provider_enabled(): raise HTTPException(404, "开发 mock 支付未启用")
+    order = db.get_order(order_no, user["id"])
+    if not order: raise HTTPException(404, "订单不存在")
+    try:
+        result = db.complete_payment(provider="mock", event_id="mock-" + order_no, payload_hash="dev", order_no=order_no, trade_no="mock-" + order_no, amount_fen=order["amount_fen"], payment_status="SUCCESS")
+    except ValueError as exc: raise HTTPException(400, str(exc)) from exc
+    return {"status": result, "membership": db.membership_status(user["id"])}
+
+
+@app.post("/api/dev/membership")
+def dev_membership(user = Depends(require_user)):
+    try:
+        return {"membership": db.grant_dev_membership(user["id"])}
+    except PermissionError as exc:
+        raise HTTPException(404, "开发环境人工开通未启用") from exc
+
+
 @app.get("/api/health")
 def health() -> dict[str, str]:
     return {"status": "ok", "ipad_build": IPAD_BUILD}
+
+
+@app.get("/api/catalog")
+def api_catalog() -> dict[str, Any]:
+    """云端推荐课目录。本机默认关闭（ENPRATO_ENABLE_CURATED 未设时返回空）。"""
+    return {"lessons": list_curated_lessons()}
+
+
+@app.get("/icon/{name}")
+def app_icon(name: str) -> FileResponse:
+    allowed = {
+        "enprato-180.png": "enprato-180.png",
+        "enprato-192.png": "enprato-192.png",
+        "enprato-512.png": "enprato-512.png",
+    }
+    filename = allowed.get(name)
+    if not filename:
+        raise HTTPException(404, "icon not found")
+    path = ROOT / "static" / "icons" / filename
+    if not path.is_file():
+        raise HTTPException(404, "icon not found")
+    return FileResponse(
+        path,
+        media_type="image/png",
+        headers={
+            "Cache-Control": "public, max-age=86400",
+        },
+    )
 
 
 @app.get("/api/lan")
@@ -173,17 +453,21 @@ def api_lan(request: Request) -> dict[str, Any]:
 
     links = []
     ipad_links = []
+    ipad_home = []
     if public_origin:
         links.append(f"{public_origin}/remote")
         ipad_links.append(f"{public_origin}/ipad/{IPAD_BUILD}")
+        ipad_home.append(f"{public_origin}/ipad")
     links.extend(f"https://{ip}:{port}/remote" for ip in ips)
     ipad_links.extend(f"https://{ip}:{port}/ipad/{IPAD_BUILD}" for ip in ips)
+    ipad_home.extend(f"https://{ip}:{port}/ipad" for ip in ips)
     return {
         "ips": ips,
         "port": port,
         "scheme": "https",
         "links": links,
         "ipad_links": ipad_links,
+        "ipad_home": ipad_home,
         "ipad_build": IPAD_BUILD,
     }
 
@@ -221,11 +505,22 @@ def remote_active() -> dict[str, Any]:
     return {"session_id": sid or ""}
 
 
+@app.post("/api/remote-token/{session_id}")
+def remote_token(session_id: str, user: dict[str, Any] = Depends(require_user)) -> dict[str, str]:
+    try:
+        return {"token": db.create_remote_token(session_id, user["id"])}
+    except PermissionError as exc:
+        raise HTTPException(404, "session not found") from exc
+
+
 @app.post("/api/remote-claim")
-def remote_claim(body: RemoteClaimBody) -> dict[str, Any]:
-    """电脑声明当前手机麦应对准哪一课；关掉手机麦时传空。"""
+def remote_claim(body: RemoteClaimBody, request: Request) -> dict[str, Any]:
+    """电脑声明当前手机麦/iPad 应对准哪一课；关掉时传空。本机可无登录。"""
+    user = current_user(request)
     sid = (body.session_id or "").strip()
     if sid:
+        if user and not db.owns_learning_session(sid, user["id"]):
+            raise HTTPException(403, "无权访问该课程")
         folder = DATA / sid
         if not folder.exists():
             raise HTTPException(404, "课程不存在")
@@ -235,9 +530,9 @@ def remote_claim(body: RemoteClaimBody) -> dict[str, Any]:
     return {"session_id": ""}
 
 @app.get("/remote", response_class=HTMLResponse)
-def remote_mic_page(s: str = "") -> HTMLResponse:
+def remote_mic_page(response: Response, s: str = "", token: str = "") -> HTMLResponse:
     _ = s
-    return HTMLResponse(
+    page = HTMLResponse(
         content=REMOTE_PAGE,
         media_type="text/html; charset=utf-8",
         headers={
@@ -245,6 +540,9 @@ def remote_mic_page(s: str = "") -> HTMLResponse:
             "Pragma": "no-cache",
         },
     )
+    if token and response is not None:
+        page.set_cookie("enprato_remote_token", token, httponly=True, secure=cookie_secure(), samesite="lax", max_age=30 * 60, path="/")
+    return page
 
 
 @app.get("/ipad")
@@ -259,11 +557,11 @@ def ipad_studio_redirect(s: str = "", b: str = "") -> RedirectResponse:
 
 
 @app.get("/ipad/{page_build}", response_class=HTMLResponse)
-def ipad_studio_page(page_build: str, s: str = "", b: str = "") -> HTMLResponse:
+def ipad_studio_page(response: Response, page_build: str, s: str = "", b: str = "", token: str = "") -> HTMLResponse:
     _ = page_build
     _ = s
     _ = b
-    return HTMLResponse(
+    page = HTMLResponse(
         content=IPAD_PAGE,
         media_type="text/html; charset=utf-8",
         headers={
@@ -275,6 +573,9 @@ def ipad_studio_page(page_build: str, s: str = "", b: str = "") -> HTMLResponse:
             "Vary": "*",
         },
     )
+    if token and response is not None:
+        page.set_cookie("enprato_remote_token", token, httponly=True, secure=cookie_secure(), samesite="lax", max_age=30 * 60, path="/")
+    return page
 
 
 @app.get("/")
@@ -284,8 +585,8 @@ def backend_home() -> RedirectResponse:
 
 
 @app.get("/api/session/{session_id}/remote-state")
-def remote_state(session_id: str) -> dict[str, Any]:
-    folder = _session_dir(session_id)
+def remote_state(session_id: str, user: dict[str, Any] = Depends(require_session_access)) -> dict[str, Any]:
+    folder = require_owned_session(session_id, user)
     detail = session_detail(folder, session_id)
     if not detail:
         raise HTTPException(404, "课程不存在")
@@ -353,8 +654,8 @@ def _match_sentence_index(sentences: list[Any], text: str, hint: int) -> int:
 
 
 @app.post("/api/session/{session_id}/remote-draft")
-def remote_draft(session_id: str, body: RemoteDraftBody) -> dict[str, Any]:
-    folder = _session_dir(session_id)
+def remote_draft(session_id: str, body: RemoteDraftBody, user: dict[str, Any] = Depends(require_session_access)) -> dict[str, Any]:
+    folder = require_owned_session(session_id, user)
     sentences = read_json(folder / "sentences.json", [])
     if not isinstance(sentences, list) or not sentences:
         raise HTTPException(404, "没有句子")
@@ -364,7 +665,7 @@ def remote_draft(session_id: str, body: RemoteDraftBody) -> dict[str, Any]:
     drafts = meta.get("drafts") if isinstance(meta.get("drafts"), dict) else {}
     drafts = {str(k): str(v) for k, v in drafts.items()}
     drafts[str(idx)] = body.text
-    if body.text.strip():
+    if body.text.strip() and user.get("id") == "lan-local":
         note_trial_use(DATA, session_id)
     write_meta(folder, drafts=drafts, index=idx, phase="dictate")
     item = push_remote_result(session_id, idx, body.text)
@@ -373,9 +674,9 @@ def remote_draft(session_id: str, body: RemoteDraftBody) -> dict[str, Any]:
 
 
 @app.post("/api/session/{session_id}/remote-drafts")
-def remote_drafts_bulk(session_id: str, body: RemoteDraftsBody) -> dict[str, Any]:
+def remote_drafts_bulk(session_id: str, body: RemoteDraftsBody, user: dict[str, Any] = Depends(require_session_access)) -> dict[str, Any]:
     """手机整页听写稿一次写入，按句号合并，不丢中间句。"""
-    folder = _session_dir(session_id)
+    folder = require_owned_session(session_id, user)
     sentences = read_json(folder / "sentences.json", [])
     if not isinstance(sentences, list) or not sentences:
         raise HTTPException(404, "没有句子")
@@ -416,7 +717,7 @@ def remote_drafts_bulk(session_id: str, body: RemoteDraftsBody) -> dict[str, Any
         else ""
     )
     write_meta(folder, drafts=drafts, index=keep_index, phase="dictate")
-    if any(str(v or "").strip() for v in drafts.values()):
+    if user.get("id") == "lan-local" and any(str(v or "").strip() for v in drafts.values()):
         note_trial_use(DATA, session_id)
     touch_phone(session_id)
     new_at_index = str(drafts.get(str(keep_index), ""))
@@ -426,9 +727,9 @@ def remote_drafts_bulk(session_id: str, body: RemoteDraftsBody) -> dict[str, Any
 
 
 @app.post("/api/session/{session_id}/remote-next")
-def remote_next(session_id: str) -> dict[str, Any]:
+def remote_next(session_id: str, user: dict[str, Any] = Depends(require_session_access)) -> dict[str, Any]:
     """手机点「下一句」：推进课程序号，电脑会跟着走。"""
-    folder = _session_dir(session_id)
+    folder = require_owned_session(session_id, user)
     sentences = read_json(folder / "sentences.json", [])
     if not isinstance(sentences, list) or not sentences:
         raise HTTPException(404, "没有句子")
@@ -447,9 +748,10 @@ async def remote_stt(
     audio: UploadFile = File(...),
     index: int = Form(...),
     mode: str = Form("replace"),
+    user: dict[str, Any] = Depends(require_session_access),
 ) -> dict[str, Any]:
-    require_active(DATA)
-    folder = _session_dir(session_id)
+    require_member_or_trial(user)
+    folder = require_owned_session(session_id, user)
     sentences = read_json(folder / "sentences.json", [])
     if not isinstance(sentences, list) or not sentences:
         raise HTTPException(404, "没有句子")
@@ -522,7 +824,8 @@ async def remote_stt(
         text = merge_dictation_text(prev, text, target)
     if text.strip():
         drafts[str(idx)] = text
-        note_trial_use(DATA, session_id)
+        if user.get("id") == "lan-local":
+            note_trial_use(DATA, session_id)
         write_meta(folder, drafts=drafts, index=idx, phase="dictate")
         item = push_remote_result(session_id, idx, text)
     else:
@@ -532,7 +835,7 @@ async def remote_stt(
 
 
 @app.get("/api/session/{session_id}/remote-inbox")
-def remote_inbox(session_id: str, after: int = 0) -> dict[str, Any]:
+def remote_inbox(session_id: str, after: int = 0, user: dict[str, Any] = Depends(require_session_access)) -> dict[str, Any]:
     _session_dir(session_id)
     items = pull_remote_results(session_id, after_id=after)
     return {"items": items, "connected": phone_connected(session_id)}
@@ -548,11 +851,18 @@ def api_warmup() -> dict[str, str]:
 async def prepare(
     video: UploadFile = File(...),
     captions: UploadFile | None = File(default=None),
+    user: dict[str, Any] = Depends(require_user_or_local),
 ) -> dict[str, Any]:
-    require_active(DATA)
+    require_member_or_trial(user)
     session_id = uuid.uuid4().hex[:12]
     folder = DATA / session_id
     folder.mkdir(parents=True, exist_ok=True)
+    db.register_learning_session(session_id, user["id"])
+    if user["id"] != "lan-local":
+        if not db.membership_status(user["id"]).get("active") and not db.consume_trial(user["id"], "prepare:" + session_id):
+            shutil.rmtree(folder, ignore_errors=True)
+            raise HTTPException(402, "free quota exhausted")
+
     suffix = Path(video.filename or "video.mp4").suffix or ".mp4"
     source = folder / f"source{suffix}"
     audio = folder / "audio.wav"
@@ -561,6 +871,8 @@ async def prepare(
         extract_wav(source, audio)
         ensure_playback_audio(folder, source)
     except Exception as exc:
+        if user["id"] != "lan-local":
+            db.refund_trial(user["id"], "prepare:" + session_id)
         shutil.rmtree(folder, ignore_errors=True)
         raise HTTPException(400, f"抽音频失败（需要视频里有音轨，并已安装 ffmpeg）: {exc}") from exc
 
@@ -580,27 +892,36 @@ async def prepare(
 
 
 @app.post("/api/prepare-url")
-async def prepare_url(body: PrepareUrlBody) -> dict[str, Any]:
+async def prepare_url(body: PrepareUrlBody, user: dict[str, Any] = Depends(require_user_or_local)) -> dict[str, Any]:
     try:
         url = validate_media_url(body.url)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     existing = find_session_id_by_url(DATA, url)
-    if existing:
+    can_reuse = bool(existing) and (
+        user["id"] == "lan-local" or db.owns_learning_session(existing, user["id"])
+    )
+    if can_reuse and existing:
         folder_existing = DATA / existing
         if find_session_media(folder_existing):
             detail = session_detail(folder_existing, existing)
             if detail:
                 return detail
-        # 课还在但片子丢了：清掉重下
         shutil.rmtree(folder_existing, ignore_errors=True)
-    require_active(DATA)
+    require_member_or_trial(user)
     session_id = uuid.uuid4().hex[:12]
     folder = DATA / session_id
     folder.mkdir(parents=True, exist_ok=True)
+    db.register_learning_session(session_id, user["id"])
+    if user["id"] != "lan-local":
+        if not db.membership_status(user["id"]).get("active") and not db.consume_trial(user["id"], "prepare:" + session_id):
+            shutil.rmtree(folder, ignore_errors=True)
+            raise HTTPException(402, "free quota exhausted")
     try:
         _media, audio, caption_text = await run_in_threadpool(ingest_url, url, folder)
     except Exception as exc:
+        if user["id"] != "lan-local":
+            db.refund_trial(user["id"], "prepare:" + session_id)
         shutil.rmtree(folder, ignore_errors=True)
         raise HTTPException(400, f"链接无法用于学习：{exc}") from exc
     sentences: list[dict[str, Any]] = []
@@ -620,13 +941,17 @@ async def prepare_url(body: PrepareUrlBody) -> dict[str, Any]:
 
 
 @app.get("/api/sessions")
-def api_sessions() -> dict[str, Any]:
-    return {"sessions": list_sessions(DATA)}
+def api_sessions(request: Request) -> dict[str, Any]:
+    user = current_user(request)
+    items = list_sessions(DATA)
+    if user:
+        items = [item for item in items if db.owns_learning_session(item["session_id"], user["id"])]
+    return {"sessions": items}
 
 
 @app.get("/api/session/{session_id}")
-def api_session(session_id: str) -> dict[str, Any]:
-    folder = _session_dir(session_id)
+def api_session(session_id: str, user: dict[str, Any] = Depends(require_session_access)) -> dict[str, Any]:
+    folder = require_owned_session(session_id, user)
     detail = session_detail(folder, session_id)
     if not detail:
         raise HTTPException(404, "session 不存在")
@@ -634,8 +959,8 @@ def api_session(session_id: str) -> dict[str, Any]:
 
 
 @app.patch("/api/session/{session_id}")
-def api_save_progress(session_id: str, body: ProgressBody) -> dict[str, str]:
-    folder = _session_dir(session_id)
+def api_save_progress(session_id: str, body: ProgressBody, user: dict[str, Any] = Depends(require_session_access)) -> dict[str, str]:
+    folder = require_owned_session(session_id, user)
     fields: dict[str, Any] = {
         "phase": body.phase,
         "index": body.index,
@@ -650,15 +975,15 @@ def api_save_progress(session_id: str, body: ProgressBody) -> dict[str, str]:
         fields["drafts"] = collapse_identical_drafts(
             apply_draft_snapshot(existing, body.drafts)
         )
-        if any(str(v or "").strip() for v in body.drafts.values()):
+        if any(str(v or "").strip() for v in body.drafts.values()) and user.get("id") == "lan-local":
             note_trial_use(DATA, session_id)
     write_meta(folder, **fields)
     return {"status": "ok"}
 
 
 @app.delete("/api/session/{session_id}")
-def api_delete_session(session_id: str) -> dict[str, str]:
-    folder = _session_dir(session_id)
+def api_delete_session(session_id: str, user: dict[str, Any] = Depends(require_session_access)) -> dict[str, str]:
+    folder = require_owned_session(session_id, user)
     shutil.rmtree(folder, ignore_errors=True)
     return {"status": "ok"}
 
@@ -670,9 +995,9 @@ class SpeakerPlayBody(BaseModel):
 
 
 @app.post("/api/session/{session_id}/speaker-play")
-def session_speaker_play(session_id: str, body: SpeakerPlayBody) -> dict[str, str]:
+def session_speaker_play(session_id: str, body: SpeakerPlayBody, user: dict[str, Any] = Depends(require_session_access)) -> dict[str, str]:
     """Play sentence audio via ffplay → Windows default device (Realtek Digital Output)."""
-    folder = _session_dir(session_id)
+    folder = require_owned_session(session_id, user)
     media = find_session_media(folder)
     playback = ensure_playback_audio(folder, media)
     path = playback if playback is not None and playback.is_file() else media
@@ -686,15 +1011,15 @@ def session_speaker_play(session_id: str, body: SpeakerPlayBody) -> dict[str, st
 
 
 @app.post("/api/session/{session_id}/speaker-stop")
-def session_speaker_stop(session_id: str) -> dict[str, str]:
+def session_speaker_stop(session_id: str, user: dict[str, Any] = Depends(require_session_access)) -> dict[str, str]:
     _ = session_id
     stop_speaker()
     return {"status": "ok"}
 
 
 @app.get("/api/session/{session_id}/audio")
-def session_audio(session_id: str) -> FileResponse:
-    folder = _session_dir(session_id)
+def session_audio(session_id: str, user: dict[str, Any] = Depends(require_session_access)) -> FileResponse:
+    folder = require_owned_session(session_id, user)
     media = find_session_media(folder)
     playback = ensure_playback_audio(folder, media)
     if playback is not None and playback.is_file():
@@ -728,8 +1053,8 @@ def session_audio(session_id: str) -> FileResponse:
 
 
 @app.get("/api/session/{session_id}/thumb")
-def session_thumb(session_id: str) -> FileResponse:
-    folder = _session_dir(session_id)
+def session_thumb(session_id: str, user: dict[str, Any] = Depends(require_session_access)) -> FileResponse:
+    folder = require_owned_session(session_id, user)
     thumb = folder / "thumb.jpg"
     try:
         if not thumb.is_file() or thumb.stat().st_size < 8000:
@@ -748,8 +1073,8 @@ def session_thumb(session_id: str) -> FileResponse:
 
 
 @app.get("/api/session/{session_id}/video")
-def session_video(session_id: str) -> FileResponse:
-    folder = _session_dir(session_id)
+def session_video(session_id: str, user: dict[str, Any] = Depends(require_session_access)) -> FileResponse:
+    folder = require_owned_session(session_id, user)
     media = find_session_media(folder)
     if media is None or not media.is_file():
         raise HTTPException(404, "没有可播放的视频")
@@ -781,8 +1106,9 @@ async def stt(
     audio: UploadFile = File(...),
     context: str = Form(default=""),
     target: str = Form(default=""),
+    user: dict[str, Any] = Depends(require_user_or_local),
 ) -> dict[str, str]:
-    require_active(DATA)
+    require_member_or_trial(user)
     tmp_dir = DATA / "_stt"
     tmp_dir.mkdir(parents=True, exist_ok=True)
     raw = tmp_dir / f"{uuid.uuid4().hex}{Path(audio.filename or 'clip.webm').suffix or '.webm'}"
@@ -817,9 +1143,10 @@ def api_translate(text: str) -> dict[str, str]:
 async def score(
     audio: UploadFile = File(...),
     session_id: str = Form(...),
+    user: dict[str, Any] = Depends(require_user_or_local),
 ) -> dict[str, Any]:
-    require_active(DATA)
-    folder = _session_dir(session_id)
+    require_member_or_trial(user)
+    folder = require_owned_session(session_id, user)
     original = folder / "audio.wav"
     if not original.is_file():
         raise HTTPException(400, "原音频不存在")

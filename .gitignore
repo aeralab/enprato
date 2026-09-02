@@ -3,6 +3,8 @@ frontend/dist/
 backend/data/
 backend/__pycache__/
 backend/app/__pycache__/
+tests/__pycache__/
+scripts/__pycache__/
 *.pyc
 .DS_Store
 .env
@@ -24,3 +26,13 @@ backend/app/__pycache__/
 /*执照*
 /**/*执照*
 /请勿上传/
+
+# deployment/payment credentials
+*.pem
+*.key
+*.p12
+*.pfx
+.env.*
+!.env.example
+*.crt
+*.cer

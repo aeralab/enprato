@@ -1,4 +1,6 @@
-import type { LicenseStatus, SessionDetail, SessionSummary, ShadowScore, UpdateInfo, WordSense } from "./types";
+import type { CurrentUser, CuratedLesson, LicenseStatus, Order, SessionDetail, SessionSummary, ShadowScore, UpdateInfo, WordSense } from "./types";
+
+let progressSaveChain: Promise<void> = Promise.resolve();
 
 async function readError(res: Response): Promise<string> {
   try {
@@ -44,7 +46,7 @@ export async function prepareSession(
   const body = new FormData();
   body.append("video", video);
   if (captions) body.append("captions", captions);
-  const res = await fetch("/api/prepare", { method: "POST", body });
+  const res = await fetch("/api/prepare", { method: "POST", body, credentials: "same-origin" });
   if (!res.ok) throw new Error(await readError(res));
   return res.json();
 }
@@ -52,6 +54,7 @@ export async function prepareSession(
 export async function prepareSessionFromUrl(url: string): Promise<SessionDetail> {
   const res = await fetch("/api/prepare-url", {
     method: "POST",
+    credentials: "same-origin",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ url }),
   });
@@ -166,21 +169,25 @@ export async function saveProgress(
   },
   options?: { keepalive?: boolean },
 ): Promise<void> {
-  await fetch(`/api/session/${sessionId}`, {
-    method: "PATCH",
-    headers: { "Content-Type": "application/json" },
-    keepalive: options?.keepalive ?? false,
-    body: JSON.stringify({
-      phase: payload.phase,
-      index: payload.index,
-      highlights: payload.highlights,
-      score: payload.score,
-      orientation: payload.orientation,
-      ...(payload.drafts
-        ? { drafts: Object.fromEntries(Object.entries(payload.drafts).map(([k, v]) => [String(k), v])) }
-        : {}),
-    }),
-  }).catch(() => undefined);
+  const request = async () => {
+    await fetch(`/api/session/${sessionId}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      keepalive: options?.keepalive ?? false,
+      body: JSON.stringify({
+        phase: payload.phase,
+        index: payload.index,
+        highlights: payload.highlights,
+        score: payload.score,
+        orientation: payload.orientation,
+        ...(payload.drafts
+          ? { drafts: Object.fromEntries(Object.entries(payload.drafts).map(([k, v]) => [String(k), v])) }
+          : {}),
+      }),
+    }).catch(() => undefined);
+  };
+  progressSaveChain = progressSaveChain.then(request, request);
+  await progressSaveChain;
 }
 
 export async function deleteSession(sessionId: string): Promise<void> {
@@ -211,6 +218,7 @@ export async function fetchLanLinks(): Promise<{
   ips: string[];
   links: string[];
   ipad_links?: string[];
+  ipad_home?: string[];
   ipad_build?: string;
   port: number;
 }> {
@@ -223,6 +231,7 @@ export async function fetchLanLinks(): Promise<{
 export async function claimRemoteSession(sessionId: string | null): Promise<void> {
   const res = await fetch("/api/remote-claim", {
     method: "POST",
+    credentials: "same-origin",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ session_id: sessionId || "" }),
   });
@@ -248,4 +257,62 @@ export async function fetchRemoteState(sessionId: string): Promise<{
   const res = await fetch(`/api/session/${sessionId}/remote-state`);
   if (!res.ok) throw new Error(await readError(res));
   return res.json();
+}
+
+
+export async function fetchCatalog(): Promise<CuratedLesson[]> {
+  const res = await fetch("/api/catalog", { credentials: "same-origin" });
+  if (!res.ok) throw new Error(await readError(res));
+  const data = (await res.json()) as { lessons?: CuratedLesson[] };
+  return Array.isArray(data.lessons) ? data.lessons : [];
+}
+
+export async function fetchCurrentUser(): Promise<CurrentUser | null> {
+  const res = await fetch("/api/auth/me", { credentials: "same-origin" });
+  if (!res.ok) throw new Error(await readError(res));
+  const data = (await res.json()) as { user: CurrentUser | null };
+  return data.user;
+}
+
+export async function registerAccount(email: string, password: string): Promise<CurrentUser> {
+  const res = await fetch("/api/auth/register", { method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email, password }) });
+  if (!res.ok) throw new Error(await readError(res));
+  return res.json();
+}
+
+export async function loginAccount(email: string, password: string): Promise<CurrentUser> {
+  const res = await fetch("/api/auth/login", { method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email, password }) });
+  if (!res.ok) throw new Error(await readError(res));
+  return res.json();
+}
+
+export async function logoutAccount(): Promise<void> {
+  const res = await fetch("/api/auth/logout", { method: "POST", credentials: "same-origin" });
+  if (!res.ok) throw new Error(await readError(res));
+}
+
+export async function grantDevMembership(): Promise<CurrentUser["membership"]> {
+  const res = await fetch("/api/dev/membership", { method: "POST", credentials: "same-origin" });
+  if (!res.ok) throw new Error(await readError(res));
+  const data = (await res.json()) as { membership: CurrentUser["membership"] };
+  return data.membership;
+}
+
+export async function createOrder(): Promise<Order> {
+  const res = await fetch("/api/payments/wechat/native", { method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ plan: "monthly_30d", provider: "wechat" }) });
+  if (!res.ok) throw new Error(await readError(res));
+  return res.json();
+}
+
+export async function fetchOrder(orderNo: string): Promise<Order> {
+  const res = await fetch("/api/payments/orders/" + encodeURIComponent(orderNo), { credentials: "same-origin" });
+  if (!res.ok) throw new Error(await readError(res));
+  return res.json();
+}
+
+export async function createRemoteToken(sessionId: string): Promise<string> {
+  const res = await fetch("/api/remote-token/" + encodeURIComponent(sessionId), { method: "POST", credentials: "same-origin" });
+  if (!res.ok) throw new Error(await readError(res));
+  const data = (await res.json()) as { token: string };
+  return data.token;
 }

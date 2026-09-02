@@ -67,14 +67,20 @@ def warmup() -> str:
 
 
 def transcribe_sentences(audio_path: Path) -> list[dict[str, Any]]:
+    """Full-video sentence split for imports without English captions.
+
+    Tuned for speed: beam_size=1 and no previous-text conditioning.
+    Word timestamps stay on so we can cut sentence boundaries.
+    """
     model = get_model()
+    _warm_model_once(model)
     segments, _info = model.transcribe(
         str(audio_path),
         language="en",
-        beam_size=5,
+        beam_size=1,
         vad_filter=True,
         word_timestamps=True,
-        condition_on_previous_text=True,
+        condition_on_previous_text=False,
     )
     words = []
     for segment in segments:

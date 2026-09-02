@@ -1,0 +1,18 @@
+[Unit]
+Description=Enprato FastAPI service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/enprato
+EnvironmentFile=/etc/enprato/enprato.env
+ExecStart=/home/ubuntu/enprato/backend/.venv/bin/python -m uvicorn backend.app.main:app --host 127.0.0.1 --port 18787
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

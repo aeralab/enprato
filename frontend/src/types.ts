@@ -96,3 +96,29 @@ export type SessionDetail = SessionSummary & {
   has_video?: boolean;
   created_at: string;
 };
+
+export type MembershipStatus = {
+  status: "active" | "expired" | "none" | string;
+  active: boolean;
+  expires_at: string;
+  plan?: string;
+  plan_name?: string;
+};
+
+export type CurrentUser = {
+  id: string;
+  email: string;
+  status: string;
+  membership: MembershipStatus;
+  trial: { limit: number; used: number; remaining: number };
+};
+
+export type Order = { id?: string; order_no: string; plan_code?: string; amount_fen: number; currency?: string; status: string; expires_at: string; payment?: { provider: string; code_url?: string } };
+
+export type CuratedLesson = {
+  id: string;
+  lesson: number;
+  title: string;
+  source_url: string;
+  series?: string;
+};

@@ -156,8 +156,7 @@ def mock_pay_enabled(data_root: Path) -> bool:
         return False
     if os.environ.get("ENPRATO_ALLOW_MOCK_PAY", "").strip().lower() in {"1", "true", "yes"}:
         return True
-    urls = pay_urls(data_root)
-    return not urls["pay_monthly_url"] and not urls["pay_lifetime_url"]
+    return False
 
 
 def checkout_license(data_root: Path, plan: str) -> dict[str, Any]:
