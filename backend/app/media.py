@@ -111,6 +111,19 @@ def find_ffprobe() -> str:
 
 
 def convert_to_wav(src: Path, dest: Path, sr: int = 16000) -> None:
+    if src.suffix.lower() == ".wav":
+        try:
+            import wave
+
+            with wave.open(str(src), "rb") as wf:
+                ready = wf.getnchannels() == 1 and wf.getframerate() == sr and wf.getsampwidth() == 2
+            if ready:
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                if src.resolve() != dest.resolve():
+                    shutil.copyfile(src, dest)
+                return
+        except Exception:
+            pass
     extract_wav(src, dest, sr=sr)
 
 

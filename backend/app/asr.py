@@ -93,14 +93,16 @@ def transcribe_sentences(audio_path: Path) -> list[dict[str, Any]]:
 
 
 def merge_dictation_text(prev: str, new: str, target: str = "") -> str:
-    p = " ".join(str(prev or "").split())
-    n = " ".join(str(new or "").split())
+    p = collapse_repeated_clauses(" ".join(str(prev or "").split()))
+    n = collapse_repeated_clauses(" ".join(str(new or "").split()))
     if not n:
         return p
     if not p:
         return n
-    pl = p.lower()
-    nl = n.lower()
+    pl = re.sub(r"[^\w\s]", " ", p.lower())
+    pl = " ".join(pl.split())
+    nl = re.sub(r"[^\w\s]", " ", n.lower())
+    nl = " ".join(nl.split())
     if nl in pl:
         return p
     if pl in nl:
@@ -108,7 +110,104 @@ def merge_dictation_text(prev: str, new: str, target: str = "") -> str:
     tt = " ".join(target.split()).lower()
     if tt and nl == tt:
         return n
-    return f"{p} {n}"
+    # 末尾已有高度重叠则不追加，避免「又识别一遍」叠成重复句
+    pw = pl.split()
+    nw = nl.split()
+    if pw and nw:
+        max_overlap = min(len(pw), len(nw), 24)
+        for k in range(max_overlap, 2, -1):
+            if pw[-k:] == nw[:k]:
+                merged = p + " " + " ".join(n.split()[k:])
+                return collapse_repeated_clauses(merged.strip())
+    return collapse_repeated_clauses(f"{p} {n}")
+
+
+def collapse_repeated_clauses(text: str) -> str:
+    """压掉 Whisper/STT 常见的整句、子句连环重复（含标点微差）。"""
+    text = " ".join(str(text or "").split())
+    if len(text) < 20:
+        return text
+
+    # 1) 按句号切开，去掉连续近重复句
+    parts = re.split(r"(?<=[.!?])\s+", text)
+    if len(parts) >= 2:
+        kept: list[str] = []
+        for part in parts:
+            if not part.strip():
+                continue
+            if kept and _clause_near_duplicate(kept[-1], part):
+                continue
+            kept.append(part.strip())
+        text = " ".join(kept)
+
+    words = text.split()
+    if len(words) < 6:
+        return text
+
+    # 2) 连续 n-gram 重复压成一次（n=2..20）
+    for _ in range(10):
+        changed = False
+        for n in range(min(20, len(words) // 2), 1, -1):
+            i = 0
+            out: list[str] = []
+            while i < len(words):
+                if i + 2 * n <= len(words) and _norm_word_span(words[i : i + n]) == _norm_word_span(
+                    words[i + n : i + 2 * n]
+                ):
+                    out.extend(words[i : i + n])
+                    i += n
+                    while i + n <= len(words) and _norm_word_span(out[-n:]) == _norm_word_span(words[i : i + n]):
+                        i += n
+                        changed = True
+                    continue
+                out.append(words[i])
+                i += 1
+            words = out
+            if changed:
+                break
+        if not changed:
+            break
+    return " ".join(words)
+
+
+def _norm_word_span(words: list[str]) -> tuple[str, ...]:
+    return tuple(_norm_token(w) for w in words if _norm_token(w))
+
+
+def _clause_near_duplicate(a: str, b: str) -> bool:
+    na = " ".join(_norm_token(t) for t in a.split() if _norm_token(t))
+    nb = " ".join(_norm_token(t) for t in b.split() if _norm_token(t))
+    if not na or not nb:
+        return False
+    if na == nb:
+        return True
+    if len(na) >= 12 and (na in nb or nb in na):
+        return True
+    return SequenceMatcher(None, na, nb).ratio() >= 0.92
+
+
+def prefer_cleaner_draft(cur: str, incoming: str) -> str:
+    """合并听写时不要无脑偏爱「更长」——重复幻觉长稿应让位给干净短稿。"""
+    c = str(cur or "")
+    n = str(incoming or "")
+    ct = c.strip()
+    nt = n.strip()
+    if not nt:
+        return c
+    if not ct:
+        return collapse_repeated_clauses(n)
+    cc = collapse_repeated_clauses(ct)
+    nn = collapse_repeated_clauses(nt)
+    c_bloated = len(ct) > max(48, int(len(cc) * 1.35))
+    n_bloated = len(nt) > max(48, int(len(nn) * 1.35))
+    if c_bloated and not n_bloated:
+        return nn
+    if n_bloated and not c_bloated:
+        return cc
+    if c_bloated and n_bloated:
+        return nn if len(nn) >= len(cc) else cc
+    # 两边都干净：保留信息更多的一侧
+    return nn if len(nn) >= len(cc) else cc
 
 
 def transcribe_speech(
@@ -120,19 +219,22 @@ def transcribe_speech(
 ) -> str:
     """Dictation / shadowing with accent: bias spelling toward the expected line."""
     model = get_model()
+    _warm_model_once(model)
     target = " ".join(target.split())
     ctx = " ".join(context.split())[:600]
-    prompt = _build_prompt(target=target, context=ctx)
-    beam = 1 if fast else 5
+    prompt = _build_prompt(target=target, context="" if fast else ctx, compact=fast)
+    beam = 1
 
-    if fast:
-        text = _run_transcribe(model, audio_path, prompt, vad=True, beam_size=beam)
-        if not text:
-            text = _run_transcribe(model, audio_path, prompt, vad=False, beam_size=beam)
-    else:
-        text = _run_transcribe(model, audio_path, prompt, vad=False, beam_size=beam)
-        if not text:
-            text = _run_transcribe(model, audio_path, prompt, vad=True, beam_size=beam)
+    # 短句听写：只跑一遍。VAD 常把短录音判成空，再无 VAD 重跑会把等待时间翻倍。
+    text = _run_transcribe(
+        model,
+        audio_path,
+        prompt,
+        vad=False,
+        beam_size=beam,
+        timestamps=False,
+        hotwords=not fast,
+    )
 
     text = _clean_stt(text)
     if target:
@@ -140,7 +242,12 @@ def transcribe_speech(
     return text
 
 
-def _build_prompt(*, target: str, context: str) -> str:
+def _build_prompt(*, target: str, context: str, compact: bool = False) -> str:
+    if compact:
+        parts = ["English dictation. Correct spelling. No extra sentences."]
+        if target:
+            parts.append("Expected: " + target)
+        return " ".join(parts)
     parts = [
         "English dictation by a non-native speaker with an accent.",
         "Output correct English spelling and punctuation.",
@@ -218,6 +325,8 @@ def _run_transcribe(
     *,
     vad: bool,
     beam_size: int = 5,
+    timestamps: bool = True,
+    hotwords: bool = True,
 ) -> str:
     kwargs: dict[str, Any] = {
         "language": "en",
@@ -226,6 +335,7 @@ def _run_transcribe(
         "initial_prompt": prompt,
         "temperature": 0.0,
         "condition_on_previous_text": False,
+        "without_timestamps": not timestamps,
         "no_speech_threshold": 0.35 if not vad else 0.5,
         "compression_ratio_threshold": 2.6,
         "log_prob_threshold": -1.2,
@@ -235,13 +345,14 @@ def _run_transcribe(
             "min_silence_duration_ms": 400,
             "speech_pad_ms": 400,
         }
-    rare = _rare_words(prompt)
+    rare = _rare_words(prompt) if hotwords else []
     if rare:
         kwargs["hotwords"] = " ".join(rare[:20])
     try:
         segments, _info = model.transcribe(str(audio_path), **kwargs)
     except TypeError:
         kwargs.pop("hotwords", None)
+        kwargs.pop("without_timestamps", None)
         segments, _info = model.transcribe(str(audio_path), **kwargs)
     return " ".join(seg.text.strip() for seg in segments if seg.text).strip()
 
@@ -322,7 +433,8 @@ def _clean_stt(text: str) -> str:
     cleaned = padded.strip()
     if cleaned and cleaned[0].isalpha():
         cleaned = cleaned[0].upper() + cleaned[1:]
-    return _collapse_hallucination(cleaned)
+    cleaned = _collapse_hallucination(cleaned)
+    return collapse_repeated_clauses(cleaned)
 
 
 def _collapse_hallucination(text: str) -> str:

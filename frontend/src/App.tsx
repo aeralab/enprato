@@ -87,11 +87,7 @@ function mergeDraftMaps(
   for (const [k, v] of Object.entries(incoming)) {
     const i = Number(k);
     if (!Number.isFinite(i)) continue;
-    const text = String(v || "");
-    const cur = String(next[i] || "");
-    if (!cur.trim() || text.trim().length >= cur.trim().length) {
-      next[i] = text;
-    }
+    next[i] = preferCleanerDraft(String(next[i] || ""), String(v || ""));
   }
   return next;
 }
@@ -105,7 +101,8 @@ function collapseIdenticalDrafts(drafts: Record<number, string>): Record<number,
   const seen = new Map<string, number>();
   const next = { ...drafts };
   for (const k of keys) {
-    const text = (next[k] || "").trim();
+    const text = dedupeRepeatedClauses(next[k] || "").trim();
+    next[k] = text;
     if (!text) continue;
     if (seen.has(text)) next[k] = "";
     else seen.set(text, k);
@@ -156,8 +153,8 @@ function normDictationWords(text: string): string[] {
 }
 
 function mergeDictationPiece(cur: string, piece: string, target: string): string {
-  const c = cur.trim();
-  const p = piece.trim();
+  const c = dedupeRepeatedClauses(cur.trim());
+  const p = dedupeRepeatedClauses(piece.trim());
   if (!p) return c;
   if (!c) return p;
   const cw = normDictationWords(c);
@@ -171,33 +168,100 @@ function mergeDictationPiece(cur: string, piece: string, target: string): string
     const tn = normDictationWords(target).join(" ");
     if (tn && pj === tn) return p;
     if (tn && cj === tn && pj === tn) return p;
-  }
-  return `${c} ${p}`;
-}
-
-function dedupeRepeatedClauses(text: string): string {
-  let out = text.trim();
-  if (out.length < 48) return out;
-  for (let len = Math.min(100, Math.floor(out.length / 2)); len >= 24; len--) {
-    for (let start = 0; start + len * 2 <= out.length; start++) {
-      const chunk = out.slice(start, start + len);
-      if (!chunk.trim()) continue;
-      if (out.slice(start + len, start + len * 2) === chunk) {
-        out = out.slice(0, start + len) + out.slice(start + len * 2).trimStart();
-        return dedupeRepeatedClauses(out);
+    const maxOverlap = Math.min(cw.length, pw.length, 24);
+    for (let k = maxOverlap; k >= 3; k -= 1) {
+      if (cw.slice(-k).join(" ") === pw.slice(0, k).join(" ")) {
+        return dedupeRepeatedClauses(`${c} ${p.split(/\s+/).slice(k).join(" ")}`.trim());
       }
     }
   }
-  return out;
+  return dedupeRepeatedClauses(`${c} ${p}`);
 }
 
-function draftsToText(drafts: Record<number, string>, index: number): string {
+function dedupeRepeatedClauses(text: string): string {
+  let out = text.trim().replace(/\s+/g, " ");
+  if (out.length < 20) return out;
+
+  const parts = out.split(/(?<=[.!?])\s+/);
+  if (parts.length >= 2) {
+    const kept: string[] = [];
+    for (const part of parts) {
+      const p = part.trim();
+      if (!p) continue;
+      if (kept.length) {
+        const a = normDictationWords(kept[kept.length - 1]).join(" ");
+        const b = normDictationWords(p).join(" ");
+        if (a && b && (a === b || (a.length >= 12 && (a.includes(b) || b.includes(a))))) continue;
+      }
+      kept.push(p);
+    }
+    out = kept.join(" ");
+  }
+
+  let words = out.split(/\s+/).filter(Boolean);
+  if (words.length < 6) return out;
+
+  for (let round = 0; round < 10; round += 1) {
+    let changed = false;
+    for (let n = Math.min(20, Math.floor(words.length / 2)); n >= 2; n -= 1) {
+      const next: string[] = [];
+      let i = 0;
+      while (i < words.length) {
+        if (i + 2 * n <= words.length) {
+          const a = normDictationWords(words.slice(i, i + n).join(" ")).join(" ");
+          const b = normDictationWords(words.slice(i + n, i + 2 * n).join(" ")).join(" ");
+          if (a && a === b) {
+            next.push(...words.slice(i, i + n));
+            i += n;
+            while (i + n <= words.length) {
+              const c = normDictationWords(words.slice(i, i + n).join(" ")).join(" ");
+              if (c !== a) break;
+              i += n;
+              changed = true;
+            }
+            continue;
+          }
+        }
+        next.push(words[i]);
+        i += 1;
+      }
+      words = next;
+      if (changed) break;
+    }
+    if (!changed) break;
+  }
+  return words.join(" ");
+}
+
+function preferCleanerDraft(cur: string, incoming: string): string {
+  const ct = String(cur || "").trim();
+  const nt = String(incoming || "").trim();
+  if (!nt) return dedupeRepeatedClauses(ct);
+  if (!ct) return dedupeRepeatedClauses(nt);
+  const cc = dedupeRepeatedClauses(ct);
+  const nn = dedupeRepeatedClauses(nt);
+  const cBloated = ct.length > Math.max(48, Math.floor(cc.length * 1.35));
+  const nBloated = nt.length > Math.max(48, Math.floor(nn.length * 1.35));
+  if (cBloated && !nBloated) return nn;
+  if (nBloated && !cBloated) return cc;
+  if (cBloated && nBloated) return nn.length >= cc.length ? nn : cc;
+  return nn.length >= cc.length ? nn : cc;
+}
+
+type DraftTextRow = {
+  sentenceIndex: number;
+  start: number;
+  end: number;
+  text: string;
+};
+
+function draftTextRows(drafts: Record<number, string>, index: number): { text: string; rows: DraftTextRow[] } {
   let end = index;
   for (const k of Object.keys(drafts)) {
     const i = Number(k);
     if (Number.isFinite(i)) end = Math.max(end, i);
   }
-  const lines = Array.from({ length: end + 1 }, (_, i) => String(drafts[i] ?? ""));
+  const lines = Array.from({ length: end + 1 }, (_, i) => dedupeRepeatedClauses(String(drafts[i] ?? "")));
   let lastNonEmpty = -1;
   for (let i = lines.length - 1; i >= 0; i--) {
     if (lines[i].trim()) {
@@ -205,8 +269,57 @@ function draftsToText(drafts: Record<number, string>, index: number): string {
       break;
     }
   }
-  if (lastNonEmpty < 0) return "";
-  return lines.slice(0, lastNonEmpty + 1).join("\n\n");
+  if (lastNonEmpty < 0) return { text: "", rows: [] };
+
+  const kept = lines.slice(0, lastNonEmpty + 1);
+  const rows: DraftTextRow[] = [];
+  let pos = 0;
+  for (let i = 0; i < kept.length; i += 1) {
+    const text = kept[i] || "";
+    rows.push({ sentenceIndex: i, start: pos, end: pos + text.length, text });
+    pos += text.length;
+    if (i < kept.length - 1) pos += 2;
+  }
+  return { text: kept.join("\n\n"), rows };
+}
+
+function draftsToText(drafts: Record<number, string>, index: number): string {
+  return draftTextRows(drafts, index).text;
+}
+
+type DraftBeforeInput = {
+  value: string;
+  selectionStart: number;
+  selectionEnd: number;
+  inputType: string;
+  rows: DraftTextRow[];
+};
+
+function isDraftDeleteInput(inputType: string): boolean {
+  return inputType.startsWith("delete");
+}
+
+function selectedDraftIndexes(before: DraftBeforeInput): number[] {
+  const start = Math.min(before.selectionStart, before.selectionEnd);
+  const end = Math.max(before.selectionStart, before.selectionEnd);
+  if (end <= start) return [];
+
+  const touched: { index: number; overlap: number; length: number; fullySelected: boolean }[] = [];
+  for (const row of before.rows) {
+    const overlap = Math.min(end, row.end) - Math.max(start, row.start);
+    if (row.text.trim() && overlap > 0) {
+      touched.push({
+        index: row.sentenceIndex,
+        overlap,
+        length: Math.max(1, row.end - row.start),
+        fullySelected: start <= row.start && end >= row.end,
+      });
+    }
+  }
+  if (touched.length > 1) return touched.map((item) => item.index);
+  return touched
+    .filter((item) => item.fullySelected || item.overlap / item.length >= 0.65)
+    .map((item) => item.index);
 }
 
 function mediaSrc(path: string): string {
@@ -1235,6 +1348,7 @@ function Studio({
   const [volume, setVolume] = useState(1);
   const [captionMode, setCaptionMode] = useState<CaptionMode>("off");
   const [zhMap, setZhMap] = useState<Record<string, string>>({});
+  const zhPendingRef = useRef<Record<string, boolean>>({});
   const [phoneMic, setPhoneMic] = useState(false);
   const [phoneLink, setPhoneLink] = useState("");
   const [ipadStudio, setIpadStudio] = useState(false);
@@ -1253,6 +1367,7 @@ function Studio({
   const draftManualEditAtRef = useRef<Record<number, number>>({});
   const draftServerSnapRef = useRef("");
   const draftBaselineRef = useRef("");
+  const draftBeforeInputRef = useRef<DraftBeforeInput | null>(null);
   const [draftCanRestore, setDraftCanRestore] = useState(false);
 
   const sentence = sentences[index];
@@ -1311,6 +1426,47 @@ function Studio({
     } catch {
       /* ignore */
     }
+  }
+
+  function clearSelectedDraftSentences(before: DraftBeforeInput, nextText: string): boolean {
+    if (!isDraftDeleteInput(before.inputType)) return false;
+    if (nextText.length >= before.value.length) return false;
+    const cleared = selectedDraftIndexes(before).filter((i) => i >= 0 && i < sentences.length);
+    if (!cleared.length) return false;
+
+    const editedAt = Date.now();
+    const next = { ...draftsRef.current };
+    for (const i of cleared) {
+      next[i] = "";
+      draftManualEditAtRef.current[i] = editedAt;
+    }
+    const first = cleared[0];
+    draftsRef.current = next;
+    setDrafts(next);
+    draftLocalEditUntilRef.current = editedAt + 8000;
+    indexRef.current = first;
+    setIndex(first);
+    setPhase("listen");
+    setCaptionMode("off");
+    setDraftCanRestore(JSON.stringify(next) !== draftBaselineRef.current);
+    writeDraftsCache(sessionId, next, first);
+    void saveProgress(
+      sessionId,
+      sessionProgressPayload({
+        phase: "listen",
+        index: first,
+        drafts: next,
+        highlights,
+        score,
+        orientation,
+      }),
+    );
+    const target = sentences[first];
+    if (target && !recording) {
+      pauseAtRef.current = target.start;
+      playAt(target.start);
+    }
+    return true;
   }
 
   function revealDraftEnd() {
@@ -1473,18 +1629,21 @@ function Studio({
   }, [orientation, showAudioOnly, videoUrl]);
 
   useEffect(() => {
-    if (captionMode !== "bi" || !overlayEnglish) return;
-    if (zhMap[overlayEnglish]) return;
-    let cancelled = false;
-    void translateSentence(overlayEnglish)
-      .then((zh) => {
-        if (!cancelled && zh) setZhMap((prev) => ({ ...prev, [overlayEnglish]: zh }));
-      })
-      .catch(() => undefined);
-    return () => {
-      cancelled = true;
-    };
-  }, [captionMode, overlayEnglish, zhMap]);
+    if (captionMode !== "bi") return;
+    const targets = [overlayEnglish, sentences[index + 1]?.text || ""].filter((item) => item.trim());
+    for (const text of targets) {
+      if (zhMap[text] || zhPendingRef.current[text]) continue;
+      zhPendingRef.current[text] = true;
+      void translateSentence(text)
+        .then((zh) => {
+          if (zh) setZhMap((prev) => ({ ...prev, [text]: zh }));
+        })
+        .catch(() => undefined)
+        .finally(() => {
+          delete zhPendingRef.current[text];
+        });
+    }
+  }, [captionMode, overlayEnglish, index, sentences, zhMap]);
 
   useEffect(() => {
     if (!sessionId) return;
@@ -2196,11 +2355,11 @@ function Studio({
             const piece = String(text || "").trim();
             setDrafts((prev) => {
               if ((draftManualEditAtRef.current[i] || 0) >= micStartedAtRef.current) return prev;
-              let merged = base.trim();
+              let merged = dedupeRepeatedClauses(base.trim());
               if (piece) {
                 merged = dedupeRepeatedClauses(mergeDictationPiece(base, piece, target));
               } else if (liveCur && liveCur !== base.trim()) {
-                merged = liveCur;
+                merged = dedupeRepeatedClauses(liveCur);
               }
               if (!merged) return prev;
               const next = { ...prev, [i]: merged };
@@ -2554,7 +2713,21 @@ function Studio({
                       window.setTimeout(() => revealDraftEnd(), 0);
                     }
                   }}
+                  onBeforeInput={(e) => {
+                    const el = e.currentTarget;
+                    const native = e.nativeEvent as InputEvent;
+                    draftBeforeInputRef.current = {
+                      value: el.value,
+                      selectionStart: el.selectionStart,
+                      selectionEnd: el.selectionEnd,
+                      inputType: native.inputType || "",
+                      rows: draftTextRows(draftsRef.current, indexRef.current).rows,
+                    };
+                  }}
                   onChange={(e) => {
+                    const before = draftBeforeInputRef.current;
+                    draftBeforeInputRef.current = null;
+                    if (before && clearSelectedDraftSentences(before, e.target.value)) return;
                     const editedAt = Date.now();
                     draftLocalEditUntilRef.current = editedAt + 8000;
                     const parts = dedupeParagraphs(e.target.value.split(/\n\s*\n/));

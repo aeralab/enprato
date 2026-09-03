@@ -7,6 +7,7 @@ from typing import Any
 import httpx
 
 UA = {"User-Agent": "enprato/0.1"}
+_http = httpx.Client(timeout=httpx.Timeout(3.0, connect=1.2), headers=UA, follow_redirects=True)
 
 
 def _norm(word: str) -> str:
@@ -36,11 +37,10 @@ def lookup_word(raw: str) -> dict[str, Any]:
 def _english_entry(word: str) -> dict[str, Any]:
     url = f"https://api.dictionaryapi.dev/api/v2/entries/en/{word}"
     try:
-        with httpx.Client(timeout=8.0, headers=UA) as client:
-            resp = client.get(url)
-            if resp.status_code != 200:
-                return {}
-            data = resp.json()
+        resp = _http.get(url, timeout=4.0)
+        if resp.status_code != 200:
+            return {}
+        data = resp.json()
     except Exception:
         return {}
     if not isinstance(data, list) or not data:
@@ -69,14 +69,14 @@ def _english_entry(word: str) -> dict[str, Any]:
 
 def _chinese_gloss(word: str) -> list[str]:
     try:
-        with httpx.Client(timeout=8.0, headers=UA) as client:
-            resp = client.get(
-                "https://dict.youdao.com/suggest",
-                params={"q": word, "le": "en", "num": 5, "doctype": "json"},
-            )
-            if resp.status_code != 200:
-                return []
-            payload = resp.json()
+        resp = _http.get(
+            "https://dict.youdao.com/suggest",
+            params={"q": word, "le": "en", "num": 5, "doctype": "json"},
+            timeout=3.0,
+        )
+        if resp.status_code != 200:
+            return []
+        payload = resp.json()
     except Exception:
         return []
     entries = (
@@ -103,14 +103,14 @@ def translate_en_zh(raw: str) -> str:
 
 def _youdao_translate(text: str) -> str:
     try:
-        with httpx.Client(timeout=10.0, headers=UA) as client:
-            resp = client.get(
-                "https://fanyi.youdao.com/translate",
-                params={"doctype": "json", "type": "EN2ZH_CN", "i": text[:800]},
-            )
-            if resp.status_code != 200:
-                return ""
-            data = resp.json()
+        resp = _http.get(
+            "https://fanyi.youdao.com/translate",
+            params={"doctype": "json", "type": "EN2ZH_CN", "i": text[:800]},
+            timeout=2.5,
+        )
+        if resp.status_code != 200:
+            return ""
+        data = resp.json()
     except Exception:
         return ""
     parts: list[str] = []
@@ -126,14 +126,14 @@ def _youdao_translate(text: str) -> str:
 
 def _mymemory_translate(text: str) -> str:
     try:
-        with httpx.Client(timeout=10.0, headers=UA) as client:
-            resp = client.get(
-                "https://api.mymemory.translated.net/get",
-                params={"q": text[:500], "langpair": "en|zh-CN"},
-            )
-            if resp.status_code != 200:
-                return ""
-            data = resp.json()
+        resp = _http.get(
+            "https://api.mymemory.translated.net/get",
+            params={"q": text[:500], "langpair": "en|zh-CN"},
+            timeout=3.0,
+        )
+        if resp.status_code != 200:
+            return ""
+        data = resp.json()
     except Exception:
         return ""
     return str((data.get("responseData") or {}).get("translatedText") or "").strip()

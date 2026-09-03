@@ -43,7 +43,9 @@ def read_meta(folder: Path) -> dict[str, Any]:
 
 
 def merge_draft_maps(existing: dict[str, str], incoming: dict[str, str] | None) -> dict[str, str]:
-    """合并听写稿：保留更长/非空内容，避免电脑与手机互相覆盖丢字。"""
+    """合并听写稿：保留更干净内容，避免重复幻觉长稿压过短稿。"""
+    from .asr import prefer_cleaner_draft
+
     out = {str(k): str(v) for k, v in existing.items()}
     if not incoming:
         return out
@@ -52,16 +54,17 @@ def merge_draft_maps(existing: dict[str, str], incoming: dict[str, str] | None) 
         text = str(value or "")
         prev = str(out.get(key) or "")
         if text.strip() or not prev.strip():
-            if not prev.strip() or len(text.strip()) >= len(prev.strip()):
-                out[key] = text
+            out[key] = prefer_cleaner_draft(prev, text)
     return out
 
 
 def apply_draft_snapshot(existing: dict[str, str], incoming: dict[str, str] | None) -> dict[str, str]:
     """整页听写稿快照：incoming 覆盖 0..max 句，允许用空串清空；保留更后面的句。"""
+    from .asr import collapse_repeated_clauses
+
     if incoming is None:
-        return {str(k): str(v) for k, v in existing.items()}
-    snap = {str(k): str(v or "") for k, v in incoming.items()}
+        return {str(k): collapse_repeated_clauses(str(v)) for k, v in existing.items()}
+    snap = {str(k): collapse_repeated_clauses(str(v or "")) for k, v in incoming.items()}
     max_i = -1
     for key in snap:
         try:
@@ -79,13 +82,15 @@ def apply_draft_snapshot(existing: dict[str, str], incoming: dict[str, str] | No
         except (TypeError, ValueError):
             continue
         if i > max_i and str(value or "").strip():
-            out[key] = str(value)
+            out[key] = collapse_repeated_clauses(str(value))
     return out
 
 
 def collapse_identical_drafts(drafts: dict[str, str]) -> dict[str, str]:
-    """相同听写内容只保留最早一句，其余清空。"""
-    out = {str(k): str(v) for k, v in drafts.items()}
+    """相同听写内容只保留最早一句，其余清空；并压掉句内重复幻觉。"""
+    from .asr import collapse_repeated_clauses
+
+    out = {str(k): collapse_repeated_clauses(str(v)) for k, v in drafts.items()}
     keys = sorted(int(k) for k in out if str(k).isdigit())
     seen: dict[str, int] = {}
     for k in keys:

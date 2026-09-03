@@ -3,7 +3,7 @@ from __future__ import annotations
 _IPAD_BTN_SPEAK = "\u8bf4\u8bdd"
 _IPAD_BTN_STOP = "\u505c\u6b62"
 # 改 iPad 页后递增；固定入口 /ipad 会跳到最新版，页内也会自动检测并刷新
-IPAD_BUILD = "20260902a"
+IPAD_BUILD = "20260903d"
 
 IPAD_PAGE = """<!DOCTYPE html>
 <html lang="zh-CN">
@@ -309,6 +309,16 @@ IPAD_PAGE = """<!DOCTYPE html>
       font-size: 0.98rem;
       line-height: 1.55;
       color: #374151;
+      border-radius: 8px;
+      padding: 2px 4px;
+      cursor: pointer;
+      -webkit-tap-highlight-color: transparent;
+      user-select: none;
+    }
+    .doc-tail-item.doc-tail-selected {
+      background: #fff7ed;
+      outline: 2px solid #f59e0b;
+      outline-offset: 0;
     }
     .doc-tail-no {
       flex: 0 0 auto;
@@ -433,6 +443,10 @@ IPAD_PAGE = """<!DOCTYPE html>
       cursor: pointer;
       touch-action: manipulation;
     }
+    .delete-selected-btn {
+      border-color: #ef4444;
+      color: #b91c1c;
+    }
     .restore-btn[hidden] { display: none; }
     .ok { color: #059669; }
     .err { color: #b91c1c; }
@@ -532,6 +546,7 @@ IPAD_PAGE = """<!DOCTYPE html>
         </div>
       </div>
       <div class="doc-tools">
+        <button id="deleteSelectedBtn" type="button" class="restore-btn delete-selected-btn" hidden>删除选中</button>
         <button id="restoreBtn" type="button" class="restore-btn" hidden>恢复修改前</button>
       </div>
       <div id="status" class="status"></div>
@@ -571,6 +586,9 @@ IPAD_PAGE = """<!DOCTYPE html>
       } catch (e) {}
     }, 12000);
     let switchingSession = false;
+    let sentencesRev = '';
+    let syncBusy = false;
+    const selectedDraftRows = new Set();
     const videoEl = document.getElementById('video');
     const videoWrapEl = document.getElementById('videoWrap');
     const metaEl = document.getElementById('meta');
@@ -591,6 +609,7 @@ IPAD_PAGE = """<!DOCTYPE html>
     const captionEnEl = document.getElementById('captionEn');
     const captionZhEl = document.getElementById('captionZh');
     const statusEl = document.getElementById('status');
+    const deleteSelectedBtn = document.getElementById('deleteSelectedBtn');
     const restoreBtn = document.getElementById('restoreBtn');
     const sessionPicker = document.getElementById('sessionPicker');
     const refreshSessionsBtn = document.getElementById('refreshSessionsBtn');
@@ -608,6 +627,7 @@ IPAD_PAGE = """<!DOCTYPE html>
     let repeatClick = { at: 0, baseIndex: 0, count: 0 };
     let captionMode = 'off';
     const zhMap = {};
+    const zhPending = {};
     let mediaRecorder = null, chunks = [], stream = null;
     let saveTimer = 0, lastSent = '';
     let sttBusy = false;
@@ -744,6 +764,22 @@ IPAD_PAGE = """<!DOCTYPE html>
       return captionMode === 'off' ? '字幕：关' : captionMode === 'en' ? '字幕：英语' : '字幕：双语';
     }
 
+    function ensureZh(text) {
+      const key = String(text || '').trim();
+      if (!key || zhMap[key] || zhPending[key]) return;
+      zhPending[key] = true;
+      fetch('/api/translate?text=' + encodeURIComponent(key))
+        .then((r) => (r.ok ? r.json() : Promise.reject()))
+        .then((d) => {
+          zhMap[key] = String(d.zh || '');
+          if (overlayEnglish() === key) captionZhEl.textContent = zhMap[key] || '';
+        })
+        .catch(() => {
+          if (overlayEnglish() === key && !zhMap[key]) captionZhEl.textContent = '';
+        })
+        .finally(() => { delete zhPending[key]; });
+    }
+
     function refreshCaption() {
       captionBtn.textContent = captionLabel();
       captionBtn.classList.toggle('primary', captionMode !== 'off');
@@ -762,16 +798,10 @@ IPAD_PAGE = """<!DOCTYPE html>
           captionZhEl.textContent = zhMap[text];
         } else {
           captionZhEl.textContent = '正在翻译…';
-          fetch('/api/translate?text=' + encodeURIComponent(text))
-            .then((r) => (r.ok ? r.json() : Promise.reject()))
-            .then((d) => {
-              zhMap[text] = String(d.zh || '');
-              if (overlayEnglish() === text) captionZhEl.textContent = zhMap[text] || '';
-            })
-            .catch(() => {
-              if (overlayEnglish() === text) captionZhEl.textContent = '';
-            });
+          ensureZh(text);
         }
+        const next = String(sentences[index + 1]?.text || '');
+        if (next) ensureZh(next);
       } else {
         captionZhEl.style.display = 'none';
         captionZhEl.textContent = '';
@@ -965,12 +995,104 @@ IPAD_PAGE = """<!DOCTYPE html>
     function mergeDraftText(cur, incoming, idx) {
       const c = String(cur ?? '');
       const n = String(incoming ?? '');
-      if (idx != null && hasUnsavedDraftEdit(idx)) return c;
+      if (idx != null && hasUnsavedDraftEdit(idx)) return collapseRepeatedClauses(c);
+      return preferCleanerDraft(c, n);
+    }
+
+    function normWords(text) {
+      return String(text || '').toLowerCase().replace(/[^\w\s']/g, ' ').split(/\s+/).filter(Boolean);
+    }
+
+    function collapseRepeatedClauses(text) {
+      let out = String(text || '').replace(/\s+/g, ' ').trim();
+      if (out.length < 20) return out;
+
+      // 句级去重
+      const parts = out.split(/(?<=[.!?])\s+/);
+      if (parts.length >= 2) {
+        const kept = [];
+        for (const part of parts) {
+          const p = part.trim();
+          if (!p) continue;
+          if (kept.length) {
+            const a = normWords(kept[kept.length - 1]).join(' ');
+            const b = normWords(p).join(' ');
+            if (a && b && (a === b || (a.length >= 12 && (a.includes(b) || b.includes(a))))) continue;
+          }
+          kept.push(p);
+        }
+        out = kept.join(' ');
+      }
+
+      let words = out.split(/\s+/).filter(Boolean);
+      if (words.length < 6) return out;
+
+      for (let round = 0; round < 10; round++) {
+        let changed = false;
+        for (let n = Math.min(20, Math.floor(words.length / 2)); n >= 2; n--) {
+          const next = [];
+          let i = 0;
+          while (i < words.length) {
+            if (i + 2 * n <= words.length) {
+              const a = normWords(words.slice(i, i + n).join(' ')).join(' ');
+              const b = normWords(words.slice(i + n, i + 2 * n).join(' ')).join(' ');
+              if (a && a === b) {
+                next.push(...words.slice(i, i + n));
+                i += n;
+                while (i + n <= words.length) {
+                  const c = normWords(words.slice(i, i + n).join(' ')).join(' ');
+                  if (c !== a) break;
+                  i += n;
+                  changed = true;
+                }
+                continue;
+              }
+            }
+            next.push(words[i]);
+            i += 1;
+          }
+          words = next;
+          if (changed) break;
+        }
+        if (!changed) break;
+      }
+      return words.join(' ');
+    }
+
+    function preferCleanerDraft(cur, incoming) {
+      const c = String(cur ?? '');
+      const n = String(incoming ?? '');
       const ct = c.trim();
       const nt = n.trim();
-      if (!nt) return c;
-      if (!ct) return n;
-      return nt.length >= ct.length ? n : c;
+      if (!nt) return collapseRepeatedClauses(c);
+      if (!ct) return collapseRepeatedClauses(n);
+      const cc = collapseRepeatedClauses(ct);
+      const nn = collapseRepeatedClauses(nt);
+      const cBloated = ct.length > Math.max(48, Math.floor(cc.length * 1.35));
+      const nBloated = nt.length > Math.max(48, Math.floor(nn.length * 1.35));
+      if (cBloated && !nBloated) return nn;
+      if (nBloated && !cBloated) return cc;
+      if (cBloated && nBloated) return nn.length >= cc.length ? nn : cc;
+      return nn.length >= cc.length ? nn : cc;
+    }
+
+    function sanitizeAllDrafts() {
+      for (const k of Object.keys(drafts)) {
+        const cleaned = collapseRepeatedClauses(draftAt(Number(k)));
+        if (cleaned !== draftAt(Number(k))) drafts[String(k)] = cleaned;
+      }
+      if (docEl && document.activeElement !== docEl) {
+        const cleaned = collapseRepeatedClauses(draftAt(index));
+        if (docEl.value !== cleaned) docEl.value = cleaned;
+      } else if (docEl && document.activeElement === docEl) {
+        const cleaned = collapseRepeatedClauses(String(docEl.value || ''));
+        if (cleaned !== docEl.value) {
+          const pos = docEl.selectionStart;
+          docEl.value = cleaned;
+          drafts[String(index)] = cleaned;
+          try { docEl.setSelectionRange(Math.min(pos, cleaned.length), Math.min(pos, cleaned.length)); } catch (e) {}
+        }
+      }
     }
 
     function restoreLocal() {
@@ -1022,7 +1144,7 @@ IPAD_PAGE = """<!DOCTYPE html>
     }
 
     function draftAt(i) {
-      return String(drafts[String(i)] || drafts[i] || '');
+      return collapseRepeatedClauses(String(drafts[String(i)] || drafts[i] || ''));
     }
 
     function escapeHtml(text) {
@@ -1033,7 +1155,9 @@ IPAD_PAGE = """<!DOCTYPE html>
     }
 
     function syncCurrentDraft() {
-      drafts[String(index)] = String(docEl.value || '');
+      const cleaned = collapseRepeatedClauses(String(docEl.value || ''));
+      if (docEl.value !== cleaned) docEl.value = cleaned;
+      drafts[String(index)] = cleaned;
       bumpDraftLocal(index);
       persistLocal();
     }
@@ -1064,6 +1188,65 @@ IPAD_PAGE = """<!DOCTYPE html>
       return rows;
     }
 
+    function updateDeleteSelectedBtn() {
+      if (!deleteSelectedBtn) return;
+      deleteSelectedBtn.hidden = selectedDraftRows.size === 0;
+      if (!deleteSelectedBtn.hidden) deleteSelectedBtn.textContent = '删除选中 ' + selectedDraftRows.size + ' 句';
+    }
+
+    function clearDraftRowSelection() {
+      selectedDraftRows.clear();
+      updateDeleteSelectedBtn();
+    }
+
+    function toggleDraftRowSelection(i) {
+      if (!Number.isFinite(i)) return;
+      if (selectedDraftRows.has(i)) selectedDraftRows.delete(i);
+      else selectedDraftRows.add(i);
+      renderDocTail();
+      updateDeleteSelectedBtn();
+    }
+
+    async function deleteSelectedDraftRows() {
+      if (recording || !selectedDraftRows.size) return;
+      const rows = Array.from(selectedDraftRows)
+        .map((item) => Number(item))
+        .filter((item) => Number.isFinite(item) && item >= 0 && item < total)
+        .sort((a, b) => a - b);
+      if (!rows.length) {
+        clearDraftRowSelection();
+        return;
+      }
+      if (!editBaseline) resetEditBaseline();
+      syncCurrentDraft();
+      for (const i of rows) {
+        drafts[String(i)] = '';
+        bumpDraftLocal(i);
+      }
+      const first = rows[0];
+      selectedDraftRows.clear();
+      localIndexControl = true;
+      index = first;
+      pauseAt = sentences[first]?.start || 0;
+      captionsOffForNewSentence();
+      docEl.value = '';
+      lastSent = '';
+      persistLocal();
+      renderStrip();
+      renderDocView(true);
+      updateRestoreBtn();
+      if (sentences[first]) {
+        userPaused = false;
+        playAt(sentences[first].start);
+      }
+      try {
+        await saveAll();
+        setStatus('已删除选中句，开始重听', 'ok');
+      } catch (e) {
+        setStatus('已本地删除，同步保存失败', 'err');
+      }
+    }
+
     function renderDocTail() {
       if (!docTailEl) return;
       const entries = recentDraftEntries(8);
@@ -1077,7 +1260,8 @@ IPAD_PAGE = """<!DOCTYPE html>
         const done = !!t;
         const cls = 'doc-tail-item'
           + (isNow ? ' doc-tail-now' : '')
-          + (done ? ' doc-tail-done' : ' doc-tail-empty-line');
+          + (done ? ' doc-tail-done' : ' doc-tail-empty-line')
+          + (selectedDraftRows.has(i) ? ' doc-tail-selected' : '');
         const text = done ? escapeHtml(t) : (isNow ? '正在听写…' : '（未听写）');
         return '<div class="' + cls + '" data-i="' + i + '">'
           + '<button type="button" class="doc-tail-no" data-i="' + i + '" title="跳到第 ' + n + ' 句">' + n + '</button>'
@@ -1086,8 +1270,16 @@ IPAD_PAGE = """<!DOCTYPE html>
       docTailEl.querySelectorAll('.doc-tail-no').forEach((btn) => {
         btn.addEventListener('click', (e) => {
           e.preventDefault();
+          e.stopPropagation();
           const i = Number(btn.getAttribute('data-i'));
           if (Number.isFinite(i)) void pickSentence(i);
+        });
+      });
+      docTailEl.querySelectorAll('.doc-tail-item').forEach((row) => {
+        row.addEventListener('click', (e) => {
+          if (e.target && e.target.closest && e.target.closest('.doc-tail-no')) return;
+          const i = Number(row.getAttribute('data-i'));
+          toggleDraftRowSelection(i);
         });
       });
       const scrollTail = () => {
@@ -1435,6 +1627,8 @@ IPAD_PAGE = """<!DOCTYPE html>
         try { localStorage.setItem('enprato.ipad.lastSession', sessionId); } catch (e) {}
         boundVideoSession = '';
         localIndexControl = false;
+        sentencesRev = '';
+        clearDraftRowSelection();
         drafts = {};
         resetDraftRevs();
         index = 0;
@@ -1484,18 +1678,22 @@ IPAD_PAGE = """<!DOCTYPE html>
     }
 
     async function syncState() {
+      if (syncBusy) return;
+      syncBusy = true;
+      try {
       const switched = await followActiveSession();
       if (!sessionId) {
         metaEl.textContent = '等待电脑端打开 iPad 听写';
         btn.disabled = true;
         return;
       }
-      try {
-        const res = await fetch('/api/session/' + sessionId + '/remote-state');
+        const qs = sentencesRev ? ('?sentences_rev=' + encodeURIComponent(sentencesRev)) : '';
+        const res = await fetch('/api/session/' + sessionId + '/remote-state' + qs);
         if (!res.ok) throw new Error('fail');
         const data = await res.json();
         const prevIndex = index;
         total = data.total || 0;
+        if (data.sentences_rev) sentencesRev = String(data.sentences_rev);
         if (Array.isArray(data.sentences) && data.sentences.length) {
           sentences = data.sentences;
         }
@@ -1512,6 +1710,7 @@ IPAD_PAGE = """<!DOCTYPE html>
           drafts = nextDrafts;
           restoreLocal();
           collapseIdenticalDrafts();
+          sanitizeAllDrafts();
           persistLocal();
           if (localCharsBefore > serverChars + 20) {
             void saveAll();
@@ -1521,6 +1720,7 @@ IPAD_PAGE = """<!DOCTYPE html>
             const merged = mergeDraftText(draftAt(Number(k)), v, Number(k));
             if (merged !== draftAt(Number(k))) drafts[String(k)] = merged;
           }
+          sanitizeAllDrafts();
         }
         if (data.draft != null && !draftAt(index).trim() && !hasUnsavedDraftEdit(index)) {
           drafts[String(index)] = data.draft;
@@ -1550,12 +1750,9 @@ IPAD_PAGE = """<!DOCTYPE html>
         }
         if (!typing) resetEditBaseline();
       } catch (e) {
-        // 上次会话失效时清掉自动恢复，避免反复请求把页面拖崩
-        if (sessionId) {
-          try { localStorage.removeItem('enprato.ipad.lastSession'); } catch (err) {}
-          clearVideoSrc('');
-        }
         setStatus('同步失败，请检查电脑端连接，或从下方重新选课', 'err');
+      } finally {
+        syncBusy = false;
       }
     }
 
@@ -1616,10 +1813,12 @@ IPAD_PAGE = """<!DOCTYPE html>
     async function saveAll() {
       if (recording) return;
       syncCurrentDraft();
+      sanitizeAllDrafts();
       if (document.activeElement !== docEl && !hasUnsavedDraftEdit(index)) {
         await absorbServerDraftsIfRicher();
       }
       collapseIdenticalDrafts();
+      sanitizeAllDrafts();
       const payload = buildPayload();
       const snap = JSON.stringify({ drafts: payload, index });
       if (snap === lastSent) return;
@@ -1653,6 +1852,9 @@ IPAD_PAGE = """<!DOCTYPE html>
     if (restoreBtn) {
       restoreBtn.addEventListener('click', () => { void restoreDraftEdits(); });
     }
+    if (deleteSelectedBtn) {
+      deleteSelectedBtn.addEventListener('click', () => { void deleteSelectedDraftRows(); });
+    }
     docEl.addEventListener('blur', () => {
       updateRestoreBtn();
       void saveAll();
@@ -1662,7 +1864,7 @@ IPAD_PAGE = """<!DOCTYPE html>
     }, 3000);
     setInterval(() => {
       if (sessionId && !sttBusy) void syncState();
-    }, 2500);
+    }, 900);
     document.addEventListener('visibilitychange', () => {
       syncCurrentDraft();
       persistLocal();
@@ -1873,25 +2075,63 @@ IPAD_PAGE = """<!DOCTYPE html>
     }
 
     function insertAtCaret(piece) {
-      const val = docEl.value;
+      let mid = collapseRepeatedClauses(String(piece || '').trim());
+      if (!mid) return;
+      const val = collapseRepeatedClauses(String(docEl.value || ''));
       let s = Math.max(0, Math.min(caretStart, val.length));
       let e = Math.max(s, Math.min(caretEnd, val.length));
+      // 光标在末尾：用智能合并，避免整段识别结果反复叠加
+      if (s >= val.length - 2 && e >= val.length - 2) {
+        const merged = collapseRepeatedClauses(preferCleanerDraft(val, mergeDictationAppend(val, mid)));
+        if (merged === val) return;
+        docEl.value = merged;
+        syncCurrentDraft();
+        caretStart = merged.length;
+        caretEnd = merged.length;
+        try { docEl.setSelectionRange(merged.length, merged.length); } catch (err) {}
+        renderDocTail();
+        revealLatest();
+        resetEditBaseline();
+        return;
+      }
       let left = val.slice(0, s);
       let right = val.slice(e);
-      let mid = String(piece || '').trim();
-      if (!mid) return;
-      if (val.trim() && s >= val.length - 2 && val.includes(mid)) return;
-      if (left && !/\\s$/.test(left)) left += ' ';
-      if (right && !/^\\s/.test(right)) mid += ' ';
-      docEl.value = left + mid + right;
+      const leftNorm = normWords(left).join(' ');
+      const midNorm = normWords(mid).join(' ');
+      if (midNorm && leftNorm.includes(midNorm)) return;
+      if (left && !/\s$/.test(left)) left += ' ';
+      if (right && !/^\s/.test(right)) mid += ' ';
+      const next = collapseRepeatedClauses(left + mid + right);
+      docEl.value = next;
       syncCurrentDraft();
-      const pos = left.length + mid.length;
+      const pos = Math.min(next.length, left.length + mid.length);
       caretStart = pos;
       caretEnd = pos;
-      try { docEl.setSelectionRange(pos, pos); } catch (e) {}
+      try { docEl.setSelectionRange(pos, pos); } catch (err) {}
       renderDocTail();
       revealLatest();
       resetEditBaseline();
+    }
+
+    function mergeDictationAppend(cur, piece) {
+      const c = collapseRepeatedClauses(String(cur || '').trim());
+      const p = collapseRepeatedClauses(String(piece || '').trim());
+      if (!p) return c;
+      if (!c) return p;
+      const cw = normWords(c);
+      const pw = normWords(p);
+      const cj = cw.join(' ');
+      const pj = pw.join(' ');
+      if (cj === pj) return c;
+      if (cj.includes(pj)) return c;
+      if (pj.includes(cj)) return p;
+      const maxOverlap = Math.min(cw.length, pw.length, 24);
+      for (let k = maxOverlap; k >= 3; k--) {
+        if (cw.slice(-k).join(' ') === pw.slice(0, k).join(' ')) {
+          return (c + ' ' + p.split(/\s+/).slice(k).join(' ')).trim();
+        }
+      }
+      return (c + ' ' + p).trim();
     }
 
     async function uploadAudio(floatChunks, sampleRate, elapsedMs, peak, mrChunks, mime) {

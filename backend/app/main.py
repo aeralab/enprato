@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -69,7 +70,7 @@ DATA = ROOT / "data" / "sessions"
 DATA.mkdir(parents=True, exist_ok=True)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Enprato", version="0.1.0")
+app = FastAPI(title="Enprato", version="0.1.1")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[origin.strip() for origin in os.environ.get("ENPRATO_CORS_ORIGINS", "http://localhost:5173,https://enprato.site").split(",") if origin.strip()],
@@ -585,7 +586,11 @@ def backend_home() -> RedirectResponse:
 
 
 @app.get("/api/session/{session_id}/remote-state")
-def remote_state(session_id: str, user: dict[str, Any] = Depends(require_session_access)) -> dict[str, Any]:
+def remote_state(
+    session_id: str,
+    user: dict[str, Any] = Depends(require_session_access),
+    sentences_rev: str = "",
+) -> dict[str, Any]:
     folder = require_owned_session(session_id, user)
     detail = session_detail(folder, session_id)
     if not detail:
@@ -607,7 +612,8 @@ def remote_state(session_id: str, user: dict[str, Any] = Depends(require_session
         }
         for s in sentences
     ]
-    return {
+    current_rev = hashlib.sha256(json.dumps(sentences_out, ensure_ascii=False, separators=(",", ":")).encode("utf-8")).hexdigest()[:16]
+    payload: dict[str, Any] = {
         "session_id": session_id,
         "index": index,
         "total": len(sentences),
@@ -615,8 +621,11 @@ def remote_state(session_id: str, user: dict[str, Any] = Depends(require_session
         "draft": draft,
         "drafts": drafts_out,
         "phase": detail["phase"],
-        "sentences": sentences_out,
+        "sentences_rev": current_rev,
     }
+    if sentences_rev.strip() != current_rev:
+        payload["sentences"] = sentences_out
+    return payload
 
 
 class RemoteDraftBody(BaseModel):
@@ -805,13 +814,14 @@ async def remote_stt(
         wav.unlink(missing_ok=True)
 
     if text.strip():
-        from .asr import _clean_stt, _spell_toward_target
+        from .asr import _clean_stt, _spell_toward_target, collapse_repeated_clauses
 
         # 光标插入模式：只返回识别文本，不整句覆盖听写稿
         if mode != "insert":
             idx = _match_sentence_index(sentences, text, idx)
             target = str(sentences[idx].get("text") or "")
         text = _spell_toward_target(_clean_stt(text), target) if target else _clean_stt(text)
+        text = collapse_repeated_clauses(text)
 
     touch_phone(session_id)
     if mode == "insert":
@@ -1133,10 +1143,11 @@ def define(word: str) -> dict[str, Any]:
 
 
 @app.get("/api/translate")
-def api_translate(text: str) -> dict[str, str]:
+async def api_translate(text: str) -> dict[str, str]:
     if not text.strip():
         raise HTTPException(400, "缺少句子")
-    return {"text": text, "zh": translate_en_zh(text)}
+    zh = await run_in_threadpool(translate_en_zh, text)
+    return {"text": text, "zh": zh}
 
 
 @app.post("/api/score")
