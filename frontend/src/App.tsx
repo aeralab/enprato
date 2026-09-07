@@ -1,9 +1,11 @@
-﻿import { useEffect, useRef, useState } from "react";
+﻿import { useEffect, useRef, useState, type FormEvent } from "react";
 import {
   activateLicense,
+  fetchAuthState,
   fetchCatalog,
-  fetchCurrentUser,
   logoutAccount,
+  sendPhoneCode,
+  verifyPhoneLogin,
   checkUpdate,
   defineWord,
   deleteSession,
@@ -17,9 +19,11 @@ import {
   speakerPlay,
   speakerStop,
   claimRemoteSession,
+  completeLearningRecord,
   fetchLanLinks,
   fetchRemoteInbox,
   fetchRemoteState,
+  fetchProgress,
   translateSentence,
   transcribeUtterance,
   warmupAsr,
@@ -32,6 +36,7 @@ import type {
   CuratedLesson,
   Highlight,
   LicenseStatus,
+  ProgressSummary,
   Orientation,
   Phase,
   Sentence,
@@ -120,11 +125,28 @@ function draftsFromServerMap(raw: Record<string, string> | undefined): Record<nu
   return collapseIdenticalDrafts(map);
 }
 
+function resumeSentenceIndex(sentenceCount: number, drafts: Record<number, string>, savedIndex: number): number {
+  const n = sentenceCount;
+  if (n <= 0) return 0;
+  const saved = Math.max(0, Math.min(savedIndex || 0, n - 1));
+  let lastFilled = -1;
+  let firstEmpty = n;
+  for (let i = 0; i < n; i++) {
+    if (String(drafts[i] || "").trim()) lastFilled = i;
+    else if (firstEmpty === n) firstEmpty = i;
+  }
+  if (firstEmpty === n) return n - 1;
+  if (saved >= firstEmpty) return saved;
+  if (lastFilled >= 0 && saved === lastFilled) return saved;
+  return firstEmpty;
+}
+
 function loadDraftsForSession(detail: SessionDetail): Record<number, string> {
   const server = draftsFromServerMap(detail.drafts);
   const cached = readDraftsCache(detail.session_id);
   const merged = collapseIdenticalDrafts(mergeDraftMaps(server, cached.drafts));
-  writeDraftsCache(detail.session_id, merged, detail.index || 0);
+  const resumeAt = resumeSentenceIndex(detail.sentences.length, merged, detail.index || 0);
+  writeDraftsCache(detail.session_id, merged, resumeAt);
   return merged;
 }
 
@@ -401,12 +423,17 @@ export default function App() {
   const [resumeHighlights, setResumeHighlights] = useState<Highlight[]>([]);
   const [resumeScore, setResumeScore] = useState<ShadowScore | null>(null);
   const [resumeHasVideo, setResumeHasVideo] = useState(true);
+  const [progressFloor, setProgressFloor] = useState(0);
   const [license, setLicense] = useState<LicenseStatus | null>(null);
   const [user, setUser] = useState<CurrentUser | null>(null);
+  const [authLoading, setAuthLoading] = useState(true);
+  const [authError, setAuthError] = useState("");
+  const [requireAuth, setRequireAuth] = useState(false);
   const [licenseBusy, setLicenseBusy] = useState(false);
   const [licenseLoadError, setLicenseLoadError] = useState("");
   const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null);
   const [catalog, setCatalog] = useState<CuratedLesson[]>([]);
+  const [screen, setScreen] = useState<"home" | "progress">("home");
 
   useEffect(() => {
     const root = document.documentElement;
@@ -433,6 +460,33 @@ export default function App() {
     warmupAsr();
     let cancelled = false;
     (async () => {
+      setAuthLoading(true);
+      try {
+        const state = await fetchAuthState();
+        if (cancelled) return;
+        setUser(state.user);
+        setRequireAuth(state.requireAuth);
+        setAuthError("");
+      } catch (err) {
+        if (!cancelled) {
+          setUser(null);
+          setAuthError(err instanceof Error ? err.message : "网络异常，请稍后重试");
+        }
+      } finally {
+        if (!cancelled) setAuthLoading(false);
+      }
+    })();
+    void checkUpdate().then(setUpdateInfo).catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (authLoading) return;
+    if (requireAuth && !user) return;
+    let cancelled = false;
+    (async () => {
       try {
         const rows = await listSessions();
         if (cancelled) return;
@@ -455,18 +509,12 @@ export default function App() {
       .catch(() => {
         if (!cancelled) setCatalog([]);
       });
+    if (!requireAuth) void refreshLicense();
     return () => {
       cancelled = true;
     };
-    // 仅启动时恢复上次课
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  useEffect(() => {
-    void fetchCurrentUser().then(setUser).catch(() => setUser(null));
-    void refreshLicense();
-    void checkUpdate().then(setUpdateInfo).catch(() => undefined);
-  }, []);
+  }, [authLoading, requireAuth, user?.id]);
 
   useEffect(() => {
     return () => {
@@ -513,11 +561,13 @@ export default function App() {
     setVideoUrl(`${mediaSrc(detail.video_url)}?v=playable`);
     setAudioUrl(`${mediaSrc(detail.audio_url || `/api/session/${detail.session_id}/audio`)}?v=1`);
     setOrientation(detail.orientation === "portrait" ? "portrait" : "landscape");
-    setResumeIndex(detail.index || 0);
-    setResumeDrafts(loadDraftsForSession(detail));
+    const drafts = loadDraftsForSession(detail);
+    setResumeDrafts(drafts);
+    setResumeIndex(resumeSentenceIndex(detail.sentences.length, drafts, detail.index || 0));
     setResumeHighlights(detail.highlights || []);
     setResumeScore(detail.score || null);
     setResumeHasVideo(detail.has_video ?? true);
+    setProgressFloor(detail.progress_floor || 0);
     localStorage.setItem(LAST_SESSION_KEY, detail.session_id);
     setPhase(restored);
   }
@@ -530,6 +580,21 @@ export default function App() {
     if (!file && !url) return;
     setPhase("preparing");
     try {
+      if (!file) {
+        const existing = history.find((item) => sameSourceUrl(item.source_url, url));
+        if (existing) {
+          const restart = window.confirm("已找到这条视频的学习记录。点击“确定”创建新的学习记录，点击“取消”继续上次学习。\n\n旧课程的进度、分句和评分不会被修改。\n\n确定：重新开始\n取消：继续上次学习");
+          if (!restart) {
+            await resume(existing.session_id);
+            return;
+          }
+        }
+        const prepared = await prepareSessionFromUrl(url, Boolean(existing));
+        openDetail({ ...prepared, phase: prepared.phase === "listen" ? "listen" : prepared.phase });
+        await refreshHistory();
+        await refreshLicense();
+        return;
+      }
       const prepared = file
         ? await prepareSession(file, null)
         : await prepareSessionFromUrl(url);
@@ -587,6 +652,33 @@ export default function App() {
 
   const isHome = phase === "import" || phase === "preparing";
 
+  if (authLoading) {
+    return (
+      <div className="auth-gate">
+        <div className="auth-gate-card">
+          <strong>ENPRATO</strong>
+          <p>正在确认登录状态…</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (requireAuth && !user) {
+    return (
+      <AuthScreen
+        error={authError}
+        onAuthed={(next) => {
+          setUser(next);
+          setAuthError("");
+        }}
+      />
+    );
+  }
+
+  if (screen === "progress") {
+    return <ProgressPage onBack={() => setScreen("home")} />;
+  }
+
   return (
     <div className={`shell${isHome ? " shell-home" : ""}`}>
       <div className={`stage ${isHome ? "stage-home" : orientation}`}>
@@ -622,6 +714,7 @@ export default function App() {
             onResume={resume}
             onDelete={removeHistory}
             user={user}
+            requireAuth={requireAuth}
             onAuth={setUser}
             license={license}
             licenseBusy={licenseBusy}
@@ -629,6 +722,7 @@ export default function App() {
             onActivateLicense={onActivateLicense}
             onRetryLicense={refreshLicense}
             updateInfo={updateInfo}
+            onOpenProgress={() => setScreen("progress")}
           />
         ) : (
           <Studio
@@ -645,6 +739,7 @@ export default function App() {
             initialHighlights={resumeHighlights}
             initialScore={resumeScore}
             audioOnly={!resumeHasVideo}
+            progressFloor={progressFloor}
             history={history}
             onOrientation={setOrientation}
             onRefreshHistory={refreshHistory}
@@ -659,6 +754,7 @@ export default function App() {
               setVideoUrl("");
               setAudioUrl("");
               setResumeHasVideo(true);
+              setProgressFloor(0);
               void refreshHistory();
             }}
           />
@@ -676,6 +772,7 @@ function ImportScreen({
   history,
   catalog,
   user,
+  requireAuth = false,
   onAuth,
   onVideo,
   onSourceUrl,
@@ -689,6 +786,7 @@ function ImportScreen({
   onActivateLicense,
   onRetryLicense,
   updateInfo,
+  onOpenProgress,
 }: {
   phase: Phase;
   error: string;
@@ -697,6 +795,7 @@ function ImportScreen({
   history: SessionSummary[];
   catalog: CuratedLesson[];
   user: CurrentUser | null;
+  requireAuth?: boolean;
   onAuth: (user: CurrentUser | null) => void;
   onVideo: (file: File) => void | Promise<void>;
   onSourceUrl: (value: string) => void;
@@ -710,6 +809,7 @@ function ImportScreen({
   onActivateLicense: (key: string) => void | Promise<void>;
   onRetryLicense: () => void | Promise<void>;
   updateInfo: UpdateInfo | null;
+  onOpenProgress: () => void;
 }) {
   if (phase === "preparing") {
     return (
@@ -734,7 +834,10 @@ function ImportScreen({
           <strong>ENPRATO</strong>
           <span>dictation booth</span>
         </div>
-        <AuthPanel user={user} onAuth={onAuth} />
+        <div className="topbar-actions">
+          <button type="button" className="ghost progress-nav" onClick={onOpenProgress}>我的成长</button>
+          <AuthPanel user={user} onAuth={onAuth} />
+        </div>
       </header>
       <div className="import">
         <aside className="import-history">
@@ -768,7 +871,20 @@ function ImportScreen({
         </aside>
         <section className="import-source">
           {updateInfo ? <UpdateBanner info={updateInfo} /> : null}
-          {user ? (
+          {user && requireAuth ? (
+            <section className="license-panel" aria-label="免费试用">
+              <div className="license-summary">
+                <div>
+                  <strong>免费试用</strong>
+                  <span>免费学习素材 {user.trial.used} / {user.trial.limit}</span>
+                </div>
+                <b>{user.membership.status === "active" ? "会员" : user.trial.remaining > 0 ? "可用" : "已用完"}</b>
+              </div>
+              {user.membership.status !== "active" && user.trial.remaining <= 0 ? (
+                <p className="meta">试用已用完。开通会员后可继续导入学习素材。</p>
+              ) : null}
+            </section>
+          ) : user ? (
             <section className="license-panel license-compat" aria-label="本机兼容授权">
               <div className="license-summary">
                 <div>
@@ -873,6 +989,12 @@ function ImportScreen({
           </aside>
         </section>
       </div>
+      <footer className="site-footer" aria-label="网站备案信息">
+        <span>Enprato</span>
+        <a href="https://beian.miit.gov.cn/" target="_blank" rel="noopener noreferrer">
+          粤ICP备2026130927号
+        </a>
+      </footer>
     </>
   );
 }
@@ -891,12 +1013,152 @@ function UpdateBanner({ info }: { info: UpdateInfo }) {
   );
 }
 
+function friendlyAuthError(err: unknown): string {
+  const raw = err instanceof Error ? err.message : String(err || "");
+  if (/邮箱已注册/.test(raw)) return "邮箱已注册";
+  if (/邮箱或密码错误/.test(raw)) return "邮箱或密码错误";
+  if (/有效邮箱|至少 8/.test(raw)) return "请输入有效邮箱，密码至少 8 位";
+  if (/两次密码|不一致/.test(raw)) return "两次密码不一致";
+  if (/手机号格式/.test(raw)) return "请输入正确的手机号";
+  if (/验证码格式/.test(raw)) return "请输入 6 位验证码";
+  if (/验证码错误或已失效/.test(raw)) return "验证码错误或已失效";
+  if (/过于频繁/.test(raw)) return "验证码发送过于频繁，请稍后再试";
+  if (/短信登录尚未配置|验证码发送失败/.test(raw)) return "短信服务尚未开通，请稍后再试";
+  if (!raw || /failed to fetch|network|load failed|internal server|traceback|sql/i.test(raw)) {
+    return "网络异常，请稍后重试";
+  }
+  return raw;
+}
+
+function AuthScreen({ error, onAuthed }: { error: string; onAuthed: (user: CurrentUser) => void }) {
+  return (
+    <div className="auth-gate">
+      <div className="auth-gate-card">
+        <p className="eyebrow">ENPRATO</p>
+        <p className="auth-manifesto">
+          本应用根据某位明显在节目里介绍的语言学习方法而产生。希望所有学习外语的人，都能根据这个方法，使用本平台高效地掌握一门陌生的语言。
+        </p>
+        <PhoneAuthForm error={error} onAuthed={onAuthed} />
+      </div>
+    </div>
+  );
+}
+
+function PhoneAuthForm({
+  error,
+  onAuthed,
+}: {
+  error?: string;
+  onAuthed: (user: CurrentUser) => void;
+}) {
+  const [phone, setPhone] = useState("");
+  const [code, setCode] = useState("");
+  const [challengeId, setChallengeId] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [cooldown, setCooldown] = useState(0);
+  const [message, setMessage] = useState(error || "");
+
+  useEffect(() => {
+    if (cooldown <= 0) return;
+    const timer = window.setTimeout(() => setCooldown((value) => value - 1), 1000);
+    return () => window.clearTimeout(timer);
+  }, [cooldown]);
+
+  async function sendCode() {
+    setMessage("");
+    const trimmed = phone.trim();
+    if (!/^1\d{10}$/.test(trimmed)) {
+      setMessage("请输入正确的手机号");
+      return;
+    }
+    setBusy(true);
+    try {
+      const sent = await sendPhoneCode(trimmed);
+      setChallengeId(sent.challenge_id);
+      setCooldown(60);
+    } catch (err) {
+      setMessage(friendlyAuthError(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function submit(event: FormEvent) {
+    event.preventDefault();
+    setMessage("");
+    const trimmed = phone.trim();
+    if (!/^1\d{10}$/.test(trimmed)) {
+      setMessage("请输入正确的手机号");
+      return;
+    }
+    if (!challengeId) {
+      setMessage("请先获取验证码");
+      return;
+    }
+    if (!/^\d{6}$/.test(code.trim())) {
+      setMessage("请输入 6 位验证码");
+      return;
+    }
+    setBusy(true);
+    try {
+      const user = await verifyPhoneLogin(trimmed, challengeId, code.trim());
+      onAuthed(user);
+    } catch (err) {
+      setMessage(friendlyAuthError(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <form className="auth-form" onSubmit={(event) => void submit(event)}>
+      <label>
+        <span>手机号</span>
+        <input type="tel" inputMode="numeric" autoComplete="tel" value={phone} onChange={(e) => setPhone(e.target.value)} required />
+      </label>
+      <div className="auth-code-row">
+        <label>
+          <span>验证码</span>
+          <input type="text" inputMode="numeric" autoComplete="one-time-code" value={code} onChange={(e) => setCode(e.target.value)} required maxLength={6} />
+        </label>
+        <button type="button" className="ghost" disabled={busy || cooldown > 0} onClick={() => void sendCode()}>
+          {cooldown > 0 ? `${cooldown}s` : "获取验证码"}
+        </button>
+      </div>
+      {message ? <p className="err">{message}</p> : null}
+      <button className="primary" type="submit" disabled={busy}>{busy ? "请稍候…" : "登录 / 注册"}</button>
+    </form>
+  );
+}
+
 function AuthPanel({ user, onAuth }: { user: CurrentUser | null; onAuth: (user: CurrentUser | null) => void }) {
   const [open, setOpen] = useState(false);
-  const [message, setMessage] = useState("");
-  async function logout() { await logoutAccount(); onAuth(null); }
-  if (user) return <div className="account-compact"><button type="button" className="account-status" onClick={() => setOpen(!open)}><strong>{user.membership.status === "active" ? "Enprato Pro" : "免费版"}</strong><span>{user.membership.status === "active" ? "" : "剩余 " + user.trial.remaining + " 次"}</span><b>我的账号</b></button>{open ? <div className="account-popover"><p>{user.email}</p><p>会员状态：{user.membership.status === "active" ? "Enprato Pro" : "免费版"}</p><p>免费额度：{user.trial.remaining}/{user.trial.limit} 次</p>{user.membership.status === "active" ? <p>到期时间：{formatLicenseDate(user.membership.expires_at)}</p> : null}<button type="button" className="ghost" onClick={() => void logout()}>退出登录</button></div> : null}</div>;
-  return <div className="account-compact"><button type="button" className="account-link" onClick={() => { setMessage(""); setOpen(true); }}>登录</button>{open ? <div className="auth-modal-backdrop" onMouseDown={e => { if (e.target === e.currentTarget) setOpen(false); }}><section className="auth-modal wechat-auth-modal" role="dialog" aria-modal="true" aria-labelledby="wechat-auth-title"><button type="button" className="auth-modal-close" aria-label="关闭" onClick={() => setOpen(false)}>X</button><h2 id="wechat-auth-title">微信扫码登录</h2><div className="wechat-login-placeholder"><strong>使用微信扫码登录</strong><span>首次登录将自动创建 Enprato 账号</span><b>微信登录即将开放</b></div>{message ? <p className="err">{message}</p> : null}<p className="wechat-auth-note">登录后将自动恢复你的会员状态、免费额度和历史课程。</p></section></div> : null}</div>;
+  async function logout() {
+    await logoutAccount();
+    onAuth(null);
+  }
+  if (user) {
+    const trialLabel = `免费学习素材 ${user.trial.used} / ${user.trial.limit}`;
+    return (
+      <div className="account-compact">
+        <button type="button" className="account-status" onClick={() => setOpen(!open)}>
+          <strong>{user.membership.status === "active" ? "Enprato Pro" : "免费试用"}</strong>
+          <span>{user.membership.status === "active" ? "" : `剩余 ${user.trial.remaining} / ${user.trial.limit}`}</span>
+          <b>我的账号</b>
+        </button>
+        {open ? (
+          <div className="account-popover">
+            <p className="account-email">{user.login_label || user.email || "已登录"}</p>
+            <p>会员状态：{user.membership.status === "active" ? "Enprato Pro" : "免费试用"}</p>
+            <p>{trialLabel}</p>
+            {user.membership.status === "active" ? <p>到期时间：{formatLicenseDate(user.membership.expires_at)}</p> : null}
+            <button type="button" className="ghost" onClick={() => void logout()}>退出登录</button>
+          </div>
+        ) : null}
+      </div>
+    );
+  }
+  return null;
 }
 
 function LicensePanel({
@@ -949,7 +1211,7 @@ function LicensePanel({
         !status?.licensed ? (
           <div className="license-summary">
             <div>
-              <span>免费听写 {used} 次</span>
+              <span>免费试用 {used} 次</span>
             </div>
             <b>{status?.active ? "可用" : "需激活"}</b>
           </div>
@@ -1073,6 +1335,21 @@ function formatLicenseDate(value: string): string {
 function sessionThumbUrl(sessionId: string, version?: string): string {
   const q = version ? `?v=${encodeURIComponent(version)}` : "";
   return `/api/session/${sessionId}/thumb${q}`;
+}
+
+function sessionBvid(url: string): string {
+  const match = String(url || "").match(/BV[0-9A-Za-z]+/i);
+  return match ? match[0].toLowerCase() : "";
+}
+
+function sameSourceUrl(left: string, right: string): boolean {
+  const a = String(left || "").trim();
+  const b = String(right || "").trim();
+  if (!a || !b) return false;
+  if (a === b) return true;
+  const bvA = sessionBvid(a);
+  const bvB = sessionBvid(b);
+  return Boolean(bvA && bvA === bvB);
 }
 
 function sessionDisplayTitle(item: SessionSummary | undefined): string {
@@ -1283,6 +1560,7 @@ function Studio({
   initialHighlights,
   initialScore,
   audioOnly = false,
+  progressFloor = 0,
   history,
   onOrientation,
   onRefreshHistory,
@@ -1301,6 +1579,7 @@ function Studio({
   initialHighlights: Highlight[];
   initialScore: ShadowScore | null;
   audioOnly?: boolean;
+  progressFloor?: number;
   history: SessionSummary[];
   onOrientation: (value: Orientation) => void;
   onRefreshHistory: () => Promise<void>;
@@ -1312,7 +1591,7 @@ function Studio({
   const videoRef = useRef<HTMLVideoElement>(null);
   const monitorRef = useRef<HTMLDivElement>(null);
   const phaseRef = useRef(phase);
-  const indexRef = useRef(0);
+  const indexRef = useRef(initialIndex);
   const recorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
   const shadowChunksRef = useRef<Blob[]>([]);
@@ -1320,7 +1599,7 @@ function Studio({
   const draftsRef = useRef<Record<number, string>>({});
   const scrubbingRef = useRef(false);
   const skipAutoPlayRef = useRef(false);
-  const pauseAtRef = useRef(0);
+  const pauseAtRef = useRef(sentences[initialIndex]?.start ?? 0);
   const segmentEndRef = useRef<number | null>(null);
   const playTokenRef = useRef(0);
   const draftTextareaRef = useRef<HTMLTextAreaElement>(null);
@@ -1333,6 +1612,8 @@ function Studio({
   const micRevealTimerRef = useRef(0);
   const recordingRef = useRef(false);
   const ipadStudioRef = useRef(false);
+  const studyStartedAtRef = useRef(Date.now());
+  const completedRecordRef = useRef(false);
 
   const [index, setIndex] = useState(initialIndex);
   const [drafts, setDrafts] = useState<Record<number, string>>(initialDrafts);
@@ -1342,6 +1623,7 @@ function Studio({
   const [highlights, setHighlights] = useState<Highlight[]>(initialHighlights);
   const [sense, setSense] = useState<WordSense | null>(null);
   const [score, setScore] = useState<ShadowScore | null>(initialScore);
+  const [todayProgress, setTodayProgress] = useState<ProgressSummary | null>(null);
   const [userPaused, setUserPaused] = useState(false);
   const [now, setNow] = useState(sentences[initialIndex]?.start ?? 0);
   const [duration, setDuration] = useState(0);
@@ -1369,6 +1651,8 @@ function Studio({
   const draftBaselineRef = useRef("");
   const draftBeforeInputRef = useRef<DraftBeforeInput | null>(null);
   const [draftCanRestore, setDraftCanRestore] = useState(false);
+  const stripRef = useRef<HTMLDivElement>(null);
+  const stripBrowseUntilRef = useRef(0);
 
   const sentence = sentences[index];
   const overlayEnglish =
@@ -1604,6 +1888,32 @@ function Studio({
   }, [index]);
 
   useEffect(() => {
+    const root = stripRef.current;
+    if (!root) return;
+    const onBrowse = () => {
+      stripBrowseUntilRef.current = Date.now() + 10000;
+    };
+    root.addEventListener("pointerdown", onBrowse);
+    root.addEventListener("wheel", onBrowse, { passive: true });
+    root.addEventListener("touchstart", onBrowse, { passive: true });
+    return () => {
+      root.removeEventListener("pointerdown", onBrowse);
+      root.removeEventListener("wheel", onBrowse);
+      root.removeEventListener("touchstart", onBrowse);
+    };
+  }, []);
+
+  useEffect(() => {
+    const root = stripRef.current;
+    if (!root) return;
+    if (Date.now() < stripBrowseUntilRef.current) return;
+    const nowBtn = root.querySelector(".beat.now") as HTMLElement | null;
+    if (!nowBtn) return;
+    const left = nowBtn.offsetLeft - (root.clientWidth - nowBtn.offsetWidth) / 2;
+    root.scrollTo({ left: Math.max(0, left) });
+  }, [index, sentences.length]);
+
+  useEffect(() => {
     userPausedRef.current = userPaused;
   }, [userPaused]);
 
@@ -1687,6 +1997,17 @@ function Studio({
     }, 120);
     return () => window.clearTimeout(timer);
   }, [sessionId, highlights, score, orientation, ipadStudio]);
+
+  useEffect(() => {
+    if (phase !== "result" || !score || completedRecordRef.current) return;
+    completedRecordRef.current = true;
+    void completeLearningRecord(
+      sessionId,
+      Math.max(0, Math.round((Date.now() - studyStartedAtRef.current) / 1000)),
+    )
+      .then(setTodayProgress)
+      .catch(() => undefined);
+  }, [phase, score, sessionId]);
 
   useEffect(() => {
     if (!sessionId) return;
@@ -2474,7 +2795,7 @@ function Studio({
         <div className="brand">
           <strong>ENPRATO</strong>
           <span>
-            {index + 1} / {sentences.length}
+            {index + 1} / {sentences.length} · {Math.round(Math.max(progressFloor, sentences.length ? (index + 1) / sentences.length : 0) * 100)}%
           </span>
         </div>
         <div className={`cue-lamp ${phase === "listen" || recording ? "on" : ""}`}>
@@ -2616,14 +2937,21 @@ function Studio({
               />
             </label>
           </div>
-          <div className="strip">
+          <div
+            className="strip"
+            ref={stripRef}
+            onPointerDown={() => {
+              stripBrowseUntilRef.current = Date.now() + 10000;
+            }}
+          >
             {sentences.map((item, i) => (
               <button
-                key={item.id}
+                key={`${i}-${item.start}`}
                 type="button"
                 className={`beat ${i === index ? "now" : ""} ${(drafts[i] ?? drafts[item.id]) ? "done" : ""}`}
                 title={`${i + 1}. ${item.text}`}
                 onClick={() => {
+                  stripBrowseUntilRef.current = 0;
                   repeatClickRef.current = { at: 0, baseIndex: i, count: 0 };
                   indexRef.current = i;
                   setIndex(i);
@@ -2631,6 +2959,21 @@ function Studio({
                   setPhase("listen");
                   setCaptionMode("off");
                   playAt(sentences[i].start);
+                  writeDraftsCache(sessionId, draftsRef.current, i);
+                  void saveProgress(
+                    sessionId,
+                    sessionProgressPayload(
+                      {
+                        phase: "listen",
+                        index: i,
+                        drafts: draftsRef.current,
+                        highlights,
+                        score,
+                        orientation,
+                      },
+                      { includeIndex: true },
+                    ),
+                  );
                 }}
               >
                 {i + 1}
@@ -2679,7 +3022,7 @@ function Studio({
         </section>
         <aside className="script-col">
           {phase === "result" && score ? (
-            <ResultPane score={score} onReset={onReset} />
+            <ResultPane score={score} todayProgress={todayProgress} onReset={onReset} />
           ) : phase === "shadow" ? (
             <>
               <h2>完整跟读</h2>
@@ -2876,7 +3219,7 @@ function Studio({
   );
 }
 
-function ResultPane({ score, onReset }: { score: ShadowScore; onReset: () => void }) {
+function ResultPane({ score, todayProgress, onReset }: { score: ShadowScore; todayProgress: ProgressSummary | null; onReset: () => void }) {
   const rows = [
     ["语调", score.pitch],
     ["语速", score.speed],
@@ -2902,12 +3245,74 @@ function ResultPane({ score, onReset }: { score: ShadowScore; onReset: () => voi
         ))}
       </div>
       <p className="hint">识别到的跟读：{score.transcript || "（空）"}</p>
+      {todayProgress ? (
+        <section className="today-progress">
+          <h3>Today’s Progress</h3>
+          {todayProgress.day_one ? (
+            <p>今天是你的第 1 天。我们从这里开始记录你的语言成长。</p>
+          ) : null}
+          <p>今天完成听写 {todayProgress.today?.dictation_words || 0} 个单词</p>
+          {todayProgress.today?.accuracy != null ? <p>正确率 {Math.round(todayProgress.today.accuracy)}%</p> : null}
+          {todayProgress.comparison.has_history && todayProgress.comparison.accuracy_delta != null ? (
+            <p>
+              最近 7 天 Accuracy：
+              {todayProgress.comparison.accuracy_delta >= 0 ? "上升" : "下降"} {Math.abs(todayProgress.comparison.accuracy_delta)} 个百分点
+            </p>
+          ) : null}
+          <p>连续学习 {todayProgress.current_streak} 天</p>
+        </section>
+      ) : null}
       <div className="actions">
         <button className="primary" onClick={onReset}>
           返回课单
         </button>
       </div>
     </>
+  );
+}
+
+function ProgressPage({ onBack }: { onBack: () => void }) {
+  const [range, setRange] = useState<"all" | 7 | 30>(30);
+  const [data, setData] = useState<ProgressSummary | null>(null);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    setError("");
+    void fetchProgress(range === "all" ? undefined : range)
+      .then(setData)
+      .catch((err) => setError(err instanceof Error ? err.message : "成长数据暂时无法读取"));
+  }, [range]);
+
+  const scored = (data?.records || []).filter((item) => item.accuracy != null).slice().reverse();
+  const chartMax = Math.max(100, ...scored.map((item) => Number(item.accuracy || 0)));
+  return (
+    <div className="progress-page">
+      <header className="topbar progress-topbar">
+        <div className="brand"><strong>ENPRATO</strong><span>My Progress</span></div>
+        <button type="button" className="ghost" onClick={onBack}>返回课单</button>
+      </header>
+      <main className="progress-main">
+        <div className="progress-heading"><div><p className="eyebrow">MY PROGRESS</p><h1>我的成长</h1><p>看见每一次真实的练习，慢慢积累成掌握。</p></div></div>
+        {error ? <p className="err">{error}</p> : null}
+        {data ? (
+          <>
+            {data.day_one ? <p className="day-one-note">今天是你的第 1 天。我们从这里开始记录你的语言成长。</p> : null}
+            <section className="progress-stats">
+              <div><b>{data.days_learned}</b><span>学习天数</span></div>
+              <div><b>{data.current_streak}</b><span>当前连续学习</span></div>
+              <div><b>{data.longest_streak}</b><span>最长连续学习</span></div>
+              <div><b>{data.total_dictation_words ?? 0}</b><span>累计听写单词</span></div>
+              <div><b>{data.recent_accuracy == null ? "—" : `${Math.round(data.recent_accuracy)}%`}</b><span>最近 Accuracy</span></div>
+            </section>
+            <section className="progress-section">
+              <div className="progress-section-head"><h2>Accuracy</h2><div className="segmented"><button className={range === 7 ? "active" : ""} onClick={() => setRange(7)}>最近 7 天</button><button className={range === 30 ? "active" : ""} onClick={() => setRange(30)}>最近 30 天</button><button className={range === "all" ? "active" : ""} onClick={() => setRange("all")}>全部</button></div></div>
+              {scored.length ? <div className="progress-chart">{scored.map((item) => <div className="chart-column" key={item.id}><div className="chart-bar" style={{ height: `${Math.max(8, (Number(item.accuracy) / chartMax) * 100)}%` }} title={`${item.learning_date} ${Math.round(Number(item.accuracy))}%`} /><span>{item.learning_date.slice(5)}</span></div>)}</div> : <p className="empty-progress">完成一次有效听写后，这里会出现 Accuracy 曲线。</p>}
+            </section>
+            <section className="progress-section"><h2>最近学习日</h2>{data.records.length ? <div className="learning-records">{data.records.slice(0, 12).map((item) => <div className="learning-record" key={item.id}><div><b>{item.learning_date}</b><span>{item.dictation_words ?? item.completed_sentence_count} 词</span></div><span>{item.accuracy == null ? "暂无正确率" : `${Math.round(item.accuracy)}%`} · {item.completed_sentence_count} 个完成单位</span></div>)}</div> : <p className="empty-progress">今天是你的第 1 天。我们从这里开始记录你的语言成长。</p>}</section>
+          </>
+        ) : !error ? <p className="empty-progress">正在读取成长数据…</p> : null}
+      </main>
+    </div>
   );
 }
 

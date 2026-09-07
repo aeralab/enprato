@@ -19,7 +19,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel
 
-from .asr import transcribe_sentences, transcribe_speech, warmup
+from .asr import transcribe_sentences, transcribe_speech, transcribe_speech_detailed, warmup
 from . import db
 from .auth import (
     COOKIE_NAME,
@@ -35,9 +35,13 @@ from .curated import list_curated_lessons
 from .dictionary import lookup_word, translate_en_zh
 from .ingest import fetch_media_title, find_session_media, ingest_url, validate_media_url
 from .license import activate_license, checkout_license, license_status, note_trial_use
-from .media import convert_to_wav, ensure_playback_audio, extract_wav
+from .media import convert_to_wav, ensure_playback_audio, extract_wav, probe_duration
 from .payment import PaymentConfigError, mock_provider_enabled, provider_for
+from .progress import complete_session, progress_for_user, record_new_dictations
+from .resplit import resplit_remaining_session, rollback_resplit_session
+from .client_ip import resolve_client_ip
 from .rate_limit import enforce as enforce_rate_limit
+from . import sms as sms_service
 from .ipad_studio import IPAD_BUILD, IPAD_PAGE
 from .remote_mic import (
     REMOTE_PAGE,
@@ -52,6 +56,8 @@ from .remote_mic import (
 from .score import score_shadowing
 from .sentences import parse_srt, parse_vtt
 from .speaker import play_speaker, stop_speaker
+from . import stt_jobs, stt_log
+from . import wechat_oauth
 from .store import (
     find_session_id_by_url,
     list_sessions,
@@ -77,7 +83,91 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["X-Request-ID", "X-Client-Request-ID"],
 )
+
+
+STATIC_DIR = Path(__file__).resolve().parent / "static"
+
+
+@app.middleware("http")
+async def attach_request_id(request: Request, call_next):
+    request_id = uuid.uuid4().hex[:12]
+    client_request_id = (request.headers.get("x-client-request-id") or "").strip()
+    request.state.request_id = request_id
+    request.state.client_request_id = client_request_id
+    stt_path = "/remote-stt" in str(request.url.path)
+    if stt_path:
+        stt_log.event(
+            "STT_RECEIVED",
+            client_request_id=client_request_id or None,
+            server_request_id=request_id,
+            method=request.method,
+            path=str(request.url.path),
+            content_type=request.headers.get("content-type", ""),
+            content_length=request.headers.get("content-length", ""),
+            user_agent=request.headers.get("user-agent", ""),
+            client_ip=request.client.host if request.client else "",
+        )
+        logger.info(
+            "STT_RECEIVED client_request_id=%s server_request_id=%s method=%s path=%s content_type=%s content_length=%s",
+            client_request_id or "-",
+            request_id,
+            request.method,
+            request.url.path,
+            request.headers.get("content-type", ""),
+            request.headers.get("content-length", ""),
+        )
+    try:
+        response = await call_next(request)
+    except Exception as exc:
+        if stt_path:
+            stt_log.event(
+                "STT_FAILED",
+                client_request_id=client_request_id or None,
+                server_request_id=request_id,
+                exception=type(exc).__name__,
+                error_type="unhandled",
+                http_status=500,
+            )
+        raise
+    response.headers["X-Request-ID"] = request_id
+    if client_request_id:
+        response.headers["X-Client-Request-ID"] = client_request_id
+    return response
+
+
+@app.get("/ipad-assets/stt_job.js")
+def ipad_stt_job_js() -> FileResponse:
+    return FileResponse(
+        STATIC_DIR / "stt_job.js",
+        media_type="text/javascript; charset=utf-8",
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+class SttDiagIn(BaseModel):
+    stage: str = "SENTENCE_INSERT"
+    client_request_id: str = ""
+    session_id: str = ""
+    index: int = -1
+    text_len: int = 0
+    text_preview: str = ""
+    server_request_id: str = ""
+
+
+@app.post("/api/stt-diag")
+async def stt_diag(payload: SttDiagIn, request: Request) -> dict[str, str]:
+    stt_log.event(
+        str(payload.stage or "SENTENCE_INSERT"),
+        client_request_id=(payload.client_request_id or "").strip() or None,
+        server_request_id=(payload.server_request_id or str(getattr(request.state, "request_id", "") or "")).strip() or None,
+        session_id=(payload.session_id or "").strip() or None,
+        index=int(payload.index),
+        text_len=int(payload.text_len),
+        text_preview=str(payload.text_preview or "")[:80],
+    )
+    return {"ok": "1"}
 
 
 @app.on_event("startup")
@@ -113,6 +203,11 @@ def _cues_from_text(raw: str, filename: str = "") -> list[dict[str, Any]]:
     if name.endswith(".vtt") or raw.lstrip().startswith("WEBVTT"):
         return parse_vtt(raw)
     return parse_srt(raw)
+
+
+def _refund_failed_prepare(user: dict[str, Any], session_id: str) -> None:
+    if user.get("id") and user["id"] != "lan-local":
+        db.refund_trial(user["id"], "prepare:" + session_id)
 
 
 def _finish_session(
@@ -157,6 +252,7 @@ def _finish_session(
 
 class PrepareUrlBody(BaseModel):
     url: str
+    create_new_session: bool = False
 
 
 class ProgressBody(BaseModel):
@@ -166,6 +262,14 @@ class ProgressBody(BaseModel):
     highlights: list[dict[str, Any]] | None = None
     score: dict[str, Any] | None = None
     orientation: str | None = None
+
+
+class LearningCompleteBody(BaseModel):
+    duration_seconds: int | None = None
+
+
+class ResplitBody(BaseModel):
+    backup_id: str | None = None
 
 
 class LicenseActivateBody(BaseModel):
@@ -197,7 +301,29 @@ class OrderBody(BaseModel):
 
 
 def public_user(user):
-    return {"id": user["id"], "email": user["email"], "status": user["status"], "membership": db.membership_status(user["id"]), "trial": db.trial_status(user["id"])}
+    email = user["email"] if isinstance(user, dict) else user["email"]
+    user_id = user["id"]
+    return {
+        "id": user_id,
+        "email": email,
+        "login_label": db.login_label(user_id, email),
+        "status": user["status"],
+        "membership": db.membership_status(user_id),
+        "trial": db.trial_status(user_id),
+    }
+
+
+def _public_base(request: Request) -> str:
+    proto = (request.headers.get("x-forwarded-proto") or request.url.scheme or "https").split(",")[0].strip()
+    host = (request.headers.get("x-forwarded-host") or request.headers.get("host") or request.url.netloc).split(",")[0].strip()
+    return f"{proto}://{host}"
+
+
+def _safe_record_dictations(user: dict[str, Any], session_id: str, folder: Path, previous: dict[str, str], incoming: dict[str, str]) -> None:
+    try:
+        record_new_dictations(user, session_id, folder, previous, incoming)
+    except Exception:
+        logger.exception("learning progress record failed session=%s", session_id)
 
 
 def require_member_or_trial(user: dict[str, Any]) -> None:
@@ -213,7 +339,7 @@ def require_member_or_trial(user: dict[str, Any]) -> None:
         return
     quota = db.trial_status(user["id"])
     if quota["remaining"] <= 0:
-        raise HTTPException(402, "free quota exhausted")
+        raise HTTPException(402, "免费学习素材次数已用完")
 
 
 def require_session_access(session_id: str, request: Request) -> dict[str, Any]:
@@ -227,6 +353,8 @@ def require_session_access(session_id: str, request: Request) -> dict[str, Any]:
         owner = db.user_by_id(owner_id)
         if owner:
             return dict(owner)
+    if user:
+        raise HTTPException(404, "session not found")
     # 家庭局域网单机：ENPRATO_REQUIRE_AUTH 未开时，iPad 无登录态可按会话目录放行
     if not auth_required() and (DATA / session_id).is_dir():
         return {"id": "lan-local", "email": "", "status": "active"}
@@ -243,12 +371,20 @@ def require_owned_session(session_id: str, user: dict[str, Any]) -> Path:
     return _session_dir(session_id)
 
 
-def set_session_cookie(response, token):
-    response.set_cookie(COOKIE_NAME, token, httponly=True, secure=cookie_secure(), samesite="lax", max_age=30 * 24 * 60 * 60, path="/")
+def set_session_cookie(response, token, request: Request | None = None):
+    response.set_cookie(
+        COOKIE_NAME,
+        token,
+        httponly=True,
+        secure=cookie_secure(request),
+        samesite="lax",
+        max_age=30 * 24 * 60 * 60,
+        path="/",
+    )
 
 
 @app.post("/api/auth/register")
-def auth_register(body: AuthBody, response: Response):
+def auth_register(body: AuthBody, request: Request, response: Response):
     email = body.email.strip().lower()
     if "@" not in email or len(email) > 254 or len(body.password) < 8:
         raise HTTPException(400, "请输入有效邮箱，密码至少 8 位")
@@ -258,17 +394,17 @@ def auth_register(body: AuthBody, response: Response):
         if "UNIQUE constraint failed" in str(exc):
             raise HTTPException(409, "邮箱已注册") from exc
         raise
-    set_session_cookie(response, db.create_auth_session(user["id"]))
+    set_session_cookie(response, db.create_auth_session(user["id"]), request)
     return public_user(user)
 
 
 @app.post("/api/auth/login")
-def auth_login(body: AuthBody, response: Response):
+def auth_login(body: AuthBody, request: Request, response: Response):
     row = db.find_user(body.email.strip().lower())
     if not row or not verify_password(body.password, row["password_hash"]):
         raise HTTPException(401, "邮箱或密码错误")
     user = dict(row)
-    set_session_cookie(response, db.create_auth_session(user["id"]))
+    set_session_cookie(response, db.create_auth_session(user["id"]), request)
     return public_user(user)
 
 
@@ -277,13 +413,70 @@ def auth_logout(request: Request, response: Response):
     token = request.cookies.get(COOKIE_NAME, "")
     if token:
         db.delete_auth_session(token)
-    response.delete_cookie(COOKIE_NAME, path="/")
+    response.delete_cookie(COOKIE_NAME, path="/", httponly=True, secure=cookie_secure(request), samesite="lax")
     return {"status": "ok"}
 
 
 @app.get("/api/auth/me")
-def auth_me(user = Depends(current_user)):
-    return {"user": public_user(user) if user else None}
+def auth_me(user=Depends(current_user)):
+    if user:
+        return {"user": public_user(user), "require_auth": auth_required()}
+    if auth_required():
+        raise HTTPException(401, "请先登录")
+    return {"user": None, "require_auth": False}
+
+
+@app.get("/api/auth/methods")
+def auth_methods() -> dict[str, Any]:
+    return {"wechat": wechat_oauth.public_status(), "phone": sms_service.public_status()}
+
+
+@app.get("/api/auth/wechat/start")
+def auth_wechat_start(request: Request):
+    channel = wechat_oauth.wechat_channel(request.headers.get("user-agent") or "")
+    if not channel:
+        return RedirectResponse("/?auth_error=wechat_unconfigured", status_code=302)
+    state = f"{channel}.{secrets.token_urlsafe(24)}"
+    try:
+        url = wechat_oauth.authorize_url(channel=channel, state=state, request_base=_public_base(request))
+    except wechat_oauth.WechatNotConfigured:
+        return RedirectResponse("/?auth_error=wechat_unconfigured", status_code=302)
+    response = RedirectResponse(url, status_code=302)
+    response.set_cookie(
+        wechat_oauth.STATE_COOKIE,
+        state,
+        httponly=True,
+        secure=cookie_secure(request),
+        samesite="lax",
+        max_age=600,
+        path="/",
+    )
+    return response
+
+
+@app.get("/api/auth/wechat/callback")
+def auth_wechat_callback(request: Request, code: str = "", state: str = ""):
+    fail = RedirectResponse("/?auth_error=wechat", status_code=302)
+    fail.delete_cookie(wechat_oauth.STATE_COOKIE, path="/")
+    cookie_state = request.cookies.get(wechat_oauth.STATE_COOKIE, "")
+    if not code or not state or not cookie_state or not secrets.compare_digest(cookie_state, state):
+        return fail
+    channel, _, nonce = state.partition(".")
+    if channel not in {"web", "oa"} or not nonce:
+        return fail
+    try:
+        profile = wechat_oauth.exchange_code(code, channel)
+        user_id = db.login_or_create_identities(wechat_oauth.identity_pairs(profile))
+    except wechat_oauth.WechatOAuthError:
+        logger.info("wechat oauth failed")
+        return fail
+    user = db.user_by_id(user_id)
+    if not user:
+        return fail
+    redirect = RedirectResponse("/", status_code=302)
+    redirect.delete_cookie(wechat_oauth.STATE_COOKIE, path="/")
+    set_session_cookie(redirect, db.create_auth_session(user_id), request)
+    return redirect
 
 
 @app.post("/api/auth/phone/send")
@@ -292,20 +485,28 @@ def auth_phone_send(body: PhoneCodeBody, request: Request):
         phone = db.normalize_phone(body.phone)
     except ValueError:
         raise HTTPException(400, "手机号格式不正确")
-    provider = os.environ.get("ENPRATO_SMS_PROVIDER", "disabled").lower()
-    is_dev = os.environ.get("ENPRATO_ENV", "development").lower() not in {"production", "prod"} and os.environ.get("ENPRATO_ALLOW_DEV_SMS", "0").lower() in {"1", "true", "yes"}
-    if provider != "dev" or not is_dev:
+    if not sms_service.sms_send_ready():
         raise HTTPException(503, "短信登录尚未配置真实短信服务")
     challenge_id = secrets.token_urlsafe(18)
     code = f"{secrets.randbelow(1000000):06d}"
-    request_ip = request.client.host if request.client else "unknown"
+    request_ip = resolve_client_ip(request)
     if not db.create_phone_challenge(phone, db.hash_token(challenge_id + ":" + code), request_ip, challenge_id):
         raise HTTPException(429, "验证码发送过于频繁，请稍后再试")
-    return {"challenge_id": challenge_id, "expires_in": 300, "provider": "dev", "dev_code": code}
+    try:
+        sms_service.send_code(phone, code)
+    except sms_service.SmsNotConfigured:
+        db.delete_phone_challenge(challenge_id)
+        raise HTTPException(503, "短信登录尚未配置真实短信服务")
+    except sms_service.SmsError:
+        db.delete_phone_challenge(challenge_id)
+        logger.info("sms send failed")
+        raise HTTPException(503, "验证码发送失败，请稍后重试")
+    logger.info("sms challenge created")
+    return {"challenge_id": challenge_id, "expires_in": 300}
 
 
 @app.post("/api/auth/phone/verify")
-def auth_phone_verify(body: PhoneVerifyBody, response: Response):
+def auth_phone_verify(body: PhoneVerifyBody, request: Request, response: Response):
     try:
         phone = db.normalize_phone(body.phone)
     except ValueError:
@@ -315,8 +516,10 @@ def auth_phone_verify(body: PhoneVerifyBody, response: Response):
     user_id = db.consume_phone_challenge(body.challenge_id, phone, db.hash_token(body.challenge_id + ":" + body.code))
     if not user_id:
         raise HTTPException(401, "验证码错误或已失效")
-    set_session_cookie(response, db.create_auth_session(user_id))
+    set_session_cookie(response, db.create_auth_session(user_id), request)
     user = db.user_by_id(user_id)
+    if not user:
+        raise HTTPException(401, "验证码错误或已失效")
     return public_user(user)
 
 
@@ -445,7 +648,7 @@ def app_icon(name: str) -> FileResponse:
 @app.get("/api/lan")
 def api_lan(request: Request) -> dict[str, Any]:
     ips = lan_ipv4s()
-    port = 18787
+    port = request.url.port or int(os.environ.get("ENPRATO_BACKEND_PORT", "18788"))
     proto = (request.headers.get("x-forwarded-proto") or request.url.scheme or "https").split(",")[0].strip()
     host = (request.headers.get("x-forwarded-host") or request.headers.get("host") or "").split(",")[0].strip()
     public_origin = ""
@@ -473,13 +676,24 @@ def api_lan(request: Request) -> dict[str, Any]:
     }
 
 
+def _protect_global_license(request: Request) -> None:
+    if not auth_required():
+        return
+    if not current_user(request):
+        raise HTTPException(401, "请先登录")
+    raise HTTPException(403, "账号模式下请使用会员订阅，不再使用全局授权码")
+
+
 @app.get("/api/license")
-def api_license() -> dict[str, Any]:
+def api_license(request: Request) -> dict[str, Any]:
+    if auth_required() and not current_user(request):
+        raise HTTPException(401, "请先登录")
     return license_status(DATA)
 
 
 @app.post("/api/license/activate")
-def api_license_activate(body: LicenseActivateBody) -> dict[str, Any]:
+def api_license_activate(request: Request, body: LicenseActivateBody) -> dict[str, Any]:
+    _protect_global_license(request)
     try:
         return activate_license(DATA, body.key)
     except ValueError as exc:
@@ -487,7 +701,8 @@ def api_license_activate(body: LicenseActivateBody) -> dict[str, Any]:
 
 
 @app.post("/api/license/checkout")
-def api_license_checkout(body: LicenseCheckoutBody) -> dict[str, Any]:
+def api_license_checkout(request: Request, body: LicenseCheckoutBody) -> dict[str, Any]:
+    _protect_global_license(request)
     try:
         return checkout_license(DATA, body.plan)
     except ValueError as exc:
@@ -604,14 +819,17 @@ def remote_state(
     drafts = detail.get("drafts") if isinstance(detail.get("drafts"), dict) else {}
     draft = str(drafts.get(str(index)) or drafts.get(index) or "")
     drafts_out = {str(k): str(v) for k, v in drafts.items()}
-    sentences_out = [
-        {
-            "start": float(s.get("start") or 0),
-            "end": float(s.get("end") or 0),
-            "text": str(s.get("text") or ""),
+    sentences_out = []
+    for sentence in sentences:
+        item = {
+            "start": float(sentence.get("start") or 0),
+            "end": float(sentence.get("end") or 0),
+            "text": str(sentence.get("text") or ""),
         }
-        for s in sentences
-    ]
+        if sentence.get("parent_id") is not None:
+            item["parent_id"] = str(sentence["parent_id"])
+            item["segment_index"] = int(sentence.get("segment_index") or 0)
+        sentences_out.append(item)
     current_rev = hashlib.sha256(json.dumps(sentences_out, ensure_ascii=False, separators=(",", ":")).encode("utf-8")).hexdigest()[:16]
     payload: dict[str, Any] = {
         "session_id": session_id,
@@ -673,9 +891,11 @@ def remote_draft(session_id: str, body: RemoteDraftBody, user: dict[str, Any] = 
     idx = max(0, min(int(body.index), len(sentences) - 1))
     drafts = meta.get("drafts") if isinstance(meta.get("drafts"), dict) else {}
     drafts = {str(k): str(v) for k, v in drafts.items()}
+    previous = dict(drafts)
     drafts[str(idx)] = body.text
     if body.text.strip() and user.get("id") == "lan-local":
         note_trial_use(DATA, session_id)
+    _safe_record_dictations(user, session_id, folder, previous, {str(idx): body.text})
     write_meta(folder, drafts=drafts, index=idx, phase="dictate")
     item = push_remote_result(session_id, idx, body.text)
     touch_phone(session_id)
@@ -715,7 +935,9 @@ def remote_drafts_bulk(session_id: str, body: RemoteDraftsBody, user: dict[str, 
             continue
         if 0 <= i <= max_i:
             incoming[str(i)] = str(value or "")
+    previous = dict(drafts)
     drafts = collapse_identical_drafts(apply_draft_snapshot(drafts, incoming))
+    _safe_record_dictations(user, session_id, folder, previous, drafts)
     if body.index is not None:
         keep_index = max(0, min(int(body.index), max_i))
     else:
@@ -751,23 +973,23 @@ def remote_next(session_id: str, user: dict[str, Any] = Depends(require_session_
     return {"index": nxt, "total": len(sentences), "id": item["id"]}
 
 
-@app.post("/api/session/{session_id}/remote-stt")
-async def remote_stt(
+async def _recognize_remote_audio(
+    *,
     session_id: str,
-    audio: UploadFile = File(...),
-    index: int = Form(...),
-    mode: str = Form("replace"),
-    user: dict[str, Any] = Depends(require_session_access),
+    user: dict[str, Any],
+    folder: Path,
+    raw: Path,
+    mime: str,
+    index: int,
+    mode: str,
+    request_id: str,
+    client_request_id: str = "",
 ) -> dict[str, Any]:
-    require_member_or_trial(user)
-    folder = require_owned_session(session_id, user)
     sentences = read_json(folder / "sentences.json", [])
     if not isinstance(sentences, list) or not sentences:
         raise HTTPException(404, "没有句子")
     meta = read_meta(folder)
-    phone_idx = max(0, min(int(index), len(sentences) - 1))
-    # iPad/手机点哪句就按哪句识别，不因电脑进度更大而抬升序号
-    idx = phone_idx
+    idx = max(0, min(int(index), len(sentences) - 1))
     target = str(sentences[idx].get("text") or "")
     drafts = meta.get("drafts") if isinstance(meta.get("drafts"), dict) else {}
     drafts = {str(k): str(v) for k, v in drafts.items()}
@@ -779,44 +1001,94 @@ async def remote_stt(
         if bit:
             context_bits.append(bit[-160:])
     context = " ".join(context_bits)[:200]
-
-    tmp_dir = DATA / "_stt"
-    tmp_dir.mkdir(parents=True, exist_ok=True)
-    upload_id = uuid.uuid4().hex
-    raw = tmp_dir / f"{upload_id}{Path(audio.filename or 'phone.webm').suffix or '.webm'}"
-    wav = tmp_dir / f"{upload_id}.converted.wav"
-    fast = True
+    wav = raw.with_name(raw.name + ".converted.wav")
+    raw_size = raw.stat().st_size if raw.is_file() else 0
+    raw_duration = 0.0
+    wav_duration = 0.0
+    asr_started = 0.0
+    diagnostics: dict[str, Any] = {}
+    text = ""
+    asr_code = ""
     try:
-        _save_upload(audio, raw)
-        await run_in_threadpool(convert_to_wav, raw, wav)
         try:
-            text = await asyncio.wait_for(
+            raw_duration = probe_duration(raw)
+        except Exception:
+            raw_duration = 0.0
+        try:
+            await run_in_threadpool(convert_to_wav, raw, wav)
+            wav_duration = probe_duration(wav)
+        except Exception as exc:
+            stt_log.event("STT_FAILED", client_request_id=client_request_id or None, server_request_id=request_id, exception=type(exc).__name__, error_type="invalid_audio", http_status=400)
+            raise HTTPException(400, "音频格式无法转换，请重新录音") from exc
+        stt_log.event("STT_AUDIO_VALIDATED", client_request_id=client_request_id or None, server_request_id=request_id, bytes=raw_size, mime=mime, wav_duration=wav_duration)
+        try:
+            asr_started = asyncio.get_running_loop().time()
+            stt_log.event("STT_ASR_STARTED", client_request_id=client_request_id or None, server_request_id=request_id)
+            diagnostics = await asyncio.wait_for(
                 run_in_threadpool(
-                    lambda: transcribe_speech(wav, context, target, fast=fast),
+                    lambda: transcribe_speech_detailed(wav, context, target, fast=True),
                 ),
-                timeout=75.0,
+                timeout=120.0,
             )
+            text = str(diagnostics.get("text") or "")
+            asr_elapsed = asyncio.get_running_loop().time() - asr_started if asr_started else 0.0
+            stt_log.event(
+                "STT_ASR_FINISHED",
+                client_request_id=client_request_id or None,
+                server_request_id=request_id,
+                session_id=session_id,
+                index=idx,
+                audio_duration=round(float(wav_duration or raw_duration or 0.0), 3),
+                audio_size=raw_size,
+                mime_type=mime,
+                words=len(text.split()),
+                text_preview=text[:120],
+                fast=bool(diagnostics.get("fast")),
+                retried=bool(diagnostics.get("retried")),
+                retry_reason=str(diagnostics.get("retry_reason") or ""),
+                last_end=round(float(diagnostics.get("last_end") or 0.0), 3),
+                prompt_mode=str(diagnostics.get("prompt_mode") or ""),
+                compact_prompt_enabled=bool(diagnostics.get("compact_prompt_enabled")),
+                expected_target_len=int(diagnostics.get("expected_target_len") or 0),
+                expected_target_preview=str(diagnostics.get("expected_target_preview") or "")[:80],
+                prompt_guard_result=str(diagnostics.get("prompt_guard_result") or ""),
+                asr_elapsed=round(asr_elapsed, 3),
+            )
+            logger.info(
+                "asr request_id=%s session=%s index=%s size=%s mime=%s raw_duration=%.3f wav_duration=%.3f asr_elapsed=%.3f segments=%s last_end=%.3f words=%s retried=%s retry_reason=%s prompt_guard_result=%s result=success",
+                request_id, session_id, idx, raw_size, mime, raw_duration, wav_duration, asr_elapsed,
+                diagnostics.get("segment_count", 0), diagnostics.get("last_end", 0.0), len(text.split()),
+                diagnostics.get("retried", False), diagnostics.get("retry_reason", ""),
+                diagnostics.get("prompt_guard_result", ""),
+            )
+            asr_code = str(diagnostics.get("code") or "")
+            if asr_code not in {"prompt_leakage", "empty_transcript"}:
+                if wav_duration > 8 and float(diagnostics.get("last_end") or 0.0) < wav_duration * 0.55:
+                    raise HTTPException(422, f"ASR_INCOMPLETE: 这次只识别到部分内容，请再试一次。Request ID: {request_id}")
         except asyncio.TimeoutError as exc:
-            raise HTTPException(504, "语音识别超时，请缩短录音后重试") from exc
+            stt_log.event("STT_FAILED", client_request_id=client_request_id or None, server_request_id=request_id, exception="TimeoutError", error_type="asr_timeout", http_status=504)
+            raise HTTPException(504, f"ASR_TIMEOUT: server recognition timed out. Request ID: {request_id}") from exc
     except HTTPException:
         raise
     except Exception as exc:
+        stt_log.event("STT_FAILED", client_request_id=client_request_id or None, server_request_id=request_id, exception=type(exc).__name__, error_type="asr_exception", http_status=500)
         logger.exception(
-            "remote-stt failed session=%s index=%s filename=%s content_type=%s",
-            session_id,
-            idx,
-            audio.filename,
-            audio.content_type,
+            "asr request_id=%s session=%s index=%s size=%s mime=%s raw_duration=%.3f wav_duration=%.3f asr_elapsed=%.3f error=%s",
+            request_id, session_id, idx, raw_size, mime, raw_duration,
+            wav_duration, asyncio.get_running_loop().time() - asr_started if asr_started else 0.0,
+            type(exc).__name__,
         )
-        raise HTTPException(500, f"remote-stt failed: {exc}") from exc
+        raise HTTPException(500, f"ASR_SERVER_ERROR: 服务器识别失败，请稍后重试。Request ID: {request_id}") from exc
     finally:
-        raw.unlink(missing_ok=True)
         wav.unlink(missing_ok=True)
+
+    asr_code = str(diagnostics.get("code") or "")
+    if asr_code in {"prompt_leakage", "empty_transcript"}:
+        text = ""
 
     if text.strip():
         from .asr import _clean_stt, _spell_toward_target, collapse_repeated_clauses
 
-        # 光标插入模式：只返回识别文本，不整句覆盖听写稿
         if mode != "insert":
             idx = _match_sentence_index(sentences, text, idx)
             target = str(sentences[idx].get("text") or "")
@@ -824,8 +1096,18 @@ async def remote_stt(
         text = collapse_repeated_clauses(text)
 
     touch_phone(session_id)
+    payload = {
+        "text": text,
+        "index": idx,
+        "id": 0,
+        "request_id": request_id,
+        "client_request_id": client_request_id,
+    }
+    if asr_code:
+        payload["code"] = asr_code
+        payload["message"] = "这次没有听清，请重新说一次"
     if mode == "insert":
-        return {"text": text, "index": idx, "id": 0}
+        return payload
 
     prev = str(drafts.get(str(idx)) or "").strip()
     if text.strip():
@@ -833,15 +1115,141 @@ async def remote_stt(
 
         text = merge_dictation_text(prev, text, target)
     if text.strip():
+        previous = dict(drafts)
         drafts[str(idx)] = text
         if user.get("id") == "lan-local":
             note_trial_use(DATA, session_id)
+        _safe_record_dictations(user, session_id, folder, previous, {str(idx): text})
         write_meta(folder, drafts=drafts, index=idx, phase="dictate")
         item = push_remote_result(session_id, idx, text)
     else:
         write_meta(folder, index=idx, phase="dictate")
         item = {"id": 0, "index": idx, "text": ""}
-    return {"text": text, "index": idx, "id": item["id"]}
+    out = {"text": text, "index": idx, "id": item["id"], "request_id": request_id, "client_request_id": client_request_id}
+    if asr_code:
+        out["code"] = asr_code
+        out["message"] = "这次没有听清，请重新说一次"
+    return out
+
+
+@app.post("/api/session/{session_id}/remote-stt")
+async def remote_stt(
+    session_id: str,
+    request: Request,
+    audio: UploadFile = File(...),
+    index: int = Form(...),
+    mode: str = Form("replace"),
+    user: dict[str, Any] = Depends(require_session_access),
+) -> dict[str, Any]:
+    require_member_or_trial(user)
+    folder = require_owned_session(session_id, user)
+    request_id = str(getattr(request.state, "request_id", "") or uuid.uuid4().hex[:12])
+    tmp_dir = DATA / "_stt"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    upload_id = uuid.uuid4().hex
+    raw = tmp_dir / f"{upload_id}{Path(audio.filename or 'phone.webm').suffix or '.webm'}"
+    try:
+        try:
+            _save_upload(audio, raw)
+        except Exception as exc:
+            raise HTTPException(400, "音频上传失败，请重新录音") from exc
+        return await _recognize_remote_audio(
+            session_id=session_id,
+            user=user,
+            folder=folder,
+            raw=raw,
+            mime=str(audio.content_type or ""),
+            index=index,
+            mode=mode,
+            request_id=request_id,
+            client_request_id=str(getattr(request.state, "client_request_id", "") or ""),
+        )
+    finally:
+        raw.unlink(missing_ok=True)
+
+
+async def _stt_from_raw_bytes(
+    session_id: str,
+    request: Request,
+    user: dict[str, Any],
+    index: int,
+    mode: str,
+    body: bytes,
+) -> dict[str, Any]:
+    require_member_or_trial(user)
+    folder = require_owned_session(session_id, user)
+    request_id = str(getattr(request.state, "request_id", "") or uuid.uuid4().hex[:12])
+    client_request_id = str(getattr(request.state, "client_request_id", "") or "")
+    stt_log.event(
+        "STT_BODY_RECEIVED",
+        client_request_id=client_request_id or None,
+        server_request_id=request_id,
+        bytes=len(body or b""),
+        content_type=request.headers.get("content-type", ""),
+    )
+    if not body or len(body) < 200:
+        stt_log.event("STT_FAILED", client_request_id=client_request_id or None, server_request_id=request_id, error_type="empty_body", http_status=400)
+        raise HTTPException(400, "音频上传失败，请重新录音")
+    if len(body) > 25 * 1024 * 1024:
+        stt_log.event("STT_FAILED", client_request_id=client_request_id or None, server_request_id=request_id, error_type="too_large", http_status=413)
+        raise HTTPException(413, "录音过大，请缩短后重试")
+    mime = str(request.headers.get("content-type") or "audio/wav").split(";")[0].strip().lower()
+    if mime in {"application/json", "text/plain", "text/html"}:
+        stt_log.event("STT_FAILED", client_request_id=client_request_id or None, server_request_id=request_id, error_type="invalid_mime", http_status=400)
+        raise HTTPException(400, "无效的音频类型")
+    owner = str(user.get("id") or "lan-local")
+    action, cached = stt_jobs.begin(owner, client_request_id)
+    if action == "replay" and isinstance(cached, dict):
+        replayed = dict(cached)
+        replayed["request_id"] = request_id
+        replayed["client_request_id"] = client_request_id
+        stt_log.event("STT_RESPONSE_SENT", client_request_id=client_request_id or None, server_request_id=request_id, replay=True)
+        return replayed
+    if action == "inflight":
+        raise HTTPException(409, "同一段录音正在识别，请稍候")
+    suffix = ".wav"
+    if "mp4" in mime or "aac" in mime or "m4a" in mime:
+        suffix = ".m4a"
+    elif "ogg" in mime:
+        suffix = ".ogg"
+    elif "webm" in mime:
+        suffix = ".webm"
+    tmp_dir = DATA / "_stt"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    raw = tmp_dir / f"{uuid.uuid4().hex}{suffix}"
+    try:
+        raw.write_bytes(body)
+        result = await _recognize_remote_audio(
+            session_id=session_id,
+            user=user,
+            folder=folder,
+            raw=raw,
+            mime=mime,
+            index=index,
+            mode=mode,
+            request_id=request_id,
+            client_request_id=client_request_id,
+        )
+        stt_jobs.finish(owner, client_request_id, result)
+        stt_log.event("STT_RESPONSE_SENT", client_request_id=client_request_id or None, server_request_id=request_id, replay=False)
+        return result
+    except Exception:
+        stt_jobs.fail(owner, client_request_id)
+        raise
+    finally:
+        raw.unlink(missing_ok=True)
+
+
+@app.api_route("/api/session/{session_id}/remote-stt-bin", methods=["PUT", "POST"])
+async def remote_stt_bin(
+    session_id: str,
+    request: Request,
+    index: int = 0,
+    mode: str = "insert",
+    user: dict[str, Any] = Depends(require_session_access),
+) -> dict[str, Any]:
+    body = await request.body()
+    return await _stt_from_raw_bytes(session_id, request, user, index, mode, body)
 
 
 @app.get("/api/session/{session_id}/remote-inbox")
@@ -871,18 +1279,18 @@ async def prepare(
     if user["id"] != "lan-local":
         if not db.membership_status(user["id"]).get("active") and not db.consume_trial(user["id"], "prepare:" + session_id):
             shutil.rmtree(folder, ignore_errors=True)
-            raise HTTPException(402, "free quota exhausted")
+            raise HTTPException(402, "免费学习素材次数已用完")
 
     suffix = Path(video.filename or "video.mp4").suffix or ".mp4"
     source = folder / f"source{suffix}"
     audio = folder / "audio.wav"
     _save_upload(video, source)
     try:
-        extract_wav(source, audio)
-        ensure_playback_audio(folder, source)
+        media = find_session_media(folder) or source
+        extract_wav(media, audio)
+        ensure_playback_audio(folder, media)
     except Exception as exc:
-        if user["id"] != "lan-local":
-            db.refund_trial(user["id"], "prepare:" + session_id)
+        _refund_failed_prepare(user, session_id)
         shutil.rmtree(folder, ignore_errors=True)
         raise HTTPException(400, f"抽音频失败（需要视频里有音轨，并已安装 ffmpeg）: {exc}") from exc
 
@@ -890,15 +1298,18 @@ async def prepare(
     if captions is not None and captions.filename:
         raw = (await captions.read()).decode("utf-8", errors="replace")
         sentences = _cues_from_text(raw, captions.filename or "")
-    detail = _finish_session(
-        folder,
-        session_id,
-        audio,
-        sentences,
-        title=Path(video.filename or "video").stem,
-        source_kind="file",
-    )
-    return detail
+    try:
+        return _finish_session(
+            folder,
+            session_id,
+            audio,
+            sentences,
+            title=Path(video.filename or "video").stem,
+            source_kind="file",
+        )
+    except Exception:
+        _refund_failed_prepare(user, session_id)
+        raise
 
 
 @app.post("/api/prepare-url")
@@ -907,7 +1318,7 @@ async def prepare_url(body: PrepareUrlBody, user: dict[str, Any] = Depends(requi
         url = validate_media_url(body.url)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
-    existing = find_session_id_by_url(DATA, url)
+    existing = None if body.create_new_session else find_session_id_by_url(DATA, url)
     can_reuse = bool(existing) and (
         user["id"] == "lan-local" or db.owns_learning_session(existing, user["id"])
     )
@@ -926,37 +1337,70 @@ async def prepare_url(body: PrepareUrlBody, user: dict[str, Any] = Depends(requi
     if user["id"] != "lan-local":
         if not db.membership_status(user["id"]).get("active") and not db.consume_trial(user["id"], "prepare:" + session_id):
             shutil.rmtree(folder, ignore_errors=True)
-            raise HTTPException(402, "free quota exhausted")
+            raise HTTPException(402, "免费学习素材次数已用完")
     try:
         _media, audio, caption_text = await run_in_threadpool(ingest_url, url, folder)
     except Exception as exc:
-        if user["id"] != "lan-local":
-            db.refund_trial(user["id"], "prepare:" + session_id)
+        _refund_failed_prepare(user, session_id)
         shutil.rmtree(folder, ignore_errors=True)
         raise HTTPException(400, f"链接无法用于学习：{exc}") from exc
     sentences: list[dict[str, Any]] = []
     if caption_text:
         sentences = _cues_from_text(caption_text)
     display_title = await run_in_threadpool(fetch_media_title, url) or url
-    detail = _finish_session(
-        folder,
-        session_id,
-        audio,
-        sentences,
-        title=display_title,
-        source_url=url,
-        source_kind="url",
-    )
-    return detail
+    try:
+        return _finish_session(
+            folder,
+            session_id,
+            audio,
+            sentences,
+            title=display_title,
+            source_url=url,
+            source_kind="url",
+        )
+    except Exception:
+        _refund_failed_prepare(user, session_id)
+        raise
 
 
 @app.get("/api/sessions")
-def api_sessions(request: Request) -> dict[str, Any]:
-    user = current_user(request)
+def api_sessions(user: dict[str, Any] = Depends(require_user_or_local)) -> dict[str, Any]:
     items = list_sessions(DATA)
-    if user:
+    if user.get("id") != "lan-local":
         items = [item for item in items if db.owns_learning_session(item["session_id"], user["id"])]
     return {"sessions": items}
+
+
+@app.get("/api/progress")
+def api_progress(days: int | None = None, user: dict[str, Any] = Depends(require_user_or_local)) -> dict[str, Any]:
+    if days not in (None, 7, 30):
+        raise HTTPException(400, "days must be 7, 30, or omitted")
+    return progress_for_user(user, days)
+
+
+@app.post("/api/progress/complete/{session_id}")
+def api_progress_complete(
+    session_id: str,
+    body: LearningCompleteBody,
+    user: dict[str, Any] = Depends(require_session_access),
+) -> dict[str, Any]:
+    try:
+        return complete_session(user, session_id, DATA, body.duration_seconds)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@app.post("/api/session/{session_id}/resplit-remaining")
+def api_resplit_remaining(session_id: str, body: ResplitBody, user: dict[str, Any] = Depends(require_session_access)) -> dict[str, Any]:
+    if os.environ.get("ENPRATO_ENABLE_RESPLIT_REMAINING") != "1":
+        raise HTTPException(404, "resplit tool is disabled")
+    folder = require_owned_session(session_id, user)
+    try:
+        if body.backup_id:
+            return rollback_resplit_session(folder, body.backup_id)
+        return resplit_remaining_session(folder)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
 
 
 @app.get("/api/session/{session_id}")
@@ -985,6 +1429,7 @@ def api_save_progress(session_id: str, body: ProgressBody, user: dict[str, Any] 
         fields["drafts"] = collapse_identical_drafts(
             apply_draft_snapshot(existing, body.drafts)
         )
+        _safe_record_dictations(user, session_id, folder, existing, fields["drafts"])
         if any(str(v or "").strip() for v in body.drafts.values()) and user.get("id") == "lan-local":
             note_trial_use(DATA, session_id)
     write_meta(folder, **fields)
@@ -1113,6 +1558,7 @@ def session_video(session_id: str, user: dict[str, Any] = Depends(require_sessio
 
 @app.post("/api/stt")
 async def stt(
+    request: Request,
     audio: UploadFile = File(...),
     context: str = Form(default=""),
     target: str = Form(default=""),
@@ -1121,15 +1567,31 @@ async def stt(
     require_member_or_trial(user)
     tmp_dir = DATA / "_stt"
     tmp_dir.mkdir(parents=True, exist_ok=True)
+    request_id = str(getattr(request.state, "request_id", "") or uuid.uuid4().hex[:12])
     raw = tmp_dir / f"{uuid.uuid4().hex}{Path(audio.filename or 'clip.webm').suffix or '.webm'}"
     wav = raw.with_suffix(".wav")
     try:
         _save_upload(audio, raw)
+        raw_size = raw.stat().st_size
+        raw_duration = probe_duration(raw)
         await run_in_threadpool(convert_to_wav, raw, wav)
-        text = await run_in_threadpool(
-            lambda: transcribe_speech(wav, context=context, target=target, fast=True),
-        )
-        return {"text": text}
+        wav_duration = probe_duration(wav)
+        asr_started = asyncio.get_running_loop().time()
+        result = await asyncio.wait_for(run_in_threadpool(
+            lambda: transcribe_speech_detailed(wav, context=context, target=target, fast=True),
+        ), timeout=120.0)
+        text = str(result.get("text") or "")
+        logger.info("asr request_id=%s size=%s mime=%s raw_duration=%.3f wav_duration=%.3f asr_elapsed=%.3f segments=%s last_end=%.3f words=%s retried=%s retry_reason=%s result=success", request_id, raw_size, audio.content_type, raw_duration, wav_duration, asyncio.get_running_loop().time() - asr_started, result.get("segment_count", 0), result.get("last_end", 0.0), len(text.split()), result.get("retried", False), result.get("retry_reason", ""))
+        if wav_duration > 8 and float(result.get("last_end") or 0.0) < wav_duration * 0.55:
+            raise HTTPException(422, f"ASR_INCOMPLETE: partial recognition. Request ID: {request_id}")
+        return {"text": text, "request_id": request_id}
+    except asyncio.TimeoutError as exc:
+        raise HTTPException(504, f"ASR_TIMEOUT: server recognition timed out. Request ID: {request_id}") from exc
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("asr request_id=%s error=%s", request_id, type(exc).__name__)
+        raise HTTPException(500, f"ASR_SERVER_ERROR: server recognition failed. Request ID: {request_id}") from exc
     finally:
         raw.unlink(missing_ok=True)
         wav.unlink(missing_ok=True)

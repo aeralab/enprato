@@ -149,6 +149,33 @@ def stream_codec(src: Path, kind: str = "a") -> str:
 
 BROWSER_VIDEO_CODECS = {"h264", "avc1", "vp8", "vp9", "theora"}
 BROWSER_AUDIO_CODECS = {"aac", "mp3", "opus", "vorbis"}
+IPAD_VIDEO_CODECS = {"h264", "avc1"}
+IPAD_AUDIO_CODECS = {"aac", "mp3"}
+IPAD_CONTAINERS = {".mp4", ".m4v", ".mov"}
+IPAD_MAX_WIDTH = 1280
+IPAD_MAX_HEIGHT = 720
+
+
+def stream_dimensions(src: Path) -> tuple[int, int]:
+    try:
+        cmd = [
+            find_ffprobe(),
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height",
+            "-of",
+            "csv=p=0:s=x",
+            str(src),
+        ]
+        completed = subprocess.run(cmd, capture_output=True, text=True)
+        raw = (completed.stdout or "").strip().splitlines()[0]
+        width, height = raw.lower().split("x", 1)
+        return max(0, int(width)), max(0, int(height))
+    except Exception:
+        return (0, 0)
 
 
 def is_browser_video(src: Path) -> bool:
@@ -168,9 +195,25 @@ def is_browser_audio(src: Path) -> bool:
 def is_browser_media(src: Path) -> bool:
     return is_browser_video(src) and media_has_audio(src) and is_browser_audio(src)
 
+
+def is_ipad_media(src: Path) -> bool:
+    if src.suffix.lower() not in IPAD_CONTAINERS:
+        return False
+    video_codec = stream_codec(src, "v")
+    audio_codec = stream_codec(src, "a")
+    if not video_codec or video_codec not in IPAD_VIDEO_CODECS:
+        return False
+    if not audio_codec or audio_codec not in IPAD_AUDIO_CODECS:
+        return False
+    width, height = stream_dimensions(src)
+    if not width or not height:
+        return True
+    return width <= IPAD_MAX_WIDTH and height <= IPAD_MAX_HEIGHT
+
+
 def make_browser_mp4(src: Path, dest: Path) -> Path:
     dest.parent.mkdir(parents=True, exist_ok=True)
-    if dest.is_file() and dest.stat().st_size > 1000 and is_browser_media(dest):
+    if dest.is_file() and dest.stat().st_size > 1000 and is_ipad_media(dest):
         return dest
     tmp = dest.with_name(f"{dest.stem}.{os.getpid()}.tmp{dest.suffix}")
     video_attempts = [
@@ -185,6 +228,8 @@ def make_browser_mp4(src: Path, dest: Path) -> Path:
                         "-i",
                         str(src),
                         *video_args,
+                        "-vf",
+                        "scale=w='min(1280,iw)':h='min(720,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2",
                         "-c:a",
                         "aac",
                         "-b:a",

@@ -124,35 +124,144 @@ def normalize_phone(phone: str) -> str:
 def create_phone_challenge(phone: str, code_hash: str, request_ip: str, challenge_id: str, minutes: int = 5) -> bool:
     conn = connect()
     try:
-        now = utc_now(); cutoff = iso(now - timedelta(minutes=1)); hour = iso(now - timedelta(hours=1))
-        if conn.execute("SELECT 1 FROM sms_challenges WHERE phone=? AND created_at>?", (phone, cutoff)).fetchone(): return False
-        if conn.execute("SELECT 1 FROM sms_challenges WHERE request_ip=? AND created_at>?", (request_ip, cutoff)).fetchone(): return False
-        if conn.execute("SELECT COUNT(*) FROM sms_challenges WHERE phone=? AND created_at>?", (phone, hour)).fetchone()[0] >= 5: return False
-        conn.execute("INSERT INTO sms_challenges(id,phone,code_hash,request_ip,created_at,expires_at) VALUES(?,?,?,?,?,?)", (challenge_id, phone, code_hash, request_ip, iso(now), iso(now + timedelta(minutes=minutes))))
+        now = utc_now()
+        cutoff = iso(now - timedelta(minutes=1))
+        hour = iso(now - timedelta(hours=1))
+        if conn.execute("SELECT 1 FROM sms_challenges WHERE phone=? AND created_at>?", (phone, cutoff)).fetchone():
+            return False
+        if conn.execute("SELECT 1 FROM sms_challenges WHERE request_ip=? AND created_at>?", (request_ip, cutoff)).fetchone():
+            return False
+        if conn.execute("SELECT COUNT(*) FROM sms_challenges WHERE phone=? AND created_at>?", (phone, hour)).fetchone()[0] >= 5:
+            return False
+        if conn.execute("SELECT COUNT(*) FROM sms_challenges WHERE request_ip=? AND created_at>?", (request_ip, hour)).fetchone()[0] >= 20:
+            return False
+        conn.execute(
+            "INSERT INTO sms_challenges(id,phone,code_hash,request_ip,created_at,expires_at) VALUES(?,?,?,?,?,?)",
+            (challenge_id, phone, code_hash, request_ip, iso(now), iso(now + timedelta(minutes=minutes))),
+        )
         return True
-    finally: conn.close()
+    finally:
+        conn.close()
+
+
+def delete_phone_challenge(challenge_id: str) -> None:
+    conn = connect()
+    try:
+        conn.execute("DELETE FROM sms_challenges WHERE id=?", (challenge_id,))
+    finally:
+        conn.close()
+
+
+def _login_or_create_identities(conn: sqlite3.Connection, pairs: list[tuple[str, str]]) -> str:
+    if not pairs:
+        raise ValueError("missing identity")
+    found: list[str] = []
+    for provider, provider_user_id in pairs:
+        row = conn.execute(
+            "SELECT user_id FROM user_identities WHERE provider=? AND provider_user_id=?",
+            (provider, provider_user_id),
+        ).fetchone()
+        if row:
+            uid = str(row["user_id"])
+            if uid not in found:
+                found.append(uid)
+    now = iso()
+    if found:
+        user_id = found[0]
+    else:
+        user_id = uuid.uuid4().hex
+        conn.execute("INSERT INTO users(id,email,password_hash,created_at) VALUES(?,?,?,?)", (user_id, None, None, now))
+        conn.execute(
+            "INSERT INTO usage_quotas(user_id,trial_limit,trial_used,updated_at) VALUES(?,?,?,?)",
+            (user_id, 5, 0, now),
+        )
+    conn.execute("UPDATE users SET last_login_at=? WHERE id=?", (now, user_id))
+    for provider, provider_user_id in pairs:
+        existing = conn.execute(
+            "SELECT user_id FROM user_identities WHERE provider=? AND provider_user_id=?",
+            (provider, provider_user_id),
+        ).fetchone()
+        if existing:
+            continue
+        conn.execute(
+            "INSERT INTO user_identities(user_id,provider,provider_user_id,verified_at,created_at) VALUES(?,?,?,?,?)",
+            (user_id, provider, provider_user_id, now, now),
+        )
+    return user_id
+
+
+def login_or_create_identities(pairs: list[tuple[str, str]]) -> str:
+    conn = connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        user_id = _login_or_create_identities(conn, pairs)
+        conn.execute("COMMIT")
+        return user_id
+    except Exception:
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+    finally:
+        conn.close()
+
+
+def login_label(user_id: str, email: str | None = None) -> str:
+    if email:
+        return email
+    conn = connect()
+    try:
+        rows = conn.execute(
+            "SELECT provider, provider_user_id FROM user_identities WHERE user_id=? ORDER BY id",
+            (user_id,),
+        ).fetchall()
+    finally:
+        conn.close()
+    for row in rows:
+        if row["provider"] == "phone":
+            phone = str(row["provider_user_id"])
+            if len(phone) >= 7:
+                return phone[:3] + "****" + phone[-4:]
+            return "手机号账号"
+        if row["provider"] in {"wechat", "wechat_openid"}:
+            return "微信账号"
+    return "已登录"
 
 
 def consume_phone_challenge(challenge_id: str, phone: str, code_hash: str) -> str | None:
     conn = connect()
     try:
         conn.execute("BEGIN IMMEDIATE")
-        row = conn.execute("SELECT * FROM sms_challenges WHERE id=? AND phone=? AND consumed_at IS NULL AND expires_at>?", (challenge_id, phone, iso())).fetchone()
-        if not row or not secrets.compare_digest(row["code_hash"], code_hash):
-            if row: conn.execute("UPDATE sms_challenges SET attempts=attempts+1 WHERE id=?", (challenge_id,))
-            conn.execute("ROLLBACK"); return None
+        row = conn.execute(
+            "SELECT * FROM sms_challenges WHERE id=? AND phone=? AND consumed_at IS NULL AND expires_at>?",
+            (challenge_id, phone, iso()),
+        ).fetchone()
+        if not row:
+            conn.execute("ROLLBACK")
+            return None
+        attempts = int(row["attempts"] or 0)
+        if attempts >= 5:
+            conn.execute("ROLLBACK")
+            return None
+        if not secrets.compare_digest(str(row["code_hash"]), code_hash):
+            conn.execute("UPDATE sms_challenges SET attempts=attempts+1 WHERE id=?", (challenge_id,))
+            if attempts + 1 >= 5:
+                conn.execute("UPDATE sms_challenges SET consumed_at=? WHERE id=?", (iso(), challenge_id))
+            conn.execute("COMMIT")
+            return None
         conn.execute("UPDATE sms_challenges SET consumed_at=? WHERE id=?", (iso(), challenge_id))
-        identity = conn.execute("SELECT user_id FROM user_identities WHERE provider='phone' AND provider_user_id=?", (phone,)).fetchone()
-        if identity: user_id = str(identity["user_id"])
-        else:
-            user_id = uuid.uuid4().hex; now = iso()
-            conn.execute("INSERT INTO users(id,email,password_hash,created_at) VALUES(?,?,?,?,?)".replace("VALUES(?,?,?,?,?)","VALUES(?,?,?,?)"), (user_id, None, None, now))
-            conn.execute("INSERT INTO usage_quotas(user_id,trial_limit,trial_used,updated_at) VALUES(?,?,?,?)", (user_id, 5, 0, now))
-            conn.execute("INSERT INTO user_identities(user_id,provider,provider_user_id,verified_at,created_at) VALUES(?,?,?,?,?)", (user_id, "phone", phone, now, now))
-        conn.execute("COMMIT"); return user_id
+        user_id = _login_or_create_identities(conn, [("phone", phone)])
+        conn.execute("COMMIT")
+        return user_id
     except Exception:
-        conn.execute("ROLLBACK"); raise
-    finally: conn.close()
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+    finally:
+        conn.close()
 
 
 def trial_status(user_id: str) -> dict[str, int]:

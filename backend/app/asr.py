@@ -10,6 +10,7 @@ from typing import Any
 
 from faster_whisper import WhisperModel
 
+from .media import probe_duration
 from .sentences import words_to_sentences
 
 MODEL_ROOT = Path(__file__).resolve().parents[1] / "data" / "models"
@@ -217,37 +218,226 @@ def transcribe_speech(
     *,
     fast: bool = False,
 ) -> str:
+    return str(transcribe_speech_detailed(audio_path, context, target, fast=fast)["text"])
+
+
+def transcribe_speech_detailed(
+    audio_path: Path,
+    context: str = "",
+    target: str = "",
+    *,
+    fast: bool = False,
+) -> dict[str, Any]:
     """Dictation / shadowing with accent: bias spelling toward the expected line."""
     model = get_model()
     _warm_model_once(model)
     target = " ".join(target.split())
     ctx = " ".join(context.split())[:600]
     prompt = _build_prompt(target=target, context="" if fast else ctx, compact=fast)
-    beam = 1
+    hints = " ".join(_spelling_hotwords(target)) if fast else ""
+    long_target = len(target.split()) > 18 or len(target) > 110
+    beam = 3 if long_target else 1
 
     # 短句听写：只跑一遍。VAD 常把短录音判成空，再无 VAD 重跑会把等待时间翻倍。
-    text = _run_transcribe(
+    audio_duration = probe_duration(audio_path)
+    first = _run_transcribe_detailed(
         model,
         audio_path,
         prompt,
         vad=False,
         beam_size=beam,
-        timestamps=False,
-        hotwords=not fast,
+        timestamps=long_target,
+        hotwords=not fast or bool(hints),
+        hotword_source=hints if fast else "",
     )
 
+    text = first["text"]
+    retry_reason = ""
+    if audio_duration > 8 and float(first["last_end"] or 0.0) < audio_duration * 0.55:
+        retry_reason = "low_coverage"
+    elif long_target and (not text or len(text.split()) < max(5, int(len(target.split()) * 0.45))):
+        retry_reason = "short_transcript"
+    retried = False
+    if retry_reason:
+        retried = True
+        retry = _run_transcribe_detailed(
+            model,
+            audio_path,
+            prompt,
+            vad=True,
+            beam_size=3,
+            timestamps=True,
+            hotwords=not fast or bool(hints),
+            hotword_source=hints if fast else "",
+        )
+        if len(retry["text"].split()) > len(text.split()) or retry["last_end"] > first["last_end"]:
+            first = retry
+            text = retry["text"]
+
     text = _clean_stt(text)
-    if target:
+    prompt_parts = [part for part in (prompt, hints) if part]
+    guard = detect_prompt_leakage(text, target, prompt_parts=prompt_parts, audio_duration=audio_duration)
+    prompt_guard_result = "ok"
+    code = ""
+    if guard["is_leakage"]:
+        prompt_guard_result = "fallback_started"
+        retried = True
+        retry_reason = "prompt_leakage"
+        fallback = _run_transcribe_detailed(
+            model,
+            audio_path,
+            "",
+            vad=True,
+            beam_size=3,
+            timestamps=True,
+            hotwords=False,
+        )
+        fallback_text = _clean_stt(fallback["text"])
+        fallback_guard = detect_prompt_leakage(
+            fallback_text,
+            target,
+            prompt_parts=[],
+            audio_duration=audio_duration,
+        )
+        if fallback_guard["is_leakage"]:
+            prompt_guard_result = "fallback_failed"
+            code = "prompt_leakage"
+            text = ""
+            first = fallback
+        elif not fallback_text.strip():
+            prompt_guard_result = "fallback_failed"
+            code = "empty_transcript"
+            text = ""
+            first = fallback
+        else:
+            prompt_guard_result = "fallback_success"
+            text = fallback_text
+            first = fallback
+    elif not text.strip():
+        code = "empty_transcript"
+
+    if text and target:
         text = _spell_toward_target(text, target)
-    return text
+    return {
+        "text": text,
+        "code": code,
+        "prompt_guard_result": prompt_guard_result,
+        "audio_duration": audio_duration,
+        "last_end": float(first["last_end"] or 0.0),
+        "segment_count": int(first["segment_count"]),
+        "retried": retried,
+        "retry_reason": retry_reason,
+        "fast": fast,
+        "prompt_mode": "compact" if fast else "full",
+        "compact_prompt_enabled": bool(fast),
+        "expected_target_len": len(target),
+        "expected_target_preview": target[:80],
+    }
+
+
+_LEAK_LABEL_PHRASES = (
+    "no extra sentence",
+    "english dictation",
+    "correct spelling",
+)
+_HOTWORD_BLOCKLIST = {
+    "answer",
+    "correct",
+    "dictation",
+    "english",
+    "expected",
+    "extra",
+    "output",
+    "say",
+    "sentence",
+    "sentences",
+    "spelling",
+    "transcript",
+}
+
+
+def _normalize_for_leak(text: str) -> str:
+    raw = str(text or "").lower().strip()
+    raw = re.sub(r"[^\w\s]", " ", raw)
+    raw = " ".join(raw.split())
+    words: list[str] = []
+    for word in raw.split():
+        if word == "sentences":
+            word = "sentence"
+        elif word == "spellings":
+            word = "spelling"
+        words.append(word)
+    return " ".join(words)
+
+
+def _texts_equivalent(left: str, right: str) -> bool:
+    a = _normalize_for_leak(left)
+    b = _normalize_for_leak(right)
+    return bool(a) and a == b
+
+
+def _is_boilerplate_only(normalized: str) -> bool:
+    rest = normalized
+    changed = True
+    phrases = tuple(sorted(_LEAK_LABEL_PHRASES, key=len, reverse=True))
+    while rest and changed:
+        changed = False
+        for phrase in phrases:
+            if rest == phrase:
+                return True
+            if rest.startswith(phrase + " "):
+                rest = rest[len(phrase) :].strip()
+                changed = True
+                break
+            if rest.endswith(" " + phrase):
+                rest = rest[: -(len(phrase) + 1)].strip()
+                changed = True
+                break
+            padded = f" {rest} "
+            needle = f" {phrase} "
+            if needle in padded:
+                rest = " ".join(padded.replace(needle, " ").split())
+                changed = True
+                break
+    return rest == ""
+
+
+def detect_prompt_leakage(
+    text: str,
+    target: str = "",
+    prompt_parts: list[str] | None = None,
+    audio_duration: float | None = None,
+) -> dict[str, Any]:
+    """Reject Whisper prompt regurgitation. Never treat short text or text==target as leakage."""
+    del audio_duration  # duration must not be used as a short-utterance reject rule
+    del prompt_parts
+    spoken = str(text or "").strip()
+    expected = str(target or "").strip()
+    if not spoken:
+        return {"is_leakage": False, "reason": "empty"}
+    if expected and _texts_equivalent(spoken, expected):
+        return {"is_leakage": False, "reason": "matches_target"}
+    normalized = _normalize_for_leak(spoken)
+    if not normalized:
+        return {"is_leakage": False, "reason": "empty"}
+    lowered = spoken.lower()
+    if "expected:" in lowered:
+        return {"is_leakage": True, "reason": "expected_label"}
+    if normalized == "expected" or normalized.startswith("expected "):
+        return {"is_leakage": True, "reason": "expected_contamination"}
+    for phrase in _LEAK_LABEL_PHRASES:
+        if normalized == phrase or normalized.startswith(phrase + " "):
+            return {"is_leakage": True, "reason": "prompt_phrase"}
+    if _is_boilerplate_only(normalized):
+        return {"is_leakage": True, "reason": "boilerplate_only"}
+    return {"is_leakage": False, "reason": "ok"}
 
 
 def _build_prompt(*, target: str, context: str, compact: bool = False) -> str:
     if compact:
-        parts = ["English dictation. Correct spelling. No extra sentences."]
-        if target:
-            parts.append("Expected: " + target)
-        return " ".join(parts)
+        # Fast path: no natural-language commands and no full target.
+        # Those labels were echoed verbatim by Whisper on iPad.
+        return ""
     parts = [
         "English dictation by a non-native speaker with an accent.",
         "Output correct English spelling and punctuation.",
@@ -257,12 +447,16 @@ def _build_prompt(*, target: str, context: str, compact: bool = False) -> str:
     if target:
         # 本句词汇进 prompt，帮助专有名词/难词拼写（听写场景：跟读刚播的那句）
         parts.append("The expected sentence (for spelling only): " + target)
-        rare = _rare_words(target)
+        rare = _spelling_hotwords(target)
         if rare:
             parts.append("Spell these words exactly: " + ", ".join(rare))
     if context:
         parts.append("Topic from earlier lines: " + context)
     return " ".join(parts)
+
+
+def _spelling_hotwords(text: str) -> list[str]:
+    return [word for word in _rare_words(text) if word.lower() not in _HOTWORD_BLOCKLIST]
 
 
 def _rare_words(text: str) -> list[str]:
@@ -328,6 +522,20 @@ def _run_transcribe(
     timestamps: bool = True,
     hotwords: bool = True,
 ) -> str:
+    return str(_run_transcribe_detailed(model, audio_path, prompt, vad=vad, beam_size=beam_size, timestamps=timestamps, hotwords=hotwords)["text"])
+
+
+def _run_transcribe_detailed(
+    model: WhisperModel,
+    audio_path: Path,
+    prompt: str,
+    *,
+    vad: bool,
+    beam_size: int = 5,
+    timestamps: bool = True,
+    hotwords: bool = True,
+    hotword_source: str = "",
+) -> dict[str, Any]:
     kwargs: dict[str, Any] = {
         "language": "en",
         "beam_size": beam_size,
@@ -345,7 +553,8 @@ def _run_transcribe(
             "min_silence_duration_ms": 400,
             "speech_pad_ms": 400,
         }
-    rare = _rare_words(prompt) if hotwords else []
+    source = hotword_source or prompt
+    rare = [w for w in _rare_words(source) if w.lower() not in _HOTWORD_BLOCKLIST] if hotwords else []
     if rare:
         kwargs["hotwords"] = " ".join(rare[:20])
     try:
@@ -354,7 +563,12 @@ def _run_transcribe(
         kwargs.pop("hotwords", None)
         kwargs.pop("without_timestamps", None)
         segments, _info = model.transcribe(str(audio_path), **kwargs)
-    return " ".join(seg.text.strip() for seg in segments if seg.text).strip()
+    collected = [seg for seg in segments if seg.text]
+    return {
+        "text": " ".join(seg.text.strip() for seg in collected).strip(),
+        "segment_count": len(collected),
+        "last_end": max((float(getattr(seg, "end", 0.0) or 0.0) for seg in collected), default=0.0),
+    }
 
 
 def _norm_token(token: str) -> str:

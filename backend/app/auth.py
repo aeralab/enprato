@@ -21,7 +21,9 @@ def hash_password(password: str) -> str:
     return f"pbkdf2_sha256${rounds}${base64.urlsafe_b64encode(salt).decode()}${base64.urlsafe_b64encode(digest).decode()}"
 
 
-def verify_password(password: str, encoded: str) -> bool:
+def verify_password(password: str, encoded: str | None) -> bool:
+    if not encoded:
+        return False
     try:
         algorithm, rounds, salt, expected = encoded.split("$", 3)
         if algorithm != "pbkdf2_sha256":
@@ -59,5 +61,13 @@ def require_user_or_local(request: Request) -> dict[str, Any]:
     return {"id": "lan-local", "email": "", "status": "active"}
 
 
-def cookie_secure() -> bool:
-    return os.environ.get("ENPRATO_COOKIE_SECURE", "0").lower() in {"1", "true", "yes"}
+def cookie_secure(request: Request | None = None) -> bool:
+    raw = os.environ.get("ENPRATO_COOKIE_SECURE", "").strip().lower()
+    if raw in {"1", "true", "yes"}:
+        return True
+    if raw in {"0", "false", "no"}:
+        return False
+    if request is None:
+        return False
+    proto = (request.headers.get("x-forwarded-proto") or request.url.scheme or "").split(",")[0].strip().lower()
+    return proto == "https"

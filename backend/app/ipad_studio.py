@@ -3,7 +3,7 @@ from __future__ import annotations
 _IPAD_BTN_SPEAK = "\u8bf4\u8bdd"
 _IPAD_BTN_STOP = "\u505c\u6b62"
 # 改 iPad 页后递增；固定入口 /ipad 会跳到最新版，页内也会自动检测并刷新
-IPAD_BUILD = "20260903d"
+IPAD_BUILD = "20260906a"
 
 IPAD_PAGE = """<!DOCTYPE html>
 <html lang="zh-CN">
@@ -225,7 +225,6 @@ IPAD_PAGE = """<!DOCTYPE html>
       overflow-x: auto;
       overflow-y: hidden;
       padding: 4px 0 6px;
-      scroll-snap-type: x proximity;
       -webkit-overflow-scrolling: touch;
       flex-shrink: 0;
     }
@@ -241,7 +240,6 @@ IPAD_PAGE = """<!DOCTYPE html>
       font-size: 14px;
       font-weight: 650;
       line-height: 1;
-      scroll-snap-align: start;
       cursor: pointer;
       touch-action: manipulation;
       -webkit-tap-highlight-color: transparent;
@@ -550,10 +548,12 @@ IPAD_PAGE = """<!DOCTYPE html>
         <button id="restoreBtn" type="button" class="restore-btn" hidden>恢复修改前</button>
       </div>
       <div id="status" class="status"></div>
+      <button id="retrySttBtn" type="button" class="restore-btn" hidden>重新上传这段录音</button>
       <button id="btn" type="button" aria-label="__IPAD_BTN_SPEAK__" data-speak="__IPAD_BTN_SPEAK__" data-stop="__IPAD_BTN_STOP__">__IPAD_BTN_SPEAK__</button>
     </div>
   </div>
   <div id="pageVer" class="page-ver" aria-hidden="true">__IPAD_BUILD__</div>
+  <script src="/ipad-assets/stt_job.js?v=__IPAD_BUILD__"></script>
   <script>
     let sessionId = new URLSearchParams(location.search).get('s') || localStorage.getItem('enprato.ipad.lastSession') || '';
     const PAGE_BUILD = '__IPAD_BUILD__';
@@ -572,12 +572,14 @@ IPAD_PAGE = """<!DOCTYPE html>
     })();
     // 电脑更新后自动跟新：轮询 health，版本变了就刷新到最新 /ipad
     setInterval(async () => {
+      if (recording || sttBusy) return;
       try {
         const res = await fetch('/api/health?_=' + Date.now(), { cache: 'no-store' });
         if (!res.ok) return;
         const data = await res.json();
         const remote = String(data.ipad_build || '');
         if (remote && remote !== PAGE_BUILD) {
+          if (recording || sttBusy) return;
           const u = new URL(location.origin + '/ipad');
           if (sessionId) u.searchParams.set('s', sessionId);
           u.searchParams.set('_', String(Date.now()));
@@ -596,7 +598,7 @@ IPAD_PAGE = """<!DOCTYPE html>
     const docTailEl = document.getElementById('docTail');
     const docCurrentLabelEl = document.getElementById('docCurrentLabel');
     const docCurrentNoEl = document.getElementById('docCurrentNo');
-    const btn = document.getElementById('btn');
+    const retrySttBtn = document.getElementById('retrySttBtn');
     const resumeBtn = document.getElementById('resumeBtn');
     const repeatBtn = document.getElementById('repeatBtn');
     const seekBar = document.getElementById('seekBar');
@@ -631,9 +633,14 @@ IPAD_PAGE = """<!DOCTYPE html>
     let mediaRecorder = null, chunks = [], stream = null;
     let saveTimer = 0, lastSent = '';
     let sttBusy = false;
+    let saveBusy = false;
+    let recState = 'idle';
+    let lastSttJob = null;
     let caretStart = 0, caretEnd = 0;
     let editBaseline = null;
     let localIndexControl = false;
+    let stripBrowseUntil = 0;
+    let resumeKey = '';
     let draftLocalRev = {};
     let draftSavedRev = {};
 
@@ -704,24 +711,90 @@ IPAD_PAGE = """<!DOCTYPE html>
       }
     }
 
+    function resumeIndexFrom(saved) {
+      const n = sentences.length;
+      if (!n) return 0;
+      let lastFilled = -1;
+      let firstEmpty = n;
+      for (let i = 0; i < n; i++) {
+        if (draftAt(i).trim()) lastFilled = i;
+        else if (firstEmpty === n) firstEmpty = i;
+      }
+      const pinned = Math.max(0, Math.min(Number(saved) || 0, n - 1));
+      if (firstEmpty === n) return n - 1;
+      if (pinned >= firstEmpty) return pinned;
+      if (lastFilled >= 0 && pinned === lastFilled) return pinned;
+      return firstEmpty;
+    }
+
+    function applyResumeIfNeeded(saved) {
+      const key = sessionId + ':' + sentences.length + ':' + (sentencesRev || '');
+      if (!sessionId || !sentences.length || resumeKey === key) return;
+      resumeKey = key;
+      const prev = index;
+      index = resumeIndexFrom(saved);
+      localIndexControl = true;
+      const cur = sentences[index];
+      if (cur) {
+        pauseAt = cur.start;
+        now = cur.start;
+        try {
+          if (videoEl && userPaused) videoEl.currentTime = cur.start;
+        } catch (e) {}
+      }
+      persistLocal();
+      if (index !== prev) {
+        lastSent = '';
+        void saveAll();
+      }
+    }
+
+    function scrollStripToCurrent(force) {
+      if (!stripEl) return;
+      const nowBtn = stripEl.querySelector('.beat.now');
+      if (!nowBtn) return;
+      if (!force && Date.now() < stripBrowseUntil) return;
+      const left = nowBtn.offsetLeft - (stripEl.clientWidth - nowBtn.offsetWidth) / 2;
+      stripEl.scrollTo({ left: Math.max(0, left) });
+    }
+
     function renderStrip() {
       if (!stripEl) return;
-      stripEl.innerHTML = '';
+      const prevScroll = stripEl.scrollLeft;
+      const browsing = Date.now() < stripBrowseUntil;
+      if (stripEl.childElementCount !== sentences.length) {
+        stripEl.innerHTML = '';
+        sentences.forEach((item, i) => {
+          const btn = document.createElement('button');
+          btn.type = 'button';
+          btn.className = 'beat';
+          btn.addEventListener('click', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            void pickSentence(i);
+          });
+          stripEl.appendChild(btn);
+        });
+      }
       sentences.forEach((item, i) => {
-        const btn = document.createElement('button');
-        btn.type = 'button';
+        const btn = stripEl.children[i];
+        if (!btn) return;
         btn.className = 'beat' + (i === index ? ' now' : '') + (draftAt(i).trim() ? ' done' : '');
         btn.textContent = String(i + 1);
         btn.title = (i + 1) + '. ' + (item.text || '');
-        btn.addEventListener('click', (e) => {
-          e.preventDefault();
-          e.stopPropagation();
-          void pickSentence(i);
-        });
-        stripEl.appendChild(btn);
       });
-      const nowBtn = stripEl.querySelector('.beat.now');
-      if (nowBtn) nowBtn.scrollIntoView({ block: 'nearest', inline: 'center' });
+      if (browsing) stripEl.scrollLeft = prevScroll;
+      else requestAnimationFrame(() => scrollStripToCurrent(true));
+    }
+
+    function markStripBrowsing() {
+      stripBrowseUntil = Date.now() + 10000;
+    }
+
+    if (stripEl) {
+      stripEl.addEventListener('touchstart', markStripBrowsing, { passive: true });
+      stripEl.addEventListener('pointerdown', markStripBrowsing);
+      stripEl.addEventListener('wheel', markStripBrowsing, { passive: true });
     }
 
     function sentenceIndexAt(time) {
@@ -1122,6 +1195,7 @@ IPAD_PAGE = """<!DOCTYPE html>
     async function pickSentence(i) {
       if (recording) return;
       if (!sentences[i]) return;
+      stripBrowseUntil = 0;
       localIndexControl = true;
       repeatClick = { at: 0, baseIndex: i, count: 0 };
       index = i;
@@ -1627,6 +1701,7 @@ IPAD_PAGE = """<!DOCTYPE html>
         try { localStorage.setItem('enprato.ipad.lastSession', sessionId); } catch (e) {}
         boundVideoSession = '';
         localIndexControl = false;
+        resumeKey = '';
         sentencesRev = '';
         clearDraftRowSelection();
         drafts = {};
@@ -1725,6 +1800,7 @@ IPAD_PAGE = """<!DOCTYPE html>
         if (data.draft != null && !draftAt(index).trim() && !hasUnsavedDraftEdit(index)) {
           drafts[String(index)] = data.draft;
         }
+        applyResumeIfNeeded(data.index);
         if (typeof data.index === 'number' && !localIndexControl && !recording) {
           index = data.index;
         }
@@ -1811,7 +1887,7 @@ IPAD_PAGE = """<!DOCTYPE html>
     }
 
     async function saveAll() {
-      if (recording) return;
+      if (recording || sttBusy) return;
       syncCurrentDraft();
       sanitizeAllDrafts();
       if (document.activeElement !== docEl && !hasUnsavedDraftEdit(index)) {
@@ -1822,6 +1898,7 @@ IPAD_PAGE = """<!DOCTYPE html>
       const payload = buildPayload();
       const snap = JSON.stringify({ drafts: payload, index });
       if (snap === lastSent) return;
+      saveBusy = true;
       try {
         const res = await fetch('/api/session/' + sessionId + '/remote-drafts', {
           method: 'POST',
@@ -1835,6 +1912,8 @@ IPAD_PAGE = """<!DOCTYPE html>
         setStatus('已保存', 'ok');
       } catch (e) {
         setStatus('保存失败，请重试', 'err');
+      } finally {
+        saveBusy = false;
       }
     }
 
@@ -1857,23 +1936,23 @@ IPAD_PAGE = """<!DOCTYPE html>
     }
     docEl.addEventListener('blur', () => {
       updateRestoreBtn();
-      void saveAll();
+      if (!recording && !sttBusy) void saveAll();
     });
     setInterval(() => {
       if (sessionId && !recording && !sttBusy) void saveAll();
     }, 3000);
     setInterval(() => {
-      if (sessionId && !sttBusy) void syncState();
+      if (sessionId && !recording && !sttBusy) void syncState();
     }, 900);
     document.addEventListener('visibilitychange', () => {
       syncCurrentDraft();
       persistLocal();
-      if (document.visibilityState === 'hidden') void saveAll();
+      if (document.visibilityState === 'hidden' && !recording && !sttBusy) void saveAll();
     });
     window.addEventListener('pagehide', () => {
       syncCurrentDraft();
       persistLocal();
-      if (!sessionId) return;
+      if (!sessionId || recording || sttBusy) return;
       const payload = {};
       let end = index;
       for (const k of Object.keys(drafts)) {
@@ -1896,16 +1975,35 @@ IPAD_PAGE = """<!DOCTYPE html>
     let peakLevel = 0;
     let recMime = '';
 
-    function encodeWav(floatChunks, sampleRate) {
-      let len = 0;
-      for (const c of floatChunks) len += c.length;
-      const pcm = new Int16Array(len);
+    function downsamplePcm(floatChunks, sampleRate, targetRate) {
+      let srcLen = 0;
+      for (const c of floatChunks) srcLen += c.length;
+      if (srcLen <= 0) return { samples: new Float32Array(0), rate: targetRate };
+      const merged = new Float32Array(srcLen);
       let off = 0;
-      for (const c of floatChunks) {
-        for (let i = 0; i < c.length; i++) {
-          const x = Math.max(-1, Math.min(1, c[i]));
-          pcm[off++] = x < 0 ? x * 0x8000 : x * 0x7fff;
-        }
+      for (const c of floatChunks) { merged.set(c, off); off += c.length; }
+      if (!sampleRate || targetRate >= sampleRate) return { samples: merged, rate: sampleRate || targetRate };
+      const ratio = sampleRate / targetRate;
+      const outLen = Math.max(1, Math.floor(srcLen / ratio));
+      const out = new Float32Array(outLen);
+      for (let i = 0; i < outLen; i++) {
+        const x = i * ratio;
+        const i0 = Math.min(srcLen - 1, Math.floor(x));
+        const i1 = Math.min(srcLen - 1, i0 + 1);
+        const f = x - i0;
+        out[i] = merged[i0] * (1 - f) + merged[i1] * f;
+      }
+      return { samples: out, rate: targetRate };
+    }
+
+    function encodeWav(floatChunks, sampleRate) {
+      const prepared = downsamplePcm(floatChunks, sampleRate, 16000);
+      const samples = prepared.samples;
+      sampleRate = prepared.rate;
+      const pcm = new Int16Array(samples.length);
+      for (let i = 0; i < samples.length; i++) {
+        const x = Math.max(-1, Math.min(1, samples[i]));
+        pcm[i] = x < 0 ? x * 0x8000 : x * 0x7fff;
       }
       const bytes = pcm.length * 2;
       const buf = new ArrayBuffer(44 + bytes);
@@ -1983,95 +2081,344 @@ IPAD_PAGE = """<!DOCTYPE html>
     }
 
     async function startRec() {
-      setStatus('正在准备麦克风…');
-      pausePlayback(videoEl.currentTime);
-      const s = await ensureStream();
-      const track = s.getAudioTracks()[0];
-      if (!track || track.readyState !== 'live') {
-        stream = null;
-        throw new Error('麦克风未就绪，请允许权限后重试');
-      }
-      stopAudioGraph();
-      if (mediaRecorder && mediaRecorder.state !== 'inactive') {
-        try { mediaRecorder.stop(); } catch (e) {}
-      }
-      mediaRecorder = null;
-      chunks = [];
-      pcmChunks = [];
-      peakLevel = 0;
-      recMime = '';
-
-      const AC = window.AudioContext || window.webkitAudioContext;
-      audioCtx = new AC();
-      if (audioCtx.state === 'suspended') await audioCtx.resume();
-      audioSource = audioCtx.createMediaStreamSource(s);
-      audioSink = audioCtx.createMediaStreamDestination();
-      const bufferSize = 4096;
-      audioProc = audioCtx.createScriptProcessor(bufferSize, 1, 1);
-      audioProc.onaudioprocess = (ev) => {
-        const input = ev.inputBuffer.getChannelData(0);
-        const copy = new Float32Array(input.length);
-        copy.set(input);
-        pcmChunks.push(copy);
-        let peak = 0;
-        for (let i = 0; i < input.length; i++) {
-          const a = Math.abs(input[i]);
-          if (a > peak) peak = a;
-        }
-        if (peak > peakLevel) peakLevel = peak;
-      };
-      audioSource.connect(audioProc);
-      audioProc.connect(audioSink);
-
-      recMime = pickRecorderMime();
+      if (recState === 'recording' || recState === 'stopping' || recState === 'uploading' || recState === 'processing') return;
+      if (retrySttBtn) retrySttBtn.hidden = true;
+      recState = 'recording';
       try {
-        mediaRecorder = recMime
-          ? new MediaRecorder(s, { mimeType: recMime, audioBitsPerSecond: 128000 })
-          : new MediaRecorder(s);
-        mediaRecorder.ondataavailable = (ev) => {
-          if (ev.data && ev.data.size > 0) chunks.push(ev.data);
-        };
-        mediaRecorder.start(250);
-      } catch (e) {
+        setStatus('正在准备麦克风…');
+        pausePlayback(videoEl.currentTime);
+        const s = await ensureStream();
+        const track = s.getAudioTracks()[0];
+        if (!track || track.readyState !== 'live') {
+          stream = null;
+          recState = 'idle';
+          throw new Error('麦克风未就绪，请允许权限后重试');
+        }
+        stopAudioGraph();
+        if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+          try { mediaRecorder.stop(); } catch (e) {}
+        }
         mediaRecorder = null;
-      }
+        chunks = [];
+        pcmChunks = [];
+        peakLevel = 0;
+        recMime = '';
 
-      recStartedAt = Date.now();
-      recording = true;
-      setBtnLabel(true);
+        const AC = window.AudioContext || window.webkitAudioContext;
+        audioCtx = new AC();
+        if (audioCtx.state === 'suspended') await audioCtx.resume();
+        audioSource = audioCtx.createMediaStreamSource(s);
+        audioSink = audioCtx.createMediaStreamDestination();
+        const bufferSize = 4096;
+        audioProc = audioCtx.createScriptProcessor(bufferSize, 1, 1);
+        audioProc.onaudioprocess = (ev) => {
+          const input = ev.inputBuffer.getChannelData(0);
+          const copy = new Float32Array(input.length);
+          copy.set(input);
+          pcmChunks.push(copy);
+          let peak = 0;
+          for (let i = 0; i < input.length; i++) {
+            const a = Math.abs(input[i]);
+            if (a > peak) peak = a;
+          }
+          if (peak > peakLevel) peakLevel = peak;
+        };
+        audioSource.connect(audioProc);
+        audioProc.connect(audioSink);
+
+        recMime = pickRecorderMime();
+        try {
+          mediaRecorder = recMime
+            ? new MediaRecorder(s, { mimeType: recMime, audioBitsPerSecond: 128000 })
+            : new MediaRecorder(s);
+          mediaRecorder.ondataavailable = (ev) => {
+            if (ev.data && ev.data.size > 0) chunks.push(ev.data);
+          };
+          mediaRecorder.start(250);
+        } catch (e) {
+          mediaRecorder = null;
+        }
+
+        recStartedAt = Date.now();
+        recording = true;
+        setBtnLabel(true);
+      } catch (e) {
+        recState = 'idle';
+        recording = false;
+        setBtnLabel(false);
+        if (lastSttJob && lastSttJob.blob) showRetry(true);
+        throw e;
+      }
     }
 
-    function stopRec() {
+    function waitRecorderStop(mr, timeoutMs) {
+      return new Promise((resolve) => {
+        if (!mr || mr.state === 'inactive') {
+          resolve();
+          return;
+        }
+        let done = false;
+        const finish = () => { if (done) return; done = true; resolve(); };
+        try {
+          mr.addEventListener('stop', finish, { once: true });
+          mr.stop();
+        } catch (e) {
+          finish();
+          return;
+        }
+        setTimeout(finish, timeoutMs || 800);
+      });
+    }
+
+    function sttUrl() {
+      return '/api/session/' + sessionId + '/remote-stt-bin?index=' + encodeURIComponent(String(index)) + '&mode=insert';
+    }
+
+    function formatSttError(result, fallbackStage) {
+      const job = lastSttJob || {};
+      const cid = (result && result.clientRequestId) || job.clientRequestId || '无';
+      const sid = (result && result.serverRequestId) || '无';
+      const status = result && result.status ? result.status : '无';
+      const kind = (result && result.kind) || '';
+      if (kind === 'audio_too_large' || status === 413) {
+        return '录音过长，请重新录制';
+      }
+      const stage = (result && result.stage) || fallbackStage || 'unknown';
+      const msg = (result && result.message) || '';
+      return '上传失败。Client Request ID: ' + cid + ' ；Server Request ID: ' + sid + ' ；HTTP Status: ' + status + ' ；错误阶段: ' + stage + (msg ? (' ；' + msg) : '') + '。可点下方重新上传，不必重录。';
+    }
+
+    function showRetry(show) {
+      if (retrySttBtn) retrySttBtn.hidden = !show;
+    }
+
+    async function idbPutBlob(id, blob) {
+      try {
+        const req = indexedDB.open('enprato-stt', 1);
+        req.onupgradeneeded = () => req.result.createObjectStore('clips');
+        const db = await new Promise((resolve, reject) => {
+          req.onsuccess = () => resolve(req.result);
+          req.onerror = () => reject(req.error);
+        });
+        await new Promise((resolve, reject) => {
+          const tx = db.transaction('clips', 'readwrite');
+          tx.objectStore('clips').put(blob, id);
+          tx.oncomplete = () => resolve();
+          tx.onerror = () => reject(tx.error);
+        });
+        db.close();
+      } catch (e) {}
+    }
+
+    async function idbGetBlob(id) {
+      try {
+        const req = indexedDB.open('enprato-stt', 1);
+        req.onupgradeneeded = () => req.result.createObjectStore('clips');
+        const db = await new Promise((resolve, reject) => {
+          req.onsuccess = () => resolve(req.result);
+          req.onerror = () => reject(req.error);
+        });
+        const blob = await new Promise((resolve, reject) => {
+          const tx = db.transaction('clips', 'readonly');
+          const q = tx.objectStore('clips').get(id);
+          q.onsuccess = () => resolve(q.result || null);
+          q.onerror = () => reject(q.error);
+        });
+        db.close();
+        return blob;
+      } catch (e) {
+        return null;
+      }
+    }
+
+    function persistPendingStt(job) {
+      try {
+        localStorage.setItem('enprato.stt.pending', JSON.stringify({
+          clientRequestId: job.clientRequestId,
+          insertStart: job.insertStart || 0,
+          insertEnd: job.insertEnd || 0,
+        }));
+      } catch (e) {}
+    }
+
+    function clearPendingStt() {
+      try { localStorage.removeItem('enprato.stt.pending'); } catch (e) {}
+    }
+
+    async function sendSttBlob(job) {
+      if (job.machine && !job.machine.startUpload()) return job.lastResult;
+      recState = 'uploading';
+      sttBusy = true;
+      btn.disabled = true;
+      setStatus('正在上传识别… Client Request ID: ' + job.clientRequestId);
+      try { console.log(JSON.stringify({ stage: 'UPLOAD_START', client_request_id: job.clientRequestId, size: job.blob && job.blob.size, mime: job.blob && job.blob.type })); } catch (e) {}
+      const stt = window.EnpratoStt;
+      const result = await stt.runUploadWithRetry({
+        url: sttUrl(),
+        blob: job.blob,
+        clientRequestId: job.clientRequestId,
+        timeoutMs: 150000,
+        maxAttempts: 3
+      });
+      job.lastResult = result;
+      try { console.log(JSON.stringify({ stage: 'UPLOAD_RESULT', client_request_id: job.clientRequestId, ok: !!(result && result.ok), status: result && result.status, kind: result && result.kind, server_request_id: result && result.serverRequestId, attempt: result && result.attempt })); } catch (e) {}
+      if (result && result.ok) {
+        recState = 'success';
+        showRetry(false);
+        return result;
+      }
+      if (result && (result.kind === 'audio_too_large' || result.status === 413)) {
+        recState = 'failed';
+        showRetry(false);
+        setStatus('录音过长，请重新录制', 'err');
+        return result;
+      }
+      if (job.machine) job.machine.allowRetry();
+      recState = 'failed';
+      showRetry(true);
+      setStatus(formatSttError(result, 'safari_send'), 'err');
+      return result;
+    }
+
+    async function consumeSttSuccess(job, result) {
+      recState = 'processing';
+      let data = {};
+      try { data = JSON.parse(result.body || '{}'); } catch (e) { data = {}; }
+      const stt = window.EnpratoStt;
+      const canInsert = stt && typeof stt.shouldInsertTranscript === 'function'
+        ? stt.shouldInsertTranscript(data)
+        : !!(data && data.text && data.code !== 'prompt_leakage' && data.code !== 'empty_transcript');
+      const insertText = canInsert ? (data.text || '') : '';
+      try {
+        const payload = {
+          stage: 'SENTENCE_INSERT',
+          timestamp: new Date().toISOString(),
+          client_request_id: job.clientRequestId || '',
+          server_request_id: (result && result.serverRequestId) || '',
+          session_id: sessionId,
+          index: index,
+          text_len: String(insertText).length,
+          text_preview: String(insertText).slice(0, 80)
+        };
+        if (insertText) {
+          console.log(JSON.stringify(payload));
+          fetch('/api/stt-diag', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+            keepalive: true
+          }).catch(function () {});
+        }
+      } catch (e) {}
+      if (insertText) {
+        caretStart = job.insertStart;
+        caretEnd = job.insertEnd;
+        insertAtCaret(insertText);
+        lastSent = '';
+        void saveAll();
+        setStatus('已保存', 'ok');
+        revealLatest();
+      } else {
+        setStatus((data && data.message) || '这次没有听清，请重新说一次', 'err');
+        revealLatest();
+      }
+      lastSttJob = null;
+      recState = 'idle';
+      clearPendingStt();
+    }
+
+    async function stopRec() {
+      if (recState !== 'recording') return;
+      recState = 'stopping';
+      sttBusy = true;
+      btn.disabled = true;
+      const stt = window.EnpratoStt;
+      if (!stt) {
+        recState = 'failed';
+        recording = false;
+        setBtnLabel(false);
+        setStatus('听写上传模块未加载，请刷新 iPad 页面', 'err');
+        sttBusy = false;
+        btn.disabled = false;
+        return;
+      }
+      const clientRequestId = stt.createClientRequestId();
+      const machine = stt.createDictationJob(clientRequestId);
+      if (!machine.requestStop()) return;
+      try { console.log(JSON.stringify({ stage: 'STOP_CLICK', client_request_id: clientRequestId })); } catch (e) {}
       const elapsed = Date.now() - recStartedAt;
       const rate = (audioCtx && audioCtx.sampleRate) || 44100;
       const pcmCopy = pcmChunks.slice();
       const peak = peakLevel;
-      const mr = mediaRecorder;
+      const mime = recMime;
+      const insertStart = caretStart;
+      const insertEnd = caretEnd;
       recording = false;
       setBtnLabel(false);
-      try { docEl.blur(); } catch (e) {}
       markDictationContentChanged();
       revealLatest();
-
-      const finish = () => {
-        stopAudioGraph();
-        mediaRecorder = null;
-        const mrChunks = chunks.slice();
-        chunks = [];
-        void uploadAudio(pcmCopy, rate, elapsed, peak, mrChunks, recMime);
-      };
-
-      if (mr && mr.state !== 'inactive') {
-        try {
-          let done = false;
-          const once = () => { if (done) return; done = true; finish(); };
-          mr.onstop = once;
-          mr.stop();
-          setTimeout(once, 900);
-          return;
-        } catch (e) {}
+      try { videoEl.pause(); } catch (e) {}
+      const mr = mediaRecorder;
+      await waitRecorderStop(mr, 800);
+      const mrChunks = chunks.slice();
+      stopAudioGraph();
+      mediaRecorder = null;
+      try { stream && stream.getTracks().forEach((t) => t.stop()); } catch (e) {}
+      stream = null;
+      chunks = [];
+      pcmChunks = [];
+      if ((elapsed || 0) < 500) {
+        recState = 'idle';
+        sttBusy = false;
+        btn.disabled = false;
+        setStatus('录音太短，请说完后再点停止', 'err');
+        return;
       }
-      finish();
+      let blob = null;
+      const pcmSamples = pcmCopy.reduce((n, c) => n + c.length, 0);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      if (pcmSamples > 800) blob = encodeWav(pcmCopy, rate);
+      else if (mrChunks && mrChunks.length) {
+        const type = (mime || mrChunks[0].type || 'audio/mp4').split(';')[0];
+        blob = new Blob(mrChunks, { type: type || 'audio/mp4' });
+      }
+      const check = stt.validateBlob(blob, elapsed);
+      lastSttJob = { clientRequestId, blob, insertStart, insertEnd, lastResult: null, machine };
+      try { console.log(JSON.stringify({ stage: 'AUDIO_READY', client_request_id: clientRequestId, size: blob && blob.size, mime: blob && blob.type, pcmSamples: pcmSamples, elapsed: elapsed })); } catch (e) {}
+      if (!check.ok) {
+        recState = 'failed';
+        sttBusy = false;
+        btn.disabled = false;
+        if (check.stage === 'audio_too_large') {
+          setStatus('录音过长，请重新录制', 'err');
+        } else {
+          setStatus('录音无效，无法上传。Client Request ID: ' + clientRequestId + ' ；错误阶段: ' + check.stage + ' ；' + check.message, 'err');
+        }
+        showRetry(false);
+        return;
+      }
+      recState = 'audio_ready';
+      persistPendingStt(lastSttJob);
+      void idbPutBlob(clientRequestId, blob);
+      if (peak > 0 && peak < 0.0008 && pcmSamples > 800) setStatus('声音偏小，仍在识别…');
+      const result = await sendSttBlob(lastSttJob);
+      if (result && result.ok) await consumeSttSuccess(lastSttJob, result);
+      sttBusy = false;
+      btn.disabled = false;
+      schedulePlaceMic();
+      revealLatest();
+    }
+
+    if (retrySttBtn) {
+      retrySttBtn.addEventListener('click', async () => {
+        if (!lastSttJob || !lastSttJob.blob || !lastSttJob.clientRequestId) return;
+        if (recState === 'uploading' || recState === 'processing' || recState === 'recording') return;
+        const result = await sendSttBlob(lastSttJob);
+        if (result && result.ok) await consumeSttSuccess(lastSttJob, result);
+        sttBusy = false;
+        btn.disabled = false;
+        schedulePlaceMic();
+      });
     }
 
     function insertAtCaret(piece) {
@@ -2134,88 +2481,14 @@ IPAD_PAGE = """<!DOCTYPE html>
       return (c + ' ' + p).trim();
     }
 
-    async function uploadAudio(floatChunks, sampleRate, elapsedMs, peak, mrChunks, mime) {
-      if ((elapsedMs || 0) < 500) {
-        setStatus('录音太短，请说完后再点停止', 'err');
-        return;
-      }
-      let blob = null;
-      let filename = 'ipad.wav';
-      const pcmSamples = floatChunks.reduce((n, c) => n + c.length, 0);
-      if (pcmSamples > 800) {
-        blob = encodeWav(floatChunks, sampleRate);
-        filename = 'ipad.wav';
-      } else if (mrChunks && mrChunks.length) {
-        const type = (mime || mrChunks[0].type || 'audio/mp4').split(';')[0];
-        blob = new Blob(mrChunks, { type: type || 'audio/mp4' });
-        filename = type.indexOf('mp4') >= 0 || type.indexOf('aac') >= 0
-          ? 'ipad.m4a'
-          : (type.indexOf('ogg') >= 0 ? 'ipad.ogg' : 'ipad.webm');
-      }
-      if (!blob || blob.size < 200) {
-        setStatus('没有录到声音，请检查 HTTPS 和麦克风权限后重试', 'err');
-        return;
-      }
-      sttBusy = true;
-      btn.disabled = true;
-      if (peak > 0 && peak < 0.0008 && pcmSamples > 800) {
-        setStatus('声音偏小，仍在识别…');
-      } else {
-        setStatus('正在识别…');
-      }
-      const insertStart = caretStart;
-      const insertEnd = caretEnd;
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 90000);
-      try {
-        const body = new FormData();
-        body.append('audio', blob, filename);
-        body.append('index', String(index));
-        body.append('mode', 'insert');
-        const res = await fetch('/api/session/' + sessionId + '/remote-stt', {
-          method: 'POST',
-          body,
-          signal: controller.signal,
-        });
-        if (!res.ok) {
-          let detail = '';
-          try { detail = await res.text(); } catch (e) {}
-          throw new Error(detail || ('HTTP ' + res.status));
-        }
-        const data = await res.json();
-        if (data.text) {
-          caretStart = insertStart;
-          caretEnd = insertEnd;
-          insertAtCaret(data.text);
-          lastSent = '';
-          void saveAll();
-          setStatus('已保存', 'ok');
-          revealLatest();
-        } else {
-          setStatus('识别为空，请靠近麦克风再说一遍', 'err');
-          revealLatest();
-        }
-      } catch (e) {
-        const aborted = e && (e.name === 'AbortError' || String(e.message || '').includes('aborted'));
-        if (aborted) {
-          setStatus('识别超时，请再说一遍（说完后稍等几秒）', 'err');
-        } else {
-          setStatus('识别失败：' + (e && e.message ? e.message : e), 'err');
-        }
-        revealLatest();
-      } finally {
-        clearTimeout(timeout);
-        sttBusy = false;
-        btn.disabled = false;
-        schedulePlaceMic();
-        revealLatest();
-      }
-    }
-
     btn.addEventListener('click', async () => {
       try {
-        if (recording) stopRec();
-        else await startRec();
+        if (recState === 'recording') {
+          void stopRec();
+          return;
+        }
+        if (sttBusy || recState === 'stopping' || recState === 'uploading' || recState === 'processing' || recState === 'audio_ready') return;
+        await startRec();
       } catch (e) {
         setStatus((e && e.message) || '麦克风启动失败，请确认 HTTPS 和权限', 'err');
       }
@@ -2327,6 +2600,30 @@ IPAD_PAGE = """<!DOCTYPE html>
       }
     });
 
+    async function restorePendingStt() {
+      try {
+        const raw = localStorage.getItem('enprato.stt.pending');
+        if (!raw) return;
+        const pending = JSON.parse(raw);
+        const cid = pending && pending.clientRequestId;
+        if (!cid) return;
+        const blob = await idbGetBlob(cid);
+        if (!blob || !blob.size) return;
+        const stt = window.EnpratoStt;
+        lastSttJob = {
+          clientRequestId: cid,
+          blob,
+          insertStart: pending.insertStart || 0,
+          insertEnd: pending.insertEnd || 0,
+          lastResult: null,
+          machine: stt ? stt.createDictationJob(cid) : null
+        };
+        recState = 'failed';
+        showRetry(true);
+        setStatus('上次录音还在，可重新上传。Client Request ID: ' + cid, 'err');
+      } catch (e) {}
+    }
+    void restorePendingStt();
     void loadSessionOptions();
     // 不在 iPad 首屏触发 /api/warmup（会拖慢甚至拖垮首屏）；电脑端打开课时再预热即可
     void syncState();

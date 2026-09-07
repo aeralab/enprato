@@ -14,10 +14,37 @@ from .ingest import (
     is_garbled_title,
     parse_bilibili_bvid,
     fetch_bilibili_view,
+    same_media_url,
 )
 from .media import extract_video_thumbnail, stream_codec
 
 PRACTICE_PHASES = {"listen", "dictate", "check", "shadow", "result"}
+
+
+def resume_sentence_index(sentence_count: int, drafts: dict[Any, Any], saved_index: int) -> int:
+    """Continue from last real dictation, not a stale saved pointer."""
+    n = int(sentence_count or 0)
+    if n <= 0:
+        return 0
+    saved = max(0, min(int(saved_index or 0), n - 1))
+
+    def filled(i: int) -> bool:
+        return bool(str(drafts.get(i) or drafts.get(str(i)) or "").strip())
+
+    last_filled = -1
+    first_empty = n
+    for i in range(n):
+        if filled(i):
+            last_filled = i
+        elif first_empty == n:
+            first_empty = i
+    if first_empty == n:
+        return n - 1
+    if saved >= first_empty:
+        return saved
+    if last_filled >= 0 and saved == last_filled:
+        return saved
+    return first_empty
 
 
 def now_iso() -> str:
@@ -217,6 +244,7 @@ def session_detail(folder: Path, session_id: str) -> dict[str, Any] | None:
     if not isinstance(sentences, list) or not sentences:
         return None
     meta = read_meta(folder)
+    progress_compat = read_json(folder / "resplit_progress.json", {})
     drafts = _drafts_int(meta.get("drafts"))
     drafts = {
         int(k): v
@@ -228,6 +256,7 @@ def session_detail(folder: Path, session_id: str) -> dict[str, Any] | None:
     cover_url = str(meta.get("cover_url") or "").strip()
     index = int(meta.get("index") or 0)
     index = max(0, min(index, len(sentences) - 1))
+    index = resume_sentence_index(len(sentences), drafts, index)
     return {
         "session_id": session_id,
         "title": title[:80],
@@ -250,6 +279,8 @@ def session_detail(folder: Path, session_id: str) -> dict[str, Any] | None:
         "has_video": session_has_video(folder),
         "thumbnail_url": f"/api/session/{session_id}/thumb",
         "cover_url": cover_url,
+        "progress_floor": float(progress_compat.get("progress_floor") or 0),
+        "progress_anchor_count": int(progress_compat.get("original_count") or 0),
     }
 
 
@@ -310,6 +341,6 @@ def find_session_id_by_url(root: Path, url: str) -> str | None:
         if not folder.is_dir():
             continue
         meta = read_meta(folder)
-        if str(meta.get("source_url") or "").strip() == target and (folder / "sentences.json").is_file():
+        if same_media_url(str(meta.get("source_url") or ""), target) and (folder / "sentences.json").is_file():
             return folder.name
     return None

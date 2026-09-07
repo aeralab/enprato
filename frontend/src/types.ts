@@ -95,6 +95,8 @@ export type SessionDetail = SessionSummary & {
   audio_url?: string;
   has_video?: boolean;
   created_at: string;
+  progress_floor?: number;
+  progress_anchor_count?: number;
 };
 
 export type MembershipStatus = {
@@ -107,10 +109,70 @@ export type MembershipStatus = {
 
 export type CurrentUser = {
   id: string;
-  email: string;
+  email: string | null;
+  login_label?: string;
   status: string;
   membership: MembershipStatus;
   trial: { limit: number; used: number; remaining: number };
+};
+
+export type LearningRecord = {
+  id: string;
+  session_id: string;
+  learning_date: string;
+  language: string;
+  title: string;
+  source_kind: string;
+  completed_at: string;
+  duration_seconds: number;
+  duration_minutes: number;
+  sentence_count: number;
+  completed_sentence_count: number;
+  dictation_words?: number;
+  evaluated_words?: number;
+  accuracy: number | null;
+  score: number | null;
+  completion_ratio: number;
+  completion_percent: number;
+};
+
+export type ProgressMilestone = {
+  key: string;
+  label: string;
+  achieved: boolean;
+  achieved_at: string | null;
+};
+
+export type ProgressSummary = {
+  days_learned: number;
+  day_one?: boolean;
+  total_duration_seconds: number;
+  total_duration_minutes: number;
+  total_sentences: number;
+  total_dictation_words?: number;
+  current_streak: number;
+  longest_streak: number;
+  recent_accuracy: number | null;
+  starting_accuracy: number | null;
+  window_accuracy?: number | null;
+  today?: {
+    date: string;
+    active: boolean;
+    dictation_words: number;
+    evaluated_words: number;
+    correct_words?: number;
+    accuracy: number | null;
+    completed_units: number;
+    audio_seconds: number;
+  };
+  records: LearningRecord[];
+  milestones: ProgressMilestone[];
+  comparison: {
+    has_history: boolean;
+    previous_count: number;
+    accuracy_delta: number | null;
+    sentence_delta: number | null;
+  };
 };
 
 export type Order = { id?: string; order_no: string; plan_code?: string; amount_fen: number; currency?: string; status: string; expires_at: string; payment?: { provider: string; code_url?: string } };

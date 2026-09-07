@@ -1,4 +1,4 @@
-import type { CurrentUser, CuratedLesson, LicenseStatus, Order, SessionDetail, SessionSummary, ShadowScore, UpdateInfo, WordSense } from "./types";
+import type { CurrentUser, CuratedLesson, LicenseStatus, Order, ProgressSummary, SessionDetail, SessionSummary, ShadowScore, UpdateInfo, WordSense } from "./types";
 
 let progressSaveChain: Promise<void> = Promise.resolve();
 
@@ -51,12 +51,12 @@ export async function prepareSession(
   return res.json();
 }
 
-export async function prepareSessionFromUrl(url: string): Promise<SessionDetail> {
+export async function prepareSessionFromUrl(url: string, createNewSession = false): Promise<SessionDetail> {
   const res = await fetch("/api/prepare-url", {
     method: "POST",
     credentials: "same-origin",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ url }),
+    body: JSON.stringify({ url, create_new_session: createNewSession }),
   });
   if (!res.ok) throw new Error(await readError(res));
   return res.json();
@@ -108,11 +108,44 @@ export async function transcribeUtterance(
   context: string,
   target = "",
 ): Promise<string> {
-  const body = new FormData();
-  body.append("audio", blob, "dictation.webm");
-  body.append("context", context);
-  body.append("target", target);
-  const res = await fetch("/api/stt", { method: "POST", body });
+  const makeBody = () => {
+    const body = new FormData();
+    body.append("audio", blob, "dictation.webm");
+    body.append("context", context);
+    body.append("target", target);
+    return body;
+  };
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), 150_000);
+  const post = () =>
+    fetch("/api/stt", {
+      method: "POST",
+      body: makeBody(),
+      signal: controller.signal,
+      cache: "no-store",
+      credentials: "same-origin",
+    });
+  let res: Response;
+  const startedAt = Date.now();
+  try {
+    try {
+      res = await post();
+    } catch (error) {
+      const quickNet =
+        Date.now() - startedAt < 2500 &&
+        !(error instanceof DOMException && error.name === "AbortError") &&
+        (error instanceof TypeError || String(error).includes("Failed to fetch"));
+      if (!quickNet) throw error;
+      res = await post();
+    }
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "AbortError") {
+      throw new Error("ASR_TIMEOUT: 这段语音较长，服务器识别超时，请重试。");
+    }
+    throw new Error("NETWORK_ERROR: 录音没有完整送到服务器，请检查网络后重试。");
+  } finally {
+    window.clearTimeout(timeout);
+  }
   if (!res.ok) throw new Error(await readError(res));
   const data = await res.json();
   return data.text as string;
@@ -145,10 +178,27 @@ export async function warmupAsr(): Promise<void> {
 }
 
 export async function listSessions(): Promise<SessionSummary[]> {
-  const res = await fetch("/api/sessions");
+  const res = await fetch("/api/sessions", { credentials: "same-origin" });
   if (!res.ok) throw new Error(await readError(res));
   const data = await res.json();
   return data.sessions as SessionSummary[];
+}
+
+export async function fetchProgress(days?: 7 | 30): Promise<ProgressSummary> {
+  const res = await fetch(`/api/progress${days ? `?days=${days}` : ""}`, { credentials: "same-origin" });
+  if (!res.ok) throw new Error(await readError(res));
+  return res.json();
+}
+
+export async function completeLearningRecord(sessionId: string, durationSeconds: number): Promise<ProgressSummary> {
+  const res = await fetch(`/api/progress/complete/${sessionId}`, {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ duration_seconds: durationSeconds }),
+  });
+  if (!res.ok) throw new Error(await readError(res));
+  return res.json();
 }
 
 export async function loadSession(sessionId: string): Promise<SessionDetail> {
@@ -267,11 +317,16 @@ export async function fetchCatalog(): Promise<CuratedLesson[]> {
   return Array.isArray(data.lessons) ? data.lessons : [];
 }
 
-export async function fetchCurrentUser(): Promise<CurrentUser | null> {
+export async function fetchAuthState(): Promise<{ user: CurrentUser | null; requireAuth: boolean }> {
   const res = await fetch("/api/auth/me", { credentials: "same-origin" });
+  if (res.status === 401) return { user: null, requireAuth: true };
   if (!res.ok) throw new Error(await readError(res));
-  const data = (await res.json()) as { user: CurrentUser | null };
-  return data.user;
+  const data = (await res.json()) as { user: CurrentUser | null; require_auth?: boolean };
+  return { user: data.user, requireAuth: Boolean(data.require_auth) };
+}
+
+export async function fetchCurrentUser(): Promise<CurrentUser | null> {
+  return (await fetchAuthState()).user;
 }
 
 export async function registerAccount(email: string, password: string): Promise<CurrentUser> {
@@ -289,6 +344,34 @@ export async function loginAccount(email: string, password: string): Promise<Cur
 export async function logoutAccount(): Promise<void> {
   const res = await fetch("/api/auth/logout", { method: "POST", credentials: "same-origin" });
   if (!res.ok) throw new Error(await readError(res));
+}
+
+export async function fetchAuthMethods(): Promise<{ wechat: { available: boolean }; phone: { available: boolean } }> {
+  const res = await fetch("/api/auth/methods", { credentials: "same-origin" });
+  if (!res.ok) throw new Error(await readError(res));
+  return res.json();
+}
+
+export async function sendPhoneCode(phone: string): Promise<{ challenge_id: string; expires_in: number }> {
+  const res = await fetch("/api/auth/phone/send", {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ phone }),
+  });
+  if (!res.ok) throw new Error(await readError(res));
+  return res.json();
+}
+
+export async function verifyPhoneLogin(phone: string, challengeId: string, code: string): Promise<CurrentUser> {
+  const res = await fetch("/api/auth/phone/verify", {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ phone, challenge_id: challengeId, code }),
+  });
+  if (!res.ok) throw new Error(await readError(res));
+  return res.json();
 }
 
 export async function grantDevMembership(): Promise<CurrentUser["membership"]> {

@@ -7,11 +7,12 @@ import shutil
 import subprocess
 import sys
 import ssl
+import time
 import urllib.request
 from pathlib import Path
 from urllib.parse import urlparse
 
-from .media import ensure_playback_audio, extract_wav, find_ffmpeg, is_browser_media, is_browser_video, make_browser_mp4, media_has_audio, run_ffmpeg, stream_codec
+from .media import ensure_playback_audio, extract_wav, find_ffmpeg, is_ipad_media, make_browser_mp4, media_has_audio, run_ffmpeg, stream_codec
 
 VIDEO_EXTS = {".mp4", ".webm", ".mkv", ".m4v", ".mov", ".avi"}
 AUDIO_EXTS = {".m4a", ".mp3", ".opus", ".ogg", ".wav", ".aac"}
@@ -42,6 +43,39 @@ def ytdlp_cmd() -> list[str]:
 def parse_bilibili_bvid(url: str) -> str | None:
     match = re.search(r"(BV[0-9A-Za-z]+)", url, re.I)
     return match.group(1) if match else None
+
+
+def same_media_url(left: str, right: str) -> bool:
+    a = (left or "").strip()
+    b = (right or "").strip()
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    ba, bb = parse_bilibili_bvid(a), parse_bilibili_bvid(b)
+    return bool(ba and bb and ba.lower() == bb.lower())
+
+
+def is_bilibili_url(url: str) -> bool:
+    text = (url or "").lower()
+    return "bilibili.com" in text or "b23.tv" in text
+
+
+def is_retryable_ytdlp_error(url: str, detail: str) -> bool:
+    if not is_bilibili_url(url):
+        return False
+    text = (detail or "").strip()
+    low = text.lower()
+    return "412" in text or "precondition failed" in low
+
+
+def ytdlp_cmd_variants(base: list[str], url: str) -> list[list[str]]:
+    variants = [list(base)]
+    if not is_bilibili_url(url):
+        return variants
+    if ["--proxy", ""] not in [base[i : i + 2] for i in range(len(base) - 1)]:
+        variants.append([*base, "--proxy", ""])
+    return variants
 
 
 def is_garbled_title(title: str) -> bool:
@@ -291,8 +325,8 @@ def ingest_url(url: str, folder: Path) -> tuple[Path, Path, str | None]:
     ]
     if cookies:
         base.extend(["--cookies", cookies])
-    # B 站偶发 412/风控：补浏览器 UA + Referer；仍失败时提示升级 yt-dlp 或配置 cookies
-    if "bilibili.com" in url.lower() or "b23.tv" in url.lower():
+    # B 站偶发 412/风控：补浏览器 UA + Referer；失败则换直连重试
+    if is_bilibili_url(url):
         base.extend(
             [
                 "--user-agent",
@@ -302,20 +336,8 @@ def ingest_url(url: str, folder: Path) -> tuple[Path, Path, str | None]:
             ]
         )
 
-    video_fmt = (
-        "bv*[vcodec^=avc1][height<=720]+ba[ext=m4a]/"
-        "bv*[ext=mp4][height<=720]+ba/"
-        "b[ext=mp4][height<=720]/"
-        "bv*+ba/b"
-    )
     try:
-        try:
-            _run(base + ["-f", video_fmt, url])
-        except RuntimeError:
-            try:
-                _run(base + ["-f", "bestvideo+bestaudio/best", url])
-            except RuntimeError:
-                _run(base + ["-f", "ba/bestaudio/b", url])
+        _download_with_retries(base, url)
     except RuntimeError as exc:
         raise RuntimeError(_friendly_ytdlp_error(url, str(exc))) from exc
 
@@ -337,12 +359,12 @@ def find_session_media(folder: Path) -> Path | None:
 
 def _ensure_playable(folder: Path) -> Path | None:
     merged = folder / "playable.mp4"
-    if merged.is_file() and is_browser_media(merged):
+    if merged.is_file() and is_ipad_media(merged):
         return merged
     picked = _pick_media(folder)
     if picked is None:
         return None
-    if picked.suffix.lower() in VIDEO_EXTS and is_browser_media(picked):
+    if picked.suffix.lower() in VIDEO_EXTS and is_ipad_media(picked):
         return picked
     audios = [
         p
@@ -370,7 +392,7 @@ def _ensure_playable(folder: Path) -> Path | None:
                     str(merged),
                 ]
             )
-            if merged.is_file() and is_browser_media(merged):
+            if merged.is_file() and is_ipad_media(merged):
                 return merged
         except Exception:
             pass
@@ -395,11 +417,11 @@ def _ensure_playable(folder: Path) -> Path | None:
                     str(merged),
                 ]
             )
-            if merged.is_file() and is_browser_media(merged):
+            if merged.is_file() and is_ipad_media(merged):
                 return merged
         except Exception:
             pass
-    if picked.suffix.lower() in VIDEO_EXTS and media_has_audio(picked) and not is_browser_media(picked):
+    if picked.suffix.lower() in VIDEO_EXTS and media_has_audio(picked) and not is_ipad_media(picked):
         try:
             return make_browser_mp4(picked, merged)
         except Exception:
@@ -407,14 +429,50 @@ def _ensure_playable(folder: Path) -> Path | None:
     return picked
 
 
+def _download_with_retries(base: list[str], url: str) -> None:
+    last = ""
+    variants = ytdlp_cmd_variants(base, url)
+    for i, cmd in enumerate(variants):
+        try:
+            _ytdlp_fetch(cmd, url)
+            return
+        except RuntimeError as exc:
+            last = str(exc)
+            if not is_retryable_ytdlp_error(url, last):
+                raise
+            if i < len(variants) - 1:
+                time.sleep(0.8)
+    raise RuntimeError(last or "yt-dlp 拉取失败")
+
+
+def _ytdlp_fetch(base: list[str], url: str) -> None:
+    video_fmt = (
+        "bv*[vcodec^=avc1][height<=720]+ba[ext=m4a]/"
+        "bv*[ext=mp4][height<=720]+ba/"
+        "b[ext=mp4][height<=720]/"
+        "bv*+ba/b"
+    )
+    last = ""
+    for fmt in (video_fmt, "bestvideo+bestaudio/best", "ba/bestaudio/b"):
+        try:
+            _run(base + ["-f", fmt, url])
+            return
+        except RuntimeError as exc:
+            last = str(exc)
+            if is_retryable_ytdlp_error(url, last):
+                raise
+    raise RuntimeError(last or "yt-dlp 失败")
+
+
 def _friendly_ytdlp_error(url: str, detail: str) -> str:
     text = (detail or "").strip()
     low = text.lower()
-    is_bili = "bilibili.com" in url.lower() or "b23.tv" in url.lower() or "bilibili" in low
+    is_bili = is_bilibili_url(url) or "bilibili" in low
     if is_bili and ("412" in text or "precondition failed" in low):
         return (
-            "B站暂时拦截了下载（HTTP 412）。请先执行 pip install -U \"yt-dlp>=2026.8.19\"，"
-            "或在环境变量 ENPRATO_COOKIES 配置已登录浏览器导出的 cookies.txt 后重试。"
+            "B站暂时拦截了链接下载（HTTP 412）。请稍后再试一次；"
+            "若左侧历史里已有同一条课，请从历史进入，不要重新拉取。"
+            "也可以先把视频下载到电脑，再拖入上传。"
         )
     if "geo-restricted" in low or "deleted" in low:
         return "视频可能已删除、需登录，或有地区限制。可换链接，或配置 ENPRATO_COOKIES 后重试。"

@@ -14,7 +14,7 @@ export default defineConfig({
     allowedHosts: true,
     proxy: {
       "/api": {
-        target: "https://127.0.0.1:18787",
+        target: "https://127.0.0.1:18788",
         secure: false,
         timeout: 600000,
         proxyTimeout: 600000,
