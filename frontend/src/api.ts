@@ -1,6 +1,31 @@
 import type { CurrentUser, CuratedLesson, LicenseStatus, Order, ProgressSummary, SessionDetail, SessionSummary, ShadowScore, UpdateInfo, WordSense } from "./types";
 
-let progressSaveChain: Promise<void> = Promise.resolve();
+const progressSaveChains = new Map<string, Promise<void>>();
+
+export type ProgressPayload = {
+  phase: string;
+  index?: number;
+  drafts?: Record<number, string>;
+  highlights: { sentenceId: number; word: string }[];
+  score: ShadowScore | null;
+  orientation: string;
+};
+
+export function snapshotProgressBody(payload: ProgressPayload): Record<string, unknown> {
+  const body: Record<string, unknown> = {
+    phase: payload.phase,
+    index: payload.index,
+    highlights: payload.highlights,
+    score: payload.score,
+    orientation: payload.orientation,
+  };
+  if (payload.drafts) {
+    body.drafts = Object.fromEntries(
+      Object.entries(payload.drafts).map(([key, value]) => [String(key), String(value ?? "")]),
+    );
+  }
+  return body;
+}
 
 async function readError(res: Response): Promise<string> {
   try {
@@ -230,35 +255,23 @@ export async function loadSession(sessionId: string): Promise<SessionDetail> {
 
 export async function saveProgress(
   sessionId: string,
-  payload: {
-    phase: string;
-    index?: number;
-    drafts?: Record<number, string>;
-    highlights: { sentenceId: number; word: string }[];
-    score: ShadowScore | null;
-    orientation: string;
-  },
+  payload: ProgressPayload,
   options?: { keepalive?: boolean },
 ): Promise<void> {
+  if (!sessionId) return;
+  const body = snapshotProgressBody(payload);
   const request = async () => {
     await fetch(`/api/session/${sessionId}`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       keepalive: options?.keepalive ?? false,
-      body: JSON.stringify({
-        phase: payload.phase,
-        index: payload.index,
-        highlights: payload.highlights,
-        score: payload.score,
-        orientation: payload.orientation,
-        ...(payload.drafts
-          ? { drafts: Object.fromEntries(Object.entries(payload.drafts).map(([k, v]) => [String(k), v])) }
-          : {}),
-      }),
+      body: JSON.stringify(body),
     }).catch(() => undefined);
   };
-  progressSaveChain = progressSaveChain.then(request, request);
-  await progressSaveChain;
+  const prev = progressSaveChains.get(sessionId) || Promise.resolve();
+  const next = prev.then(request, request);
+  progressSaveChains.set(sessionId, next);
+  await next;
 }
 
 export async function deleteSession(sessionId: string): Promise<void> {

@@ -32,6 +32,12 @@ import {
 } from "./api";
 import { resumeTimeInSentence, splitWords } from "./diffWords";
 import { applyBurnWipeLayout } from "./videoBurnLayout";
+import {
+  createLoadGate,
+  draftsCacheKey,
+  fullDraftSnapshot,
+  LEGACY_DRAFTS_CACHE_PREFIX,
+} from "./sessionState";
 import type {
   CaptionMode,
   CurrentUser,
@@ -50,7 +56,6 @@ import type {
 } from "./types";
 
 const LAST_SESSION_KEY = "enprato.lastSession";
-const DRAFTS_CACHE_PREFIX = "enprato.drafts.";
 const ENABLE_SERVER_SPEAKER = import.meta.env.VITE_ENABLE_SERVER_SPEAKER === "1";
 
 
@@ -62,9 +67,11 @@ function backendHint(err: unknown): string {
   return msg || "无法连接后端";
 }
 
-function readDraftsCache(sessionId: string): { drafts: Record<number, string>; savedAt: number } {
+function readDraftsCache(userId: string, sessionId: string): { drafts: Record<number, string>; savedAt: number } {
   try {
-    const raw = localStorage.getItem(`${DRAFTS_CACHE_PREFIX}${sessionId}`);
+    const raw =
+      localStorage.getItem(draftsCacheKey(userId, sessionId)) ||
+      localStorage.getItem(`${LEGACY_DRAFTS_CACHE_PREFIX}${sessionId}`);
     if (!raw) return { drafts: {}, savedAt: 0 };
     const data = JSON.parse(raw) as { drafts?: Record<string, string>; savedAt?: number };
     return { drafts: draftsMap(data?.drafts), savedAt: data.savedAt || 0 };
@@ -73,14 +80,15 @@ function readDraftsCache(sessionId: string): { drafts: Record<number, string>; s
   }
 }
 
-function writeDraftsCache(sessionId: string, drafts: Record<number, string>, index: number) {
+function writeDraftsCache(userId: string, sessionId: string, drafts: Record<number, string>, index: number) {
+  if (!sessionId) return;
   try {
     const payload = {
       drafts: Object.fromEntries(Object.entries(drafts).map(([k, v]) => [String(k), v])),
       index,
       savedAt: Date.now(),
     };
-    localStorage.setItem(`${DRAFTS_CACHE_PREFIX}${sessionId}`, JSON.stringify(payload));
+    localStorage.setItem(draftsCacheKey(userId, sessionId), JSON.stringify(payload));
   } catch {
     /* ignore quota */
   }
@@ -143,12 +151,12 @@ function resumeSentenceIndex(sentenceCount: number, drafts: Record<number, strin
   return firstEmpty;
 }
 
-function loadDraftsForSession(detail: SessionDetail): Record<number, string> {
+function loadDraftsForSession(detail: SessionDetail, userId: string): Record<number, string> {
   const server = draftsFromServerMap(detail.drafts);
-  const cached = readDraftsCache(detail.session_id);
+  const cached = readDraftsCache(userId, detail.session_id);
   const merged = collapseIdenticalDrafts(mergeDraftMaps(server, cached.drafts));
   const resumeAt = resumeSentenceIndex(detail.sentences.length, merged, detail.index || 0);
-  writeDraftsCache(detail.session_id, merged, resumeAt);
+  writeDraftsCache(userId, detail.session_id, merged, resumeAt);
   return merged;
 }
 
@@ -436,6 +444,8 @@ export default function App() {
   const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null);
   const [catalog, setCatalog] = useState<CuratedLesson[]>([]);
   const [screen, setScreen] = useState<"home" | "progress">("home");
+  const loadGateRef = useRef(createLoadGate());
+  const draftsUserId = user?.id || "lan-local";
 
   useEffect(() => {
     const root = document.documentElement;
@@ -495,7 +505,10 @@ export default function App() {
         setHistory(rows);
         const last = localStorage.getItem(LAST_SESSION_KEY);
         if (last && rows.some((row) => row.session_id === last)) {
-          openDetail(await loadSession(last));
+          const token = loadGateRef.current.bump();
+          const detail = await loadSession(last);
+          if (!loadGateRef.current.isCurrent(token)) return;
+          openDetail(detail);
         }
       } catch (err) {
         if (!cancelled) {
@@ -563,7 +576,7 @@ export default function App() {
     setVideoUrl(`${mediaSrc(detail.video_url)}?v=playable`);
     setAudioUrl(`${mediaSrc(detail.audio_url || `/api/session/${detail.session_id}/audio`)}?v=1`);
     setOrientation(detail.orientation === "portrait" ? "portrait" : "landscape");
-    const drafts = loadDraftsForSession(detail);
+    const drafts = loadDraftsForSession(detail, draftsUserId);
     setResumeDrafts(drafts);
     setResumeIndex(resumeSentenceIndex(detail.sentences.length, drafts, detail.index || 0));
     setResumeHighlights(detail.highlights || []);
@@ -580,6 +593,7 @@ export default function App() {
     const url = sourceUrl.trim();
     // 有本地文件优先用文件，避免错误链接挡住进入
     if (!file && !url) return;
+    const token = loadGateRef.current.bump();
     setPhase("preparing");
     try {
       if (!file) {
@@ -587,11 +601,13 @@ export default function App() {
         if (existing) {
           const restart = window.confirm("已找到这条视频的学习记录。点击“确定”创建新的学习记录，点击“取消”继续上次学习。\n\n旧课程的进度、分句和评分不会被修改。\n\n确定：重新开始\n取消：继续上次学习");
           if (!restart) {
+            if (!loadGateRef.current.isCurrent(token)) return;
             await resume(existing.session_id);
             return;
           }
         }
         const prepared = await prepareSessionFromUrl(url, Boolean(existing));
+        if (!loadGateRef.current.isCurrent(token)) return;
         openDetail({ ...prepared, phase: prepared.phase === "listen" ? "listen" : prepared.phase });
         await refreshHistory();
         await refreshLicense();
@@ -600,10 +616,12 @@ export default function App() {
       const prepared = file
         ? await prepareSession(file, null)
         : await prepareSessionFromUrl(url);
+      if (!loadGateRef.current.isCurrent(token)) return;
       openDetail({ ...prepared, phase: prepared.phase === "listen" ? "listen" : prepared.phase });
       await refreshHistory();
       await refreshLicense();
     } catch (err) {
+      if (!loadGateRef.current.isCurrent(token)) return;
       setPhase("import");
       setError(friendlyUrlImportError(err));
       if (!file) {
@@ -616,16 +634,19 @@ export default function App() {
   async function startCurated(url: string) {
     const clean = url.trim();
     if (!clean) return;
+    const token = loadGateRef.current.bump();
     setVideoFile(null);
     setSourceUrl(clean);
     setError("");
     setPhase("preparing");
     try {
       const prepared = await prepareSessionFromUrl(clean);
+      if (!loadGateRef.current.isCurrent(token)) return;
       openDetail({ ...prepared, phase: prepared.phase === "listen" ? "listen" : prepared.phase });
       await refreshHistory();
       await refreshLicense();
     } catch (err) {
+      if (!loadGateRef.current.isCurrent(token)) return;
       setPhase("import");
       setError(friendlyUrlImportError(err));
       setVideoUrl("");
@@ -635,9 +656,13 @@ export default function App() {
 
   async function resume(id: string) {
     setError("");
+    const token = loadGateRef.current.bump();
     try {
-      openDetail(await loadSession(id));
+      const detail = await loadSession(id);
+      if (!loadGateRef.current.isCurrent(token)) return;
+      openDetail(detail);
     } catch (err) {
+      if (!loadGateRef.current.isCurrent(token)) return;
       setError(err instanceof Error ? err.message : "无法打开历史课");
       localStorage.removeItem(LAST_SESSION_KEY);
       await refreshHistory();
@@ -744,6 +769,7 @@ export default function App() {
             videoUrl={videoUrl}
             audioUrl={audioUrl}
             sessionId={sessionId}
+            draftsUserId={draftsUserId}
             sentences={sentences}
             orientation={orientation}
             initialIndex={resumeIndex}
@@ -757,6 +783,7 @@ export default function App() {
             onRefreshHistory={refreshHistory}
             onSwitchSession={resume}
             onReset={() => {
+              loadGateRef.current.bump();
               setPhase("import");
               setSentences([]);
               setSessionId("");
@@ -767,6 +794,10 @@ export default function App() {
               setAudioUrl("");
               setResumeHasVideo(true);
               setProgressFloor(0);
+              setResumeDrafts({});
+              setResumeIndex(0);
+              setResumeHighlights([]);
+              setResumeScore(null);
               void refreshHistory();
             }}
           />
@@ -1653,6 +1684,7 @@ function Studio({
   videoUrl,
   audioUrl,
   sessionId,
+  draftsUserId,
   sentences,
   orientation,
   initialIndex,
@@ -1672,6 +1704,7 @@ function Studio({
   videoUrl: string;
   audioUrl: string;
   sessionId: string;
+  draftsUserId: string;
   sentences: Sentence[];
   orientation: Orientation;
   initialIndex: number;
@@ -1696,7 +1729,9 @@ function Studio({
   const chunksRef = useRef<Blob[]>([]);
   const shadowChunksRef = useRef<Blob[]>([]);
   const streamRef = useRef<MediaStream | null>(null);
-  const draftsRef = useRef<Record<number, string>>({});
+  const draftsRef = useRef<Record<number, string>>({ ...initialDrafts });
+  const sessionIdRef = useRef(sessionId);
+  const sentencesRef = useRef(sentences);
   const scrubbingRef = useRef(false);
   const skipAutoPlayRef = useRef(false);
   const pauseAtRef = useRef(sentences[initialIndex]?.start ?? 0);
@@ -1753,6 +1788,8 @@ function Studio({
   const [draftCanRestore, setDraftCanRestore] = useState(false);
   const stripRef = useRef<HTMLDivElement>(null);
   const stripBrowseUntilRef = useRef(0);
+  sessionIdRef.current = sessionId;
+  sentencesRef.current = sentences;
 
   const sentence = sentences[index];
   const overlayEnglish =
@@ -1788,6 +1825,15 @@ function Studio({
     return rest;
   }
 
+  function currentDraftSnapshot(source: Record<number, string> = draftsRef.current) {
+    return fullDraftSnapshot(source, sentencesRef.current.length);
+  }
+
+  function persistDraftsCache(source: Record<number, string> = draftsRef.current, indexValue = indexRef.current) {
+    if (!sessionIdRef.current) return;
+    writeDraftsCache(draftsUserId, sessionIdRef.current, currentDraftSnapshot(source), indexValue);
+  }
+
   function restoreDraftEdits() {
     try {
       const next = JSON.parse(draftBaselineRef.current) as Record<number, string>;
@@ -1799,13 +1845,13 @@ function Studio({
         sessionProgressPayload({
           phase: phaseRef.current,
           index: indexRef.current,
-          drafts: next,
+          drafts: currentDraftSnapshot(next),
           highlights,
           score,
           orientation,
         }),
       );
-      writeDraftsCache(sessionId, next, indexRef.current);
+      persistDraftsCache(next, indexRef.current);
       window.setTimeout(() => revealDraftEnd(), 80);
     } catch {
       /* ignore */
@@ -1833,13 +1879,13 @@ function Studio({
     setPhase("listen");
     setCaptionMode("off");
     setDraftCanRestore(JSON.stringify(next) !== draftBaselineRef.current);
-    writeDraftsCache(sessionId, next, first);
+    persistDraftsCache(next, first);
     void saveProgress(
       sessionId,
       sessionProgressPayload({
         phase: "listen",
         index: first,
-        drafts: next,
+        drafts: currentDraftSnapshot(next),
         highlights,
         score,
         orientation,
@@ -2063,20 +2109,20 @@ function Studio({
         sessionProgressPayload({
           phase,
           index,
-          drafts: draftsRef.current,
+          drafts: fullDraftSnapshot(draftsRef.current, sentencesRef.current.length),
           highlights,
           score,
           orientation,
         }),
       );
-      writeDraftsCache(sessionId, draftsRef.current, indexRef.current);
+      persistDraftsCache( draftsRef.current, indexRef.current);
     }, 250);
     return () => window.clearTimeout(timer);
   }, [sessionId, phase, index, drafts, highlights, score, orientation, ipadStudio]);
 
   useEffect(() => {
     if (!sessionId) return;
-    writeDraftsCache(sessionId, drafts, index);
+    persistDraftsCache( drafts, index);
   }, [sessionId, drafts, index]);
 
   useEffect(() => {
@@ -2087,13 +2133,13 @@ function Studio({
         sessionProgressPayload({
           phase: phaseRef.current,
           index: indexRef.current,
-          drafts: draftsRef.current,
+          drafts: fullDraftSnapshot(draftsRef.current, sentencesRef.current.length),
           highlights,
           score,
           orientation,
         }),
       );
-      writeDraftsCache(sessionId, draftsRef.current, indexRef.current);
+      persistDraftsCache( draftsRef.current, indexRef.current);
     }, 120);
     return () => window.clearTimeout(timer);
   }, [sessionId, highlights, score, orientation, ipadStudio]);
@@ -2117,14 +2163,14 @@ function Studio({
         sessionProgressPayload({
           phase: phaseRef.current,
           index: indexRef.current,
-          drafts: draftsRef.current,
+          drafts: fullDraftSnapshot(draftsRef.current, sentencesRef.current.length),
           highlights,
           score,
           orientation,
         }),
         { keepalive: true },
       );
-      writeDraftsCache(sessionId, draftsRef.current, indexRef.current);
+      persistDraftsCache( draftsRef.current, indexRef.current);
     };
     const onHide = () => {
       if (document.visibilityState === "hidden") flush();
@@ -2176,10 +2222,11 @@ function Studio({
   useEffect(() => {
     if ((!phoneMic && !ipadStudio) || !sessionId) return;
     let cancelled = false;
+    const expectedId = sessionId;
     const tick = async () => {
       try {
-        const data = await fetchRemoteInbox(sessionId, remoteAfterRef.current);
-        if (cancelled) return;
+        const data = await fetchRemoteInbox(expectedId, remoteAfterRef.current);
+        if (cancelled || sessionIdRef.current !== expectedId) return;
         if (phoneMic && data.connected) setPhonePaired(true);
         if (phoneMic) {
           let pendingAdvanceIndex: number | null = null;
@@ -2219,8 +2266,8 @@ function Studio({
             }
           }
         }
-        const state = await fetchRemoteState(sessionId);
-        if (cancelled) return;
+        const state = await fetchRemoteState(expectedId);
+        if (cancelled || sessionIdRef.current !== expectedId) return;
         if (phoneMic) setPhonePaired(true);
         if (
           ipadStudio &&
@@ -2316,12 +2363,12 @@ function Studio({
       await saveProgress(sessionId, {
         phase: phaseRef.current,
         index: indexRef.current,
-        drafts: draftsRef.current,
+        drafts: fullDraftSnapshot(draftsRef.current, sentencesRef.current.length),
         highlights,
         score,
         orientation,
       });
-      writeDraftsCache(sessionId, draftsRef.current, indexRef.current);
+      persistDraftsCache( draftsRef.current, indexRef.current);
       await onSwitchSession(nextId);
       await onRefreshHistory();
     } catch (err) {
@@ -2535,12 +2582,12 @@ function Studio({
     void saveProgress(sessionId, {
       phase: "listen",
       index: target,
-      drafts: draftsRef.current,
+      drafts: fullDraftSnapshot(draftsRef.current, sentencesRef.current.length),
       highlights,
       score,
       orientation,
     });
-    writeDraftsCache(sessionId, draftsRef.current, target);
+    persistDraftsCache( draftsRef.current, target);
     playAt(sentence.start);
   }
 
@@ -2566,12 +2613,12 @@ function Studio({
     void saveProgress(sessionId, {
       phase: "check",
       index: currentIndex,
-      drafts: draftsRef.current,
+      drafts: fullDraftSnapshot(draftsRef.current, sentencesRef.current.length),
       highlights,
       score,
       orientation,
     });
-    writeDraftsCache(sessionId, draftsRef.current, currentIndex);
+    persistDraftsCache( draftsRef.current, currentIndex);
     pauseMedia();
     setUserPaused(true);
     setCaptionMode("en");
@@ -2664,12 +2711,12 @@ function Studio({
     void saveProgress(sessionId, {
       phase: "listen",
       index: next,
-      drafts: draftsRef.current,
+      drafts: fullDraftSnapshot(draftsRef.current, sentencesRef.current.length),
       highlights,
       score,
       orientation,
     });
-    writeDraftsCache(sessionId, draftsRef.current, next);
+    persistDraftsCache( draftsRef.current, next);
     playCurrent();
   }
 
@@ -3059,14 +3106,14 @@ function Studio({
                   setPhase("listen");
                   setCaptionMode("off");
                   playAt(sentences[i].start);
-                  writeDraftsCache(sessionId, draftsRef.current, i);
+                  persistDraftsCache( draftsRef.current, i);
                   void saveProgress(
                     sessionId,
                     sessionProgressPayload(
                       {
                         phase: "listen",
                         index: i,
-                        drafts: draftsRef.current,
+                        drafts: fullDraftSnapshot(draftsRef.current, sentencesRef.current.length),
                         highlights,
                         score,
                         orientation,
@@ -3191,13 +3238,13 @@ function Studio({
                       sessionProgressPayload({
                         phase: phaseRef.current,
                         index: indexRef.current,
-                        drafts: draftsRef.current,
+                        drafts: fullDraftSnapshot(draftsRef.current, sentencesRef.current.length),
                         highlights,
                         score,
                         orientation,
                       }),
                     );
-                    writeDraftsCache(sessionId, draftsRef.current, indexRef.current);
+                    persistDraftsCache( draftsRef.current, indexRef.current);
                   }}
                 />
                 <div className={`voice-pad${ipadStudio ? " voice-pad-ipad" : ""}`}>
