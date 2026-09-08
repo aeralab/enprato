@@ -140,6 +140,38 @@ class AuthFlowTests(unittest.TestCase):
         self.assertEqual(client.post("/api/auth/logout").status_code, 200)
         self.assertEqual(client.get("/api/auth/me").status_code, 401)
 
+    def test_same_email_login_after_logout(self):
+        client = TestClient(main.app)
+        payload = {"email": "back@example.com", "password": "password123"}
+        self.assertEqual(client.post("/api/auth/register", json=payload).status_code, 200)
+        self.assertEqual(client.post("/api/auth/logout").status_code, 200)
+        login = client.post("/api/auth/login", json=payload)
+        self.assertEqual(login.status_code, 200)
+        self.assertEqual(login.json()["email"], "back@example.com")
+        self.assertNotIn("password", login.json())
+        self.assertNotIn("password_hash", login.json())
+        me = client.get("/api/auth/me")
+        self.assertEqual(me.status_code, 200)
+        self.assertEqual(me.json()["user"]["email"], "back@example.com")
+
+    def test_invalid_email_and_short_password_rejected(self):
+        client = TestClient(main.app)
+        bad_email = client.post("/api/auth/register", json={"email": "not-an-email", "password": "password123"})
+        self.assertEqual(bad_email.status_code, 400)
+        short = client.post("/api/auth/register", json={"email": "ok@example.com", "password": "short"})
+        self.assertEqual(short.status_code, 400)
+
+    def test_register_conflict_then_login_matches_email_gate(self):
+        client = TestClient(main.app)
+        payload = {"email": "combo@example.com", "password": "password123"}
+        self.assertEqual(client.post("/api/auth/register", json=payload).status_code, 200)
+        client.post("/api/auth/logout")
+        conflict = client.post("/api/auth/register", json=payload)
+        self.assertEqual(conflict.status_code, 409)
+        login = client.post("/api/auth/login", json=payload)
+        self.assertEqual(login.status_code, 200)
+        self.assertEqual(client.get("/api/auth/me").json()["user"]["email"], "combo@example.com")
+
     def test_expired_session_is_401(self):
         client = TestClient(main.app)
         client.post("/api/auth/register", json={"email": "exp@example.com", "password": "password123"})

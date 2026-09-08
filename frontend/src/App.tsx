@@ -3,7 +3,9 @@ import {
   activateLicense,
   fetchAuthState,
   fetchCatalog,
+  loginAccount,
   logoutAccount,
+  registerAccount,
   sendPhoneCode,
   verifyPhoneLogin,
   checkUpdate,
@@ -1049,13 +1051,84 @@ function AuthScreen({ error, onAuthed }: { error: string; onAuthed: (user: Curre
         <p className="auth-wordmark">ENPRATO</p>
         <h1>学习你感兴趣的语言，<br className="auth-title-break" />用最快的时间掌握它。</h1>
         <p className="auth-lead">导入你喜欢的视频或音频，通过听、说、写反复练习。</p>
-        <PhoneAuthForm error={error} onAuthed={onAuthed} />
+        <EmailAuthForm error={error} onAuthed={onAuthed} />
       </div>
     </div>
   );
 }
 
-function PhoneAuthForm({
+function EmailAuthForm({
+  error,
+  onAuthed,
+}: {
+  error?: string;
+  onAuthed: (user: CurrentUser) => void;
+}) {
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState(error || "");
+
+  async function submit(event: FormEvent) {
+    event.preventDefault();
+    setMessage("");
+    const trimmed = email.trim();
+    if (!trimmed.includes("@") || trimmed.length > 254 || password.length < 8) {
+      setMessage("请输入有效邮箱，密码至少 8 位");
+      return;
+    }
+    setBusy(true);
+    try {
+      try {
+        const user = await registerAccount(trimmed, password);
+        onAuthed(user);
+        return;
+      } catch (err) {
+        const raw = err instanceof Error ? err.message : String(err || "");
+        if (!/邮箱已注册/.test(raw)) throw err;
+      }
+      const user = await loginAccount(trimmed, password);
+      onAuthed(user);
+    } catch (err) {
+      setMessage(friendlyAuthError(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <form className="auth-form" onSubmit={(event) => void submit(event)}>
+      <label>
+        <span>邮箱</span>
+        <input
+          type="email"
+          autoComplete="email"
+          placeholder="请输入邮箱"
+          value={email}
+          onChange={(e) => setEmail(e.target.value)}
+          required
+        />
+      </label>
+      <label>
+        <span>密码</span>
+        <input
+          type="password"
+          autoComplete="current-password"
+          placeholder="请输入密码"
+          value={password}
+          onChange={(e) => setPassword(e.target.value)}
+          required
+          minLength={8}
+        />
+      </label>
+      {message ? <p className="err">{message}</p> : null}
+      <button className="primary" type="submit" disabled={busy}>{busy ? "请稍候…" : "登录 / 注册"}</button>
+      <p className="auth-legal">登录即表示你同意相关服务条款与隐私政策</p>
+    </form>
+  );
+}
+
+export function PhoneAuthForm({
   error,
   onAuthed,
 }: {
