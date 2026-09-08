@@ -18,6 +18,15 @@ async function readError(res: Response): Promise<string> {
   }
 }
 
+function isAbortError(err: unknown): boolean {
+  return (
+    (typeof DOMException !== "undefined" && err instanceof DOMException && err.name === "AbortError") ||
+    (err instanceof Error && err.name === "AbortError")
+  );
+}
+
+const URL_IMPORT_TIMEOUT_MS = 15 * 60 * 1000;
+
 function compareVersions(a: string, b: string): number {
   const pa = a.split(/[.-]/).map((part) => Number(part) || 0);
   const pb = b.split(/[.-]/).map((part) => Number(part) || 0);
@@ -52,14 +61,26 @@ export async function prepareSession(
 }
 
 export async function prepareSessionFromUrl(url: string, createNewSession = false): Promise<SessionDetail> {
-  const res = await fetch("/api/prepare-url", {
-    method: "POST",
-    credentials: "same-origin",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ url, create_new_session: createNewSession }),
-  });
-  if (!res.ok) throw new Error(await readError(res));
-  return res.json();
+  const controller = new AbortController();
+  const timer = window.setTimeout(() => controller.abort(), URL_IMPORT_TIMEOUT_MS);
+  try {
+    const res = await fetch("/api/prepare-url", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url, create_new_session: createNewSession }),
+      signal: controller.signal,
+    });
+    if (!res.ok) throw new Error(await readError(res));
+    return res.json();
+  } catch (err) {
+    if (isAbortError(err)) {
+      throw new Error("导入时间过长，已停止等待。请换一条较短的链接，或先下载到本地再上传。");
+    }
+    throw err;
+  } finally {
+    window.clearTimeout(timer);
+  }
 }
 
 export async function fetchLicense(): Promise<LicenseStatus> {

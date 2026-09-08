@@ -9,14 +9,24 @@ import sys
 import ssl
 import time
 import urllib.request
+import logging
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from .media import ensure_playback_audio, extract_wav, find_ffmpeg, is_ipad_media, make_browser_mp4, media_has_audio, run_ffmpeg, stream_codec
+
+logger = logging.getLogger(__name__)
 
 VIDEO_EXTS = {".mp4", ".webm", ".mkv", ".m4v", ".mov", ".avi"}
 AUDIO_EXTS = {".m4a", ".mp3", ".opus", ".ogg", ".wav", ".aac"}
 SUB_EXTS = {".vtt", ".srt"}
+YTDLP_TIMEOUT_SEC = int(os.environ.get("ENPRATO_YTDLP_TIMEOUT", "600"))
+LOCAL_UPLOAD_HINT = "该链接暂时无法直接读取。你可以先将视频保存到本地，再上传到 Enprato 学习。"
+MEDIA_FORMATS = (
+    "bv*[vcodec^=avc1][height<=480]+ba[ext=m4a]/bv*[ext=mp4][height<=480]+ba/b[height<=480][ext=mp4]",
+    "bv*[vcodec^=avc1][height<=720]+ba[ext=m4a]/bv*[ext=mp4][height<=720]+ba/b[ext=mp4][height<=720]",
+    "ba[ext=m4a]/bestaudio[ext=m4a]/ba/bestaudio",
+)
 
 YT_DLP_CANDIDATES = [
     os.environ.get("YT_DLP_PATH", ""),
@@ -40,6 +50,10 @@ def ytdlp_cmd() -> list[str]:
     raise RuntimeError("未找到 yt-dlp。请先安装：pip install yt-dlp")
 
 
+def ytdlp_network_args() -> list[str]:
+    return ["--socket-timeout", "30", "--retries", "2", "--fragment-retries", "2"]
+
+
 def parse_bilibili_bvid(url: str) -> str | None:
     match = re.search(r"(BV[0-9A-Za-z]+)", url, re.I)
     return match.group(1) if match else None
@@ -59,6 +73,28 @@ def same_media_url(left: str, right: str) -> bool:
 def is_bilibili_url(url: str) -> bool:
     text = (url or "").lower()
     return "bilibili.com" in text or "b23.tv" in text
+
+
+def is_youtube_url(url: str) -> bool:
+    host = (urlparse(url or "").netloc or "").lower()
+    return "youtube.com" in host or host.endswith("youtu.be") or host == "youtu.be"
+
+
+def url_preview(url: str) -> str:
+    try:
+        parsed = urlparse(url or "")
+    except Exception:
+        return "unknown"
+    host = (parsed.netloc or "").split("@")[-1].lower()
+    if is_bilibili_url(url):
+        bvid = parse_bilibili_bvid(url)
+        return f"bilibili:{bvid}" if bvid else f"bilibili:{host or 'unknown'}"
+    if is_youtube_url(url):
+        vid = (parse_qs(parsed.query).get("v") or [""])[0].strip()
+        if not vid and "youtu.be" in host:
+            vid = (parsed.path or "").strip("/").split("/")[0]
+        return f"youtube:{vid}" if vid else f"youtube:{host or 'unknown'}"
+    return host or "unknown"
 
 
 def is_retryable_ytdlp_error(url: str, detail: str) -> bool:
@@ -158,7 +194,7 @@ def fetch_media_title(url: str) -> str | None:
     try:
         ytdlp = ytdlp_cmd()
         completed = subprocess.run(
-            [*ytdlp, "--no-playlist", "--no-warnings", "-j", "--skip-download", url],
+            [*ytdlp, "--no-playlist", "--no-warnings", *ytdlp_network_args(), "-j", "--skip-download", url],
             capture_output=True,
             timeout=90,
         )
@@ -196,6 +232,7 @@ def fetch_url_thumbnail(url: str, dest: Path) -> bool:
             *ytdlp,
             "--no-playlist",
             "--no-warnings",
+            *ytdlp_network_args(),
             "--skip-download",
             "--write-thumbnail",
             "--convert-thumbnails",
@@ -294,19 +331,23 @@ def validate_media_url(raw: str) -> str:
 def ingest_url(url: str, folder: Path) -> tuple[Path, Path, str | None]:
     """Fetch playable media + optional English captions. Returns (video_or_audio, wav, captions_text)."""
     url = validate_media_url(url)
+    preview = url_preview(url)
+    started = time.monotonic()
     folder.mkdir(parents=True, exist_ok=True)
     ffmpeg = find_ffmpeg()
     ffmpeg_dir = str(Path(ffmpeg).parent)
     ytdlp = ytdlp_cmd()
     out_tmpl = str(folder / "source.%(ext)s")
     cookies = os.environ.get("ENPRATO_COOKIES", "").strip()
+    logger.info("media_download_start host=%s cookies=%s", preview, "1" if cookies else "0")
 
     base = [
         *ytdlp,
         "--no-playlist",
         "--no-warnings",
         "--restrict-filenames",
-        "--newline",
+        "--no-progress",
+        *ytdlp_network_args(),
         "--ffmpeg-location",
         ffmpeg_dir,
         "--merge-output-format",
@@ -339,16 +380,37 @@ def ingest_url(url: str, folder: Path) -> tuple[Path, Path, str | None]:
     try:
         _download_with_retries(base, url)
     except RuntimeError as exc:
+        logger.info(
+            "url_import_failed stage=media_download host=%s exception=%s elapsed_ms=%d",
+            preview,
+            type(exc).__name__,
+            _elapsed_ms(started),
+        )
         raise RuntimeError(_friendly_ytdlp_error(url, str(exc))) from exc
+    logger.info("media_download_done host=%s elapsed_ms=%d", preview, _elapsed_ms(started))
 
     media = _ensure_playable(folder)
     if media is None:
         raise RuntimeError("链接能打开，但没有拿到可播放的音视频（可能有版权保护或地区限制）")
 
     audio = folder / "audio.wav"
-    extract_wav(media, audio)
-    ensure_playback_audio(folder, media)
+    extract_started = time.monotonic()
+    logger.info("audio_extract_start host=%s", preview)
+    try:
+        extract_wav(media, audio)
+        ensure_playback_audio(folder, media)
+    except Exception as exc:
+        logger.info(
+            "url_import_failed stage=audio_extract host=%s exception=%s elapsed_ms=%d",
+            preview,
+            type(exc).__name__,
+            _elapsed_ms(extract_started),
+        )
+        raise
+    logger.info("audio_extract_done host=%s elapsed_ms=%d", preview, _elapsed_ms(extract_started))
+    logger.info("subtitle_fetch_start host=%s", preview)
     captions = _read_captions(folder)
+    logger.info("subtitle_fetch_done host=%s captions=%s", preview, "1" if captions else "0")
     adopt_downloaded_thumbnail(folder)
     return media, audio, captions
 
@@ -446,22 +508,28 @@ def _download_with_retries(base: list[str], url: str) -> None:
 
 
 def _ytdlp_fetch(base: list[str], url: str) -> None:
-    video_fmt = (
-        "bv*[vcodec^=avc1][height<=720]+ba[ext=m4a]/"
-        "bv*[ext=mp4][height<=720]+ba/"
-        "b[ext=mp4][height<=720]/"
-        "bv*+ba/b"
-    )
     last = ""
-    for fmt in (video_fmt, "bestvideo+bestaudio/best", "ba/bestaudio/b"):
+    preview = url_preview(url)
+    for fmt in MEDIA_FORMATS:
         try:
+            logger.info("media_download_start host=%s format=%s", preview, fmt.split("/")[0])
             _run(base + ["-f", fmt, url])
             return
         except RuntimeError as exc:
             last = str(exc)
-            if is_retryable_ytdlp_error(url, last):
+            if is_retryable_ytdlp_error(url, last) or _is_timeout_error(last):
                 raise
     raise RuntimeError(last or "yt-dlp 失败")
+
+
+def _is_timeout_error(detail: str) -> bool:
+    text = detail or ""
+    low = text.lower()
+    return "超时" in text or "timed out" in low or "timeoutexpired" in low
+
+
+def _elapsed_ms(started: float) -> int:
+    return int((time.monotonic() - started) * 1000)
 
 
 def _friendly_ytdlp_error(url: str, detail: str) -> str:
@@ -469,18 +537,29 @@ def _friendly_ytdlp_error(url: str, detail: str) -> str:
     low = text.lower()
     is_bili = is_bilibili_url(url) or "bilibili" in low
     if is_bili and ("412" in text or "precondition failed" in low):
-        return (
-            "B站暂时拦截了链接下载（HTTP 412）。请稍后再试一次；"
-            "若左侧历史里已有同一条课，请从历史进入，不要重新拉取。"
-            "也可以先把视频下载到电脑，再拖入上传。"
-        )
+        return LOCAL_UPLOAD_HINT
+    if _is_timeout_error(text):
+        return LOCAL_UPLOAD_HINT
+    if "sign in to confirm" in low or "not a bot" in low:
+        return LOCAL_UPLOAD_HINT
     if "geo-restricted" in low or "deleted" in low:
-        return "视频可能已删除、需登录，或有地区限制。可换链接，或配置 ENPRATO_COOKIES 后重试。"
+        return "视频可能已删除、需登录，或有地区限制。可换链接，或先下载到本地再上传。"
     return text or "yt-dlp 拉取失败"
 
 
-def _run(cmd: list[str]) -> None:
-    completed = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+def _run(cmd: list[str], timeout: int | None = None) -> None:
+    limit = YTDLP_TIMEOUT_SEC if timeout is None else timeout
+    try:
+        completed = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=limit,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("下载超时，已停止等待") from exc
     if completed.returncode != 0:
         detail = (completed.stderr or completed.stdout or "").strip()
         lines = [line for line in detail.splitlines() if line.strip()]

@@ -28,9 +28,13 @@ def find_ffmpeg() -> str:
     raise RuntimeError("未找到 ffmpeg，请安装或设置环境变量 FFMPEG_PATH")
 
 
-def run_ffmpeg(args: list[str]) -> None:
-    cmd = [find_ffmpeg(), "-y", "-hide_banner", "-loglevel", "error", *args]
-    completed = subprocess.run(cmd, capture_output=True, text=True)
+def run_ffmpeg(args: list[str], timeout: int | None = None) -> None:
+    cmd = [find_ffmpeg(), "-y", "-nostdin", "-hide_banner", "-loglevel", "error", *args]
+    limit = int(os.environ.get("ENPRATO_FFMPEG_TIMEOUT", "600")) if timeout is None else timeout
+    try:
+        completed = subprocess.run(cmd, capture_output=True, text=True, timeout=limit)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("ffmpeg 执行超时") from exc
     if completed.returncode != 0:
         raise RuntimeError(completed.stderr.strip() or "ffmpeg 执行失败")
 
@@ -47,7 +51,7 @@ def probe_duration(src: Path) -> float:
             "default=noprint_wrappers=1:nokey=1",
             str(src),
         ]
-        completed = subprocess.run(cmd, capture_output=True, text=True)
+        completed = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         if completed.returncode != 0:
             return 0.0
         return max(0.0, float((completed.stdout or "").strip()))
@@ -141,7 +145,7 @@ def stream_codec(src: Path, kind: str = "a") -> str:
             "default=nw=1:nk=1",
             str(src),
         ]
-        completed = subprocess.run(cmd, capture_output=True, text=True)
+        completed = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         return (completed.stdout or "").strip().lower()
     except Exception:
         return ""
@@ -170,7 +174,7 @@ def stream_dimensions(src: Path) -> tuple[int, int]:
             "csv=p=0:s=x",
             str(src),
         ]
-        completed = subprocess.run(cmd, capture_output=True, text=True)
+        completed = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         raw = (completed.stdout or "").strip().splitlines()[0]
         width, height = raw.lower().split("x", 1)
         return max(0, int(width)), max(0, int(height))
@@ -313,7 +317,7 @@ def media_has_audio(src: Path) -> bool:
             "csv=p=0",
             str(src),
         ]
-        completed = subprocess.run(cmd, capture_output=True, text=True)
+        completed = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         return "audio" in (completed.stdout or "").lower()
     except Exception:
         return False
