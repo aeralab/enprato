@@ -75,7 +75,7 @@ export async function prepareSessionFromUrl(url: string, createNewSession = fals
     return res.json();
   } catch (err) {
     if (isAbortError(err)) {
-      throw new Error("导入时间过长，已停止等待。请换一条较短的链接，或先下载到本地再上传。");
+      throw new Error("暂时无法直接读取该视频链接。你可以先将视频保存到本地，再上传到 Enprato 学习。");
     }
     throw err;
   } finally {

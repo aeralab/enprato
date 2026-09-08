@@ -94,6 +94,23 @@ class YtdlpTimeoutTests(unittest.TestCase):
                 ingest._ytdlp_fetch(["yt-dlp"], "https://www.youtube.com/watch?v=abc")
         self.assertEqual(len(calls), 1)
 
+    def test_network_unreachable_does_not_try_next_format(self):
+        calls = []
+        err = (
+            "ERROR: [youtube] gpMe8ADa2_E: Unable to download API page: "
+            "HTTPSConnection(host='www.youtube.com', port=443): "
+            "Failed to establish a new connection: [Errno 101] Network is unreachable"
+        )
+
+        def fake_run(cmd, timeout=None):
+            calls.append(cmd)
+            raise RuntimeError(err)
+
+        with patch.object(ingest, "_run", side_effect=fake_run):
+            with self.assertRaises(RuntimeError):
+                ingest._ytdlp_fetch(["yt-dlp"], "https://www.youtube.com/watch?v=gpMe8ADa2_E")
+        self.assertEqual(len(calls), 1)
+
     def test_format_unavailable_falls_back(self):
         calls = []
 
@@ -108,18 +125,38 @@ class YtdlpTimeoutTests(unittest.TestCase):
 
 
 class FriendlyErrorTests(unittest.TestCase):
-    def test_bilibili_412_asks_for_local_upload(self):
-        msg = ingest._friendly_ytdlp_error(
-            "https://www.bilibili.com/video/BV1CMjq6nEu1/",
-            "ERROR: [BiliBili] Unable to download webpage: HTTP Error 412: Precondition Failed",
+    def _assert_safe_user_error(self, msg: str):
+        self.assertEqual(msg, ingest.LOCAL_UPLOAD_HINT)
+        low = msg.lower()
+        self.assertNotIn("errno", low)
+        self.assertNotIn("101", msg)
+        self.assertNotIn("youtube", low)
+        self.assertNotIn("b站", msg)
+        self.assertNotIn("bilibili", low)
+        self.assertNotIn("412", msg)
+        self.assertNotIn("traceback", low)
+        self.assertNotIn("yt-dlp", low)
+        self.assertNotIn("www.", low)
+
+    def test_youtube_network_unreachable_is_classified(self):
+        err = (
+            "ERROR: [youtube] gpMe8ADa2_E: Unable to download API page: "
+            "HTTPSConnection(host='www.youtube.com', port=443): "
+            "Failed to establish a new connection: [Errno 101] Network is unreachable"
         )
-        self.assertIn("保存到本地", msg)
-        self.assertIn("上传", msg)
+        self.assertEqual(ingest.classify_ytdlp_error(err), "network_unreachable")
+        self._assert_safe_user_error(ingest.public_url_import_error(err))
+
+    def test_bilibili_412_asks_for_local_upload(self):
+        err = "ERROR: [BiliBili] Unable to download webpage: HTTP Error 412: Precondition Failed"
+        self.assertEqual(ingest.classify_ytdlp_error(err), "http_412")
+        msg = ingest._friendly_ytdlp_error("https://www.bilibili.com/video/BV1CMjq6nEu1/", err)
+        self._assert_safe_user_error(msg)
         self.assertNotIn("ENPRATO_COOKIES", msg)
 
     def test_timeout_asks_for_local_upload(self):
         msg = ingest._friendly_ytdlp_error("https://www.youtube.com/watch?v=abc", "下载超时，已停止等待")
-        self.assertIn("保存到本地", msg)
+        self._assert_safe_user_error(msg)
 
 
 class PrepareUrlFailureTests(unittest.TestCase):
@@ -134,6 +171,25 @@ class PrepareUrlFailureTests(unittest.TestCase):
         with patch.object(main, "ingest_url", side_effect=RuntimeError("yt-dlp 拉取失败")):
             res = client.post("/api/prepare-url", json={"url": "https://www.youtube.com/watch?v=abc"})
         self.assertEqual(res.status_code, 400)
+        self.assertEqual(res.json()["detail"], ingest.LOCAL_UPLOAD_HINT)
+        self.assertNotIn("yt-dlp", res.json()["detail"])
+        self.assertEqual(list(main.DATA.iterdir()), [])
+
+    def test_youtube_network_unreachable_returns_generic_fallback(self):
+        client = TestClient(main.app)
+        err = (
+            "ERROR: [youtube] gpMe8ADa2_E: Unable to download API page: "
+            "HTTPSConnection(host='www.youtube.com', port=443): "
+            "Failed to establish a new connection: [Errno 101] Network is unreachable"
+        )
+        with patch.object(main, "ingest_url", side_effect=RuntimeError(err)):
+            res = client.post("/api/prepare-url", json={"url": "https://www.youtube.com/watch?v=gpMe8ADa2_E"})
+        self.assertEqual(res.status_code, 400)
+        detail = res.json()["detail"]
+        self.assertEqual(detail, ingest.LOCAL_UPLOAD_HINT)
+        self.assertNotIn("Errno", detail)
+        self.assertNotIn("101", detail)
+        self.assertNotIn("youtube", detail.lower())
         self.assertEqual(list(main.DATA.iterdir()), [])
 
     def test_download_timeout_returns_400(self):
@@ -142,7 +198,7 @@ class PrepareUrlFailureTests(unittest.TestCase):
         with patch.object(main, "ingest_url", side_effect=RuntimeError(err)):
             res = client.post("/api/prepare-url", json={"url": "https://www.youtube.com/watch?v=abc"})
         self.assertEqual(res.status_code, 400)
-        self.assertIn("保存到本地", res.json()["detail"])
+        self.assertEqual(res.json()["detail"], ingest.LOCAL_UPLOAD_HINT)
         self.assertEqual(list(main.DATA.iterdir()), [])
 
     def test_bilibili_412_returns_local_upload_fallback(self):
@@ -152,14 +208,17 @@ class PrepareUrlFailureTests(unittest.TestCase):
         with patch.object(main, "ingest_url", side_effect=RuntimeError(err)):
             res = client.post("/api/prepare-url", json={"url": url})
         self.assertEqual(res.status_code, 400)
-        self.assertIn("保存到本地", res.json()["detail"])
-        self.assertIn("上传", res.json()["detail"])
+        detail = res.json()["detail"]
+        self.assertEqual(detail, ingest.LOCAL_UPLOAD_HINT)
+        self.assertNotIn("412", detail)
+        self.assertNotIn("B站", detail)
 
     def test_ffmpeg_failure_returns_400(self):
         client = TestClient(main.app)
         with patch.object(main, "ingest_url", side_effect=RuntimeError("ffmpeg 执行失败")):
             res = client.post("/api/prepare-url", json={"url": "https://www.youtube.com/watch?v=abc"})
         self.assertEqual(res.status_code, 400)
+        self.assertEqual(res.json()["detail"], ingest.LOCAL_UPLOAD_HINT)
         self.assertEqual(list(main.DATA.iterdir()), [])
 
     def test_asr_failure_returns_400_and_does_not_leave_pending_session(self):

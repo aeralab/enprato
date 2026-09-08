@@ -605,8 +605,7 @@ export default function App() {
       await refreshLicense();
     } catch (err) {
       setPhase("import");
-      const msg = err instanceof Error ? err.message : "准备失败";
-      setError(msg.replace(/^链接无法用于学习[:：]\s*/i, ""));
+      setError(friendlyUrlImportError(err));
       if (!file) {
         setVideoUrl("");
         setAudioUrl("");
@@ -628,8 +627,7 @@ export default function App() {
       await refreshLicense();
     } catch (err) {
       setPhase("import");
-      const msg = err instanceof Error ? err.message : "准备失败";
-      setError(msg.replace(/^链接无法用于学习[:：]\s*/i, ""));
+      setError(friendlyUrlImportError(err));
       setVideoUrl("");
       setAudioUrl("");
     }
@@ -1025,6 +1023,23 @@ function UpdateBanner({ info }: { info: UpdateInfo }) {
       </a>
     </section>
   );
+}
+
+function friendlyUrlImportError(err: unknown): string {
+  const raw = err instanceof Error ? err.message : String(err || "");
+  const text = raw.replace(/^链接无法用于学习[:：]\s*/i, "").trim();
+  if (/无法从视频中分出句子|语音识别时间过长|微信视频号|请粘贴 http/i.test(text)) return text;
+  if (
+    /errno|traceback|youtube\.com|youtu\.be|bilibili|yt-dlp|precondition|412|network is unreachable|httpsconnection|www\.|internal server/i.test(
+      text,
+    )
+  ) {
+    return "暂时无法直接读取该视频链接。你可以先将视频保存到本地，再上传到 Enprato 学习。";
+  }
+  if (!text || /failed to fetch|network|load failed|导入时间过长/i.test(text)) {
+    return "暂时无法直接读取该视频链接。你可以先将视频保存到本地，再上传到 Enprato 学习。";
+  }
+  return text;
 }
 
 function friendlyAuthError(err: unknown): string {

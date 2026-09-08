@@ -21,7 +21,7 @@ VIDEO_EXTS = {".mp4", ".webm", ".mkv", ".m4v", ".mov", ".avi"}
 AUDIO_EXTS = {".m4a", ".mp3", ".opus", ".ogg", ".wav", ".aac"}
 SUB_EXTS = {".vtt", ".srt"}
 YTDLP_TIMEOUT_SEC = int(os.environ.get("ENPRATO_YTDLP_TIMEOUT", "600"))
-LOCAL_UPLOAD_HINT = "该链接暂时无法直接读取。你可以先将视频保存到本地，再上传到 Enprato 学习。"
+LOCAL_UPLOAD_HINT = "暂时无法直接读取该视频链接。你可以先将视频保存到本地，再上传到 Enprato 学习。"
 MEDIA_FORMATS = (
     "bv*[vcodec^=avc1][height<=480]+ba[ext=m4a]/bv*[ext=mp4][height<=480]+ba/b[height<=480][ext=mp4]",
     "bv*[vcodec^=avc1][height<=720]+ba[ext=m4a]/bv*[ext=mp4][height<=720]+ba/b[ext=mp4][height<=720]",
@@ -51,7 +51,7 @@ def ytdlp_cmd() -> list[str]:
 
 
 def ytdlp_network_args() -> list[str]:
-    return ["--socket-timeout", "30", "--retries", "2", "--fragment-retries", "2"]
+    return ["--socket-timeout", "20", "--retries", "1", "--fragment-retries", "1"]
 
 
 def parse_bilibili_bvid(url: str) -> str | None:
@@ -380,13 +380,15 @@ def ingest_url(url: str, folder: Path) -> tuple[Path, Path, str | None]:
     try:
         _download_with_retries(base, url)
     except RuntimeError as exc:
+        kind = classify_ingest_error(str(exc))
         logger.info(
-            "url_import_failed stage=media_download host=%s exception=%s elapsed_ms=%d",
+            "url_import_failed stage=media_download host=%s error_kind=%s exception=%s elapsed_ms=%d",
             preview,
+            kind,
             type(exc).__name__,
             _elapsed_ms(started),
         )
-        raise RuntimeError(_friendly_ytdlp_error(url, str(exc))) from exc
+        raise RuntimeError(public_url_import_error(exc)) from exc
     logger.info("media_download_done host=%s elapsed_ms=%d", preview, _elapsed_ms(started))
 
     media = _ensure_playable(folder)
@@ -401,12 +403,12 @@ def ingest_url(url: str, folder: Path) -> tuple[Path, Path, str | None]:
         ensure_playback_audio(folder, media)
     except Exception as exc:
         logger.info(
-            "url_import_failed stage=audio_extract host=%s exception=%s elapsed_ms=%d",
+            "url_import_failed stage=audio_extract host=%s error_kind=ffmpeg_failure exception=%s elapsed_ms=%d",
             preview,
             type(exc).__name__,
             _elapsed_ms(extract_started),
         )
-        raise
+        raise RuntimeError(public_url_import_error(exc)) from exc
     logger.info("audio_extract_done host=%s elapsed_ms=%d", preview, _elapsed_ms(extract_started))
     logger.info("subtitle_fetch_start host=%s", preview)
     captions = _read_captions(folder)
@@ -517,7 +519,9 @@ def _ytdlp_fetch(base: list[str], url: str) -> None:
             return
         except RuntimeError as exc:
             last = str(exc)
-            if is_retryable_ytdlp_error(url, last) or _is_timeout_error(last):
+            kind = classify_ytdlp_error(last)
+            if kind in {"http_412", "timeout", "network_unreachable"}:
+                logger.info("media_download_failed host=%s error_kind=%s format=%s", preview, kind, fmt.split("/")[0])
                 raise
     raise RuntimeError(last or "yt-dlp 失败")
 
@@ -528,23 +532,67 @@ def _is_timeout_error(detail: str) -> bool:
     return "超时" in text or "timed out" in low or "timeoutexpired" in low
 
 
+def _is_network_unreachable(detail: str) -> bool:
+    low = (detail or "").lower()
+    return (
+        "network is unreachable" in low
+        or "errno 101" in low
+        or "errno 51" in low
+        or "failed to establish a new connection" in low
+        or "no route to host" in low
+        or "connection refused" in low
+        or "errno 111" in low
+        or "errno 113" in low
+        or "name or service not known" in low
+        or "temporary failure in name resolution" in low
+        or "nodename nor servname" in low
+        or "connect call failed" in low
+    )
+
+
+def classify_ytdlp_error(detail: str) -> str:
+    text = detail or ""
+    low = text.lower()
+    if "412" in text or "precondition failed" in low:
+        return "http_412"
+    if _is_timeout_error(text):
+        return "timeout"
+    if _is_network_unreachable(text):
+        return "network_unreachable"
+    if "sign in to confirm" in low or "not a bot" in low:
+        return "ytdlp_blocked"
+    if "geo-restricted" in low or "deleted" in low:
+        return "ytdlp_unavailable"
+    return "ytdlp_failure"
+
+
+def classify_ingest_error(detail: str) -> str:
+    text = detail or ""
+    low = text.lower()
+    if "ffmpeg" in low:
+        return "ffmpeg_failure"
+    if "语音识别" in text or "分出句子" in text or "asr" in low:
+        return "asr_failure"
+    return classify_ytdlp_error(text)
+
+
 def _elapsed_ms(started: float) -> int:
     return int((time.monotonic() - started) * 1000)
 
 
 def _friendly_ytdlp_error(url: str, detail: str) -> str:
-    text = (detail or "").strip()
-    low = text.lower()
-    is_bili = is_bilibili_url(url) or "bilibili" in low
-    if is_bili and ("412" in text or "precondition failed" in low):
-        return LOCAL_UPLOAD_HINT
-    if _is_timeout_error(text):
-        return LOCAL_UPLOAD_HINT
-    if "sign in to confirm" in low or "not a bot" in low:
-        return LOCAL_UPLOAD_HINT
-    if "geo-restricted" in low or "deleted" in low:
-        return "视频可能已删除、需登录，或有地区限制。可换链接，或先下载到本地再上传。"
-    return text or "yt-dlp 拉取失败"
+    del url
+    del detail
+    return LOCAL_UPLOAD_HINT
+
+
+def public_url_import_error(exc: BaseException | str) -> str:
+    text = str(exc or "").strip()
+    if "无法从视频中分出句子" in text or "语音识别时间过长" in text:
+        return text
+    if "微信视频号" in text or "请粘贴 http" in text:
+        return text
+    return LOCAL_UPLOAD_HINT
 
 
 def _run(cmd: list[str], timeout: int | None = None) -> None:
@@ -561,9 +609,15 @@ def _run(cmd: list[str], timeout: int | None = None) -> None:
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError("下载超时，已停止等待") from exc
     if completed.returncode != 0:
-        detail = (completed.stderr or completed.stdout or "").strip()
-        lines = [line for line in detail.splitlines() if line.strip()]
-        raise RuntimeError(lines[-1] if lines else "yt-dlp 失败")
+        raise RuntimeError(_compact_cmd_error(completed.stderr, completed.stdout))
+
+
+def _compact_cmd_error(stderr: str | None, stdout: str | None) -> str:
+    detail = (stderr or stdout or "").strip()
+    lines = [line.strip() for line in detail.splitlines() if line.strip() and "traceback" not in line.lower()]
+    if not lines:
+        return "yt-dlp 失败"
+    return " | ".join(lines[-8:])
 
 
 def _pick_media(folder: Path) -> Path | None:
