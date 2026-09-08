@@ -36,7 +36,19 @@ from .auth import (
 )
 from .curated import list_curated_lessons
 from .dictionary import lookup_word, translate_en_zh
-from .ingest import classify_ingest_error, fetch_media_title, find_session_media, ingest_url, public_url_import_error, url_preview, validate_media_url
+from .ingest import (
+    classify_ingest_error,
+    fetch_media_title,
+    find_session_media,
+    ingest_url,
+    is_bilibili_url,
+    log_url_import_stage,
+    public_url_import_error,
+    read_import_title,
+    url_host_family,
+    url_preview,
+    validate_media_url,
+)
 from .license import activate_license, checkout_license, license_status, note_trial_use
 from .media import convert_to_wav, ensure_playback_audio, extract_wav, probe_duration
 from .payment import PaymentConfigError, mock_provider_enabled, provider_for
@@ -214,16 +226,16 @@ def _refund_failed_prepare(user: dict[str, Any], session_id: str) -> None:
         db.refund_trial(user["id"], "prepare:" + session_id)
 
 
-def _transcribe_import(audio: Path) -> list[dict[str, Any]]:
-    logger.info("asr_start")
+def _transcribe_import(audio: Path, host: str = "unknown") -> list[dict[str, Any]]:
+    log_url_import_stage(host, "asr_start")
     started = time.monotonic()
     try:
         with ThreadPoolExecutor(max_workers=1) as pool:
             sentences = pool.submit(transcribe_sentences, audio).result(timeout=ASR_IMPORT_TIMEOUT_SEC)
     except FuturesTimeoutError:
-        logger.info("url_import_failed stage=asr error_kind=asr_timeout exception=TimeoutError elapsed_ms=%d", int((time.monotonic() - started) * 1000))
+        log_url_import_stage(host, "asr", elapsed_ms=int((time.monotonic() - started) * 1000), error_kind="asr_timeout")
         raise HTTPException(400, "语音识别时间过长，已停止。请换较短的视频，或先下载到本地再上传。") from None
-    logger.info("asr_done elapsed_ms=%d sentences=%d", int((time.monotonic() - started) * 1000), len(sentences or []))
+    log_url_import_stage(host, "asr", elapsed_ms=int((time.monotonic() - started) * 1000), sentences=len(sentences or []))
     return sentences
 
 
@@ -236,9 +248,16 @@ def _finish_session(
     title: str = "",
     source_url: str = "",
     source_kind: str = "file",
+    host: str = "unknown",
 ) -> dict[str, Any]:
     if not sentences:
-        sentences = _transcribe_import(audio)
+        if not audio.is_file():
+            media = find_session_media(folder)
+            if media is None:
+                raise HTTPException(400, "无法从视频中分出句子，请补一份英文字幕文件")
+            extract_wav(media, audio)
+            ensure_playback_audio(folder, media)
+        sentences = _transcribe_import(audio, host=host)
     if not sentences:
         shutil.rmtree(folder, ignore_errors=True)
         raise HTTPException(400, "无法从视频中分出句子，请补一份英文字幕文件")
@@ -1336,8 +1355,9 @@ async def prepare_url(body: PrepareUrlBody, user: dict[str, Any] = Depends(requi
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     preview = url_preview(url)
+    host = url_host_family(url)
     started = time.monotonic()
-    logger.info("url_import_start host=%s", preview)
+    logger.info("url_import_start host=%s preview=%s", host, preview)
     existing = None if body.create_new_session else find_session_id_by_url(DATA, url)
     can_reuse = bool(existing) and (
         user["id"] == "lan-local" or db.owns_learning_session(existing, user["id"])
@@ -1362,25 +1382,31 @@ async def prepare_url(body: PrepareUrlBody, user: dict[str, Any] = Depends(requi
     try:
         _media, audio, caption_text = await run_in_threadpool(ingest_url, url, folder)
     except Exception as exc:
-        logger.info(
-            "url_import_failed stage=ingest host=%s error_kind=%s exception=%s elapsed_ms=%d",
-            preview,
-            classify_ingest_error(str(exc)),
-            type(exc).__name__,
-            int((time.monotonic() - started) * 1000),
+        log_url_import_stage(
+            host,
+            "ingest",
+            elapsed_ms=int((time.monotonic() - started) * 1000),
+            error_kind=classify_ingest_error(str(exc)),
+            exception=type(exc).__name__,
         )
         _refund_failed_prepare(user, session_id)
         shutil.rmtree(folder, ignore_errors=True)
         raise HTTPException(400, public_url_import_error(exc)) from exc
     sentences: list[dict[str, Any]] = []
     if caption_text:
+        split_started = time.monotonic()
+        log_url_import_stage(host, "splitter_start")
         sentences = _cues_from_text(caption_text)
-    logger.info("metadata_fetch_start host=%s", preview)
-    meta_started = time.monotonic()
-    display_title = await run_in_threadpool(fetch_media_title, url) or url
-    logger.info("metadata_fetch_done host=%s elapsed_ms=%d", preview, int((time.monotonic() - meta_started) * 1000))
+        log_url_import_stage(host, "splitter", elapsed_ms=int((time.monotonic() - split_started) * 1000), cues=len(sentences))
+        if not sentences:
+            log_url_import_stage(host, "splitter", subtitle_status="parse_failure", recovered="1")
+    display_title = read_import_title(folder)
+    if not display_title and is_bilibili_url(url):
+        display_title = await run_in_threadpool(fetch_media_title, url)
+    display_title = display_title or url
 
     def complete_url_session() -> dict[str, Any]:
+        log_url_import_stage(host, "session_create_start")
         return _finish_session(
             folder,
             session_id,
@@ -1389,24 +1415,26 @@ async def prepare_url(body: PrepareUrlBody, user: dict[str, Any] = Depends(requi
             title=display_title,
             source_url=url,
             source_kind="url",
+            host=host,
         )
 
     try:
         detail = await run_in_threadpool(complete_url_session)
-        logger.info(
-            "session_create_done host=%s session_id=%s elapsed_ms=%d",
-            preview,
-            session_id,
-            int((time.monotonic() - started) * 1000),
+        log_url_import_stage(
+            host,
+            "session_create",
+            elapsed_ms=int((time.monotonic() - started) * 1000),
+            session_id=session_id,
         )
+        log_url_import_stage(host, "total", elapsed_ms=int((time.monotonic() - started) * 1000))
         return detail
     except Exception as exc:
-        logger.info(
-            "url_import_failed stage=session_create host=%s error_kind=%s exception=%s elapsed_ms=%d",
-            preview,
-            classify_ingest_error(str(exc)),
-            type(exc).__name__,
-            int((time.monotonic() - started) * 1000),
+        log_url_import_stage(
+            host,
+            "session_create",
+            elapsed_ms=int((time.monotonic() - started) * 1000),
+            error_kind=classify_ingest_error(str(exc)),
+            exception=type(exc).__name__,
         )
         _refund_failed_prepare(user, session_id)
         shutil.rmtree(folder, ignore_errors=True)
@@ -1672,7 +1700,13 @@ async def score(
     folder = require_owned_session(session_id, user)
     original = folder / "audio.wav"
     if not original.is_file():
-        raise HTTPException(400, "原音频不存在")
+        media = find_session_media(folder)
+        if media is None:
+            raise HTTPException(400, "原音频不存在")
+        try:
+            extract_wav(media, original)
+        except Exception:
+            raise HTTPException(400, "原音频不存在") from None
     sentences = json.loads((folder / "sentences.json").read_text(encoding="utf-8"))
     reference = " ".join(item["text"] for item in sentences)
     raw = folder / f"user{Path(audio.filename or 'shadow.webm').suffix or '.webm'}"

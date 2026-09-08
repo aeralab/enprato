@@ -20,8 +20,13 @@ logger = logging.getLogger(__name__)
 VIDEO_EXTS = {".mp4", ".webm", ".mkv", ".m4v", ".mov", ".avi"}
 AUDIO_EXTS = {".m4a", ".mp3", ".opus", ".ogg", ".wav", ".aac"}
 SUB_EXTS = {".vtt", ".srt"}
+IMPORT_META_NAME = "import_meta.json"
 YTDLP_TIMEOUT_SEC = int(os.environ.get("ENPRATO_YTDLP_TIMEOUT", "600"))
+SUBTITLE_TIMEOUT_SEC = 90
+METADATA_TIMEOUT_SEC = 90
 LOCAL_UPLOAD_HINT = "暂时无法直接读取该视频链接。你可以先将视频保存到本地，再上传到 Enprato 学习。"
+MANUAL_EN_LANGS = ("en", "en-US", "en-GB")
+AUTO_EN_LANGS = ("en", "en-US")
 MEDIA_FORMATS = (
     "bv*[vcodec^=avc1][height<=480]+ba[ext=m4a]/bv*[ext=mp4][height<=480]+ba/b[height<=480][ext=mp4]",
     "bv*[vcodec^=avc1][height<=720]+ba[ext=m4a]/bv*[ext=mp4][height<=720]+ba/b[ext=mp4][height<=720]",
@@ -328,19 +333,184 @@ def validate_media_url(raw: str) -> str:
     return url
 
 
+def url_host_family(url: str) -> str:
+    if is_bilibili_url(url):
+        return "bilibili.com"
+    if is_youtube_url(url):
+        return "youtube.com"
+    try:
+        host = (urlparse(url or "").netloc or "").split("@")[-1].lower()
+    except Exception:
+        return "unknown"
+    return host or "unknown"
+
+
+def format_attempt_label(fmt: str) -> str:
+    if "height<=480" in (fmt or ""):
+        return "480"
+    if "height<=720" in (fmt or ""):
+        return "720"
+    return "audio"
+
+
+def log_url_import_stage(host: str, stage: str, elapsed_ms: int | None = None, **fields: object) -> None:
+    parts = [f"url_import_stage host={host} stage={stage}"]
+    if elapsed_ms is not None:
+        parts.append(f"elapsed_ms={elapsed_ms}")
+    for key, value in fields.items():
+        if value is None:
+            continue
+        parts.append(f"{key}={value}")
+    logger.info(" ".join(parts))
+
+
+def read_import_title(folder: Path) -> str | None:
+    path = folder / IMPORT_META_NAME
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    title = str(payload.get("title") or "").strip()
+    return title if title and not is_garbled_title(title) else None
+
+
+def read_subtitle_status(folder: Path) -> str:
+    path = folder / IMPORT_META_NAME
+    if not path.is_file():
+        return "unknown"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return "unknown"
+    return str(payload.get("subtitle_status") or "unknown")
+
+
+def _write_import_meta(folder: Path, **fields: object) -> None:
+    path = folder / IMPORT_META_NAME
+    current: dict[str, object] = {}
+    if path.is_file():
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                current = loaded
+        except Exception:
+            current = {}
+    for key, value in fields.items():
+        if value is None:
+            continue
+        current[key] = value
+    path.write_text(json.dumps(current, ensure_ascii=False), encoding="utf-8")
+
+
+def _usable_en_lang(key: str) -> bool:
+    text = (key or "").lower()
+    if not text or "live" in text:
+        return False
+    if "en-en" in text:
+        return False
+    return text == "en" or text.startswith("en-") or text.startswith("en_")
+
+
+def _first_english_lang(mapping: dict | None, prefer: tuple[str, ...]) -> str | None:
+    keys = [str(key) for key in (mapping or {})]
+    lower = {key.lower(): key for key in keys}
+    for pref in prefer:
+        found = lower.get(pref.lower())
+        if found:
+            return found
+    for key in keys:
+        if _usable_en_lang(key):
+            return key
+    return None
+
+
+def pick_english_sub_lang(info: dict | None) -> tuple[str | None, bool]:
+    payload = info or {}
+    manual = _first_english_lang(payload.get("subtitles") or {}, MANUAL_EN_LANGS)
+    if manual:
+        return manual, False
+    auto = _first_english_lang(payload.get("automatic_captions") or {}, AUTO_EN_LANGS)
+    if auto:
+        return auto, True
+    return None, False
+
+
 def ingest_url(url: str, folder: Path) -> tuple[Path, Path, str | None]:
     """Fetch playable media + optional English captions. Returns (video_or_audio, wav, captions_text)."""
     url = validate_media_url(url)
-    preview = url_preview(url)
+    host = url_host_family(url)
     started = time.monotonic()
     folder.mkdir(parents=True, exist_ok=True)
     ffmpeg = find_ffmpeg()
     ffmpeg_dir = str(Path(ffmpeg).parent)
     ytdlp = ytdlp_cmd()
-    out_tmpl = str(folder / "source.%(ext)s")
     cookies = os.environ.get("ENPRATO_COOKIES", "").strip()
-    logger.info("media_download_start host=%s cookies=%s", preview, "1" if cookies else "0")
+    base = _ytdlp_common_base(ytdlp, ffmpeg_dir, url, cookies)
+    audio = folder / "audio.wav"
 
+    meta_started = time.monotonic()
+    log_url_import_stage(host, "metadata_start")
+    info = _fetch_url_metadata(base, url, folder)
+    log_url_import_stage(host, "metadata", elapsed_ms=_elapsed_ms(meta_started))
+
+    sub_started = time.monotonic()
+    log_url_import_stage(host, "subtitle_start")
+    captions = _fetch_english_captions(base, url, folder, info)
+    log_url_import_stage(
+        host,
+        "subtitle",
+        elapsed_ms=_elapsed_ms(sub_started),
+        captions="1" if captions else "0",
+        subtitle_status=read_subtitle_status(folder),
+    )
+
+    try:
+        media_started = time.monotonic()
+        log_url_import_stage(host, "media_download_start")
+        _download_with_retries(_media_cmd_base(base, folder), url)
+        log_url_import_stage(host, "media_download", elapsed_ms=_elapsed_ms(media_started))
+    except RuntimeError as exc:
+        kind = classify_ingest_error(str(exc))
+        log_url_import_stage(
+            host,
+            "media_download",
+            elapsed_ms=_elapsed_ms(media_started),
+            error_kind=kind,
+            exception=type(exc).__name__,
+        )
+        raise RuntimeError(public_url_import_error(exc)) from exc
+
+    media = _ensure_playable(folder)
+    if media is None:
+        raise RuntimeError("链接能打开，但没有拿到可播放的音视频（可能有版权保护或地区限制）")
+
+    if captions:
+        log_url_import_stage(host, "audio_extract", elapsed_ms=0, skipped="captions")
+    else:
+        extract_started = time.monotonic()
+        log_url_import_stage(host, "audio_extract_start")
+        try:
+            extract_wav(media, audio)
+            ensure_playback_audio(folder, media)
+        except Exception as exc:
+            log_url_import_stage(
+                host,
+                "audio_extract",
+                elapsed_ms=_elapsed_ms(extract_started),
+                error_kind="ffmpeg_failure",
+                exception=type(exc).__name__,
+            )
+            raise RuntimeError(public_url_import_error(exc)) from exc
+        log_url_import_stage(host, "audio_extract", elapsed_ms=_elapsed_ms(extract_started))
+
+    adopt_downloaded_thumbnail(folder)
+    log_url_import_stage(host, "ingest_total", elapsed_ms=_elapsed_ms(started))
+    return media, audio, captions
+
+
+def _ytdlp_common_base(ytdlp: list[str], ffmpeg_dir: str, url: str, cookies: str) -> list[str]:
     base = [
         *ytdlp,
         "--no-playlist",
@@ -350,23 +520,9 @@ def ingest_url(url: str, folder: Path) -> tuple[Path, Path, str | None]:
         *ytdlp_network_args(),
         "--ffmpeg-location",
         ffmpeg_dir,
-        "--merge-output-format",
-        "mp4",
-        "--write-thumbnail",
-        "--convert-thumbnails",
-        "jpg",
-        "--write-subs",
-        "--write-auto-subs",
-        "--sub-langs",
-        "en.*,en",
-        "--convert-subs",
-        "vtt",
-        "-o",
-        out_tmpl,
     ]
     if cookies:
         base.extend(["--cookies", cookies])
-    # B 站偶发 412/风控：补浏览器 UA + Referer；失败则换直连重试
     if is_bilibili_url(url):
         base.extend(
             [
@@ -376,45 +532,103 @@ def ingest_url(url: str, folder: Path) -> tuple[Path, Path, str | None]:
                 "Referer:https://www.bilibili.com",
             ]
         )
+    return base
 
+
+def _media_cmd_base(base: list[str], folder: Path) -> list[str]:
+    return [
+        *base,
+        "--merge-output-format",
+        "mp4",
+        "--write-thumbnail",
+        "--convert-thumbnails",
+        "jpg",
+        "-o",
+        str(folder / "source.%(ext)s"),
+    ]
+
+
+def _fetch_url_metadata(base: list[str], url: str, folder: Path) -> dict:
+    host = url_host_family(url)
+    if is_bilibili_url(url):
+        bvid = parse_bilibili_bvid(url)
+        if bvid:
+            view = fetch_bilibili_view(bvid)
+            if view and view.get("title"):
+                _write_import_meta(folder, title=view["title"])
+        return {}
+    cmd = [*base, "--skip-download", "-j", url]
     try:
-        _download_with_retries(base, url)
-    except RuntimeError as exc:
-        kind = classify_ingest_error(str(exc))
-        logger.info(
-            "url_import_failed stage=media_download host=%s error_kind=%s exception=%s elapsed_ms=%d",
-            preview,
-            kind,
-            type(exc).__name__,
-            _elapsed_ms(started),
-        )
-        raise RuntimeError(public_url_import_error(exc)) from exc
-    logger.info("media_download_done host=%s elapsed_ms=%d", preview, _elapsed_ms(started))
-
-    media = _ensure_playable(folder)
-    if media is None:
-        raise RuntimeError("链接能打开，但没有拿到可播放的音视频（可能有版权保护或地区限制）")
-
-    audio = folder / "audio.wav"
-    extract_started = time.monotonic()
-    logger.info("audio_extract_start host=%s", preview)
-    try:
-        extract_wav(media, audio)
-        ensure_playback_audio(folder, media)
+        raw = _run_capture(cmd, timeout=METADATA_TIMEOUT_SEC)
+        payload = json.loads(raw)
     except Exception as exc:
-        logger.info(
-            "url_import_failed stage=audio_extract host=%s error_kind=ffmpeg_failure exception=%s elapsed_ms=%d",
-            preview,
-            type(exc).__name__,
-            _elapsed_ms(extract_started),
-        )
-        raise RuntimeError(public_url_import_error(exc)) from exc
-    logger.info("audio_extract_done host=%s elapsed_ms=%d", preview, _elapsed_ms(extract_started))
-    logger.info("subtitle_fetch_start host=%s", preview)
+        kind = classify_ytdlp_error(str(exc))
+        if kind == "subtitle_rate_limited":
+            _write_import_meta(folder, subtitle_status="rate_limited")
+        log_url_import_stage(host, "metadata", error_kind=kind, recovered="1")
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    title = str(payload.get("title") or "").strip()
+    if title and not is_garbled_title(title):
+        _write_import_meta(folder, title=title)
+    duration = payload.get("duration")
+    if isinstance(duration, (int, float)):
+        _write_import_meta(folder, duration=int(duration))
+    return {
+        "title": payload.get("title"),
+        "duration": payload.get("duration"),
+        "subtitles": payload.get("subtitles") or {},
+        "automatic_captions": payload.get("automatic_captions") or {},
+    }
+
+
+def _fetch_english_captions(base: list[str], url: str, folder: Path, info: dict | None) -> str | None:
+    host = url_host_family(url)
+    if read_subtitle_status(folder) == "rate_limited":
+        return None
+    lang, is_auto = pick_english_sub_lang(info)
+    if not lang and info:
+        _write_import_meta(folder, subtitle_status="unavailable")
+        log_url_import_stage(host, "subtitle", subtitle_status="unavailable")
+        return None
+    if not lang:
+        lang, is_auto = "en", False
+    out_tmpl = str(folder / "source.%(ext)s")
+    cmd = [*base, "--skip-download", "--convert-subs", "vtt", "-o", out_tmpl]
+    if is_auto:
+        cmd.extend(["--write-auto-subs", "--sub-langs", lang])
+    else:
+        cmd.extend(["--write-subs", "--sub-langs", lang])
+    last = ""
+    variants = ytdlp_cmd_variants(cmd, url)
+    for i, variant in enumerate(variants):
+        try:
+            _run([*variant, url], timeout=SUBTITLE_TIMEOUT_SEC)
+            last = ""
+            break
+        except RuntimeError as exc:
+            last = str(exc)
+            kind = classify_ytdlp_error(last)
+            if kind == "subtitle_rate_limited" or _is_http_429(last):
+                _write_import_meta(folder, subtitle_status="rate_limited")
+                log_url_import_stage(host, "subtitle", error_kind="subtitle_rate_limited", recovered="1")
+                return None
+            if kind in {"timeout", "network_unreachable"}:
+                _write_import_meta(folder, subtitle_status="unavailable")
+                log_url_import_stage(host, "subtitle", error_kind=kind, recovered="1")
+                return None
+            if is_retryable_ytdlp_error(url, last) and i < len(variants) - 1:
+                time.sleep(0.8)
+                continue
+            break
+    if last:
+        _write_import_meta(folder, subtitle_status="unavailable")
+        log_url_import_stage(host, "subtitle", error_kind=classify_ytdlp_error(last), recovered="1")
+        return None
     captions = _read_captions(folder)
-    logger.info("subtitle_fetch_done host=%s captions=%s", preview, "1" if captions else "0")
-    adopt_downloaded_thumbnail(folder)
-    return media, audio, captions
+    _write_import_meta(folder, subtitle_status="ok" if captions else "unavailable")
+    return captions
 
 
 def find_session_media(folder: Path) -> Path | None:
@@ -511,17 +725,35 @@ def _download_with_retries(base: list[str], url: str) -> None:
 
 def _ytdlp_fetch(base: list[str], url: str) -> None:
     last = ""
-    preview = url_preview(url)
+    host = url_host_family(url)
     for fmt in MEDIA_FORMATS:
+        label = format_attempt_label(fmt)
+        started = time.monotonic()
+        log_url_import_stage(host, "media_download", format_attempt=label, status="start")
         try:
-            logger.info("media_download_start host=%s format=%s", preview, fmt.split("/")[0])
             _run(base + ["-f", fmt, url])
+            log_url_import_stage(
+                host,
+                "media_download",
+                format_attempt=label,
+                elapsed_ms=_elapsed_ms(started),
+                status="ok",
+            )
             return
         except RuntimeError as exc:
             last = str(exc)
             kind = classify_ytdlp_error(last)
-            if kind in {"http_412", "timeout", "network_unreachable"}:
-                logger.info("media_download_failed host=%s error_kind=%s format=%s", preview, kind, fmt.split("/")[0])
+            log_url_import_stage(
+                host,
+                "media_download",
+                format_attempt=label,
+                elapsed_ms=_elapsed_ms(started),
+                status="fail",
+                error_kind=kind,
+            )
+            if kind in {"http_412", "timeout", "network_unreachable", "subtitle_rate_limited"}:
+                raise
+            if _is_http_429(last):
                 raise
     raise RuntimeError(last or "yt-dlp 失败")
 
@@ -550,9 +782,24 @@ def _is_network_unreachable(detail: str) -> bool:
     )
 
 
+def _is_http_429(detail: str) -> bool:
+    text = detail or ""
+    low = text.lower()
+    return "429" in text or "too many requests" in low
+
+
+def _is_subtitle_related(detail: str) -> bool:
+    low = (detail or "").lower()
+    return "subtitle" in low or "subtitles" in low or "caption" in low
+
+
 def classify_ytdlp_error(detail: str) -> str:
     text = detail or ""
     low = text.lower()
+    if _is_subtitle_related(text) and _is_http_429(text):
+        return "subtitle_rate_limited"
+    if _is_subtitle_related(text):
+        return "subtitle_unavailable"
     if "412" in text or "precondition failed" in low:
         return "http_412"
     if _is_timeout_error(text):
@@ -596,6 +843,15 @@ def public_url_import_error(exc: BaseException | str) -> str:
 
 
 def _run(cmd: list[str], timeout: int | None = None) -> None:
+    _run_completed(cmd, timeout=timeout)
+
+
+def _run_capture(cmd: list[str], timeout: int | None = None) -> str:
+    completed = _run_completed(cmd, timeout=timeout)
+    return completed.stdout or ""
+
+
+def _run_completed(cmd: list[str], timeout: int | None = None) -> subprocess.CompletedProcess[str]:
     limit = YTDLP_TIMEOUT_SEC if timeout is None else timeout
     try:
         completed = subprocess.run(
@@ -610,6 +866,7 @@ def _run(cmd: list[str], timeout: int | None = None) -> None:
         raise RuntimeError("下载超时，已停止等待") from exc
     if completed.returncode != 0:
         raise RuntimeError(_compact_cmd_error(completed.stderr, completed.stdout))
+    return completed
 
 
 def _compact_cmd_error(stderr: str | None, stdout: str | None) -> str:
