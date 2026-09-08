@@ -655,11 +655,23 @@ export default function App() {
   if (authLoading) {
     return (
       <div className="auth-gate">
-        <div className="auth-gate-card">
-          <strong>ENPRATO</strong>
-          <p>正在确认登录状态…</p>
+        <div className="auth-gate-panel">
+          <p className="auth-wordmark">ENPRATO</p>
+          <p className="auth-status">正在确认登录状态…</p>
         </div>
       </div>
+    );
+  }
+
+  if (import.meta.env.DEV && new URLSearchParams(window.location.search).get("previewLogin") === "1") {
+    return (
+      <AuthScreen
+        error={authError}
+        onAuthed={(next) => {
+          setUser(next);
+          setAuthError("");
+        }}
+      />
     );
   }
 
@@ -1033,11 +1045,10 @@ function friendlyAuthError(err: unknown): string {
 function AuthScreen({ error, onAuthed }: { error: string; onAuthed: (user: CurrentUser) => void }) {
   return (
     <div className="auth-gate">
-      <div className="auth-gate-card">
-        <p className="eyebrow">ENPRATO</p>
-        <p className="auth-manifesto">
-          本应用根据某位明显在节目里介绍的语言学习方法而产生。希望所有学习外语的人，都能根据这个方法，使用本平台高效地掌握一门陌生的语言。
-        </p>
+      <div className="auth-gate-panel">
+        <p className="auth-wordmark">ENPRATO</p>
+        <h1>学习你感兴趣的语言，<br className="auth-title-break" />用最快的时间掌握它。</h1>
+        <p className="auth-lead">导入你喜欢的视频或音频，通过听、说、写反复练习。</p>
         <PhoneAuthForm error={error} onAuthed={onAuthed} />
       </div>
     </div>
@@ -1114,19 +1125,20 @@ function PhoneAuthForm({
     <form className="auth-form" onSubmit={(event) => void submit(event)}>
       <label>
         <span>手机号</span>
-        <input type="tel" inputMode="numeric" autoComplete="tel" value={phone} onChange={(e) => setPhone(e.target.value)} required />
+        <input type="tel" inputMode="numeric" autoComplete="tel" placeholder="请输入手机号" value={phone} onChange={(e) => setPhone(e.target.value)} required />
       </label>
       <div className="auth-code-row">
         <label>
           <span>验证码</span>
-          <input type="text" inputMode="numeric" autoComplete="one-time-code" value={code} onChange={(e) => setCode(e.target.value)} required maxLength={6} />
+          <input type="text" inputMode="numeric" autoComplete="one-time-code" placeholder="请输入验证码" value={code} onChange={(e) => setCode(e.target.value)} required maxLength={6} />
         </label>
-        <button type="button" className="ghost" disabled={busy || cooldown > 0} onClick={() => void sendCode()}>
+        <button type="button" className="auth-send-code" disabled={busy || cooldown > 0} onClick={() => void sendCode()}>
           {cooldown > 0 ? `${cooldown}s` : "获取验证码"}
         </button>
       </div>
       {message ? <p className="err">{message}</p> : null}
       <button className="primary" type="submit" disabled={busy}>{busy ? "请稍候…" : "登录 / 注册"}</button>
+      <p className="auth-legal">登录即表示你同意相关服务条款与隐私政策</p>
     </form>
   );
 }
