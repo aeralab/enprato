@@ -298,6 +298,8 @@ class ProgressBody(BaseModel):
     highlights: list[dict[str, Any]] | None = None
     score: dict[str, Any] | None = None
     orientation: str | None = None
+    source_session_id: str | None = None
+    save_reason: str | None = None
 
 
 class LearningCompleteBody(BaseModel):
@@ -1492,6 +1494,14 @@ def api_session(session_id: str, user: dict[str, Any] = Depends(require_session_
 
 @app.patch("/api/session/{session_id}")
 def api_save_progress(session_id: str, body: ProgressBody, user: dict[str, Any] = Depends(require_session_access)) -> dict[str, str]:
+    source = str(body.source_session_id or "").strip()
+    if source and source != session_id:
+        logging.getLogger("enprato.progress").warning(
+            "rejected progress patch: source_session_id=%s target=%s",
+            source,
+            session_id,
+        )
+        raise HTTPException(400, "source_session_id mismatch")
     folder = require_owned_session(session_id, user)
     fields: dict[str, Any] = {
         "phase": body.phase,

@@ -9,6 +9,8 @@ export type ProgressPayload = {
   highlights: { sentenceId: number; word: string }[];
   score: ShadowScore | null;
   orientation: string;
+  source_session_id?: string;
+  save_reason?: string;
 };
 
 export function snapshotProgressBody(payload: ProgressPayload): Record<string, unknown> {
@@ -19,6 +21,8 @@ export function snapshotProgressBody(payload: ProgressPayload): Record<string, u
     score: payload.score,
     orientation: payload.orientation,
   };
+  if (payload.source_session_id) body.source_session_id = payload.source_session_id;
+  if (payload.save_reason) body.save_reason = payload.save_reason;
   if (payload.drafts) {
     body.drafts = Object.fromEntries(
       Object.entries(payload.drafts).map(([key, value]) => [String(key), String(value ?? "")]),

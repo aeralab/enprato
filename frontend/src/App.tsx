@@ -16,7 +16,7 @@ import {
   loadSession,
   prepareSession,
   prepareSessionFromUrl,
-  saveProgress,
+  saveProgress as postProgress,
   scoreShadow,
   speakerPlay,
   speakerStop,
@@ -34,6 +34,7 @@ import { resumeTimeInSentence, splitWords } from "./diffWords";
 import { applyBurnWipeLayout } from "./videoBurnLayout";
 import {
   createLoadGate,
+  captureLearningSnapshot,
   draftsCacheKey,
   fullDraftSnapshot,
   LEGACY_DRAFTS_CACHE_PREFIX,
@@ -577,8 +578,9 @@ export default function App() {
     setAudioUrl(`${mediaSrc(detail.audio_url || `/api/session/${detail.session_id}/audio`)}?v=1`);
     setOrientation(detail.orientation === "portrait" ? "portrait" : "landscape");
     const drafts = loadDraftsForSession(detail, draftsUserId);
+    const resumeAt = resumeSentenceIndex(detail.sentences.length, drafts, detail.index || 0);
     setResumeDrafts(drafts);
-    setResumeIndex(resumeSentenceIndex(detail.sentences.length, drafts, detail.index || 0));
+    setResumeIndex(resumeAt);
     setResumeHighlights(detail.highlights || []);
     setResumeScore(detail.score || null);
     setResumeHasVideo(detail.has_video ?? true);
@@ -1731,6 +1733,8 @@ function Studio({
   const streamRef = useRef<MediaStream | null>(null);
   const draftsRef = useRef<Record<number, string>>({ ...initialDrafts });
   const sessionIdRef = useRef(sessionId);
+  const boundSessionRef = useRef(sessionId);
+  const boundSentenceCountRef = useRef(sentences.length);
   const sentencesRef = useRef(sentences);
   const scrubbingRef = useRef(false);
   const skipAutoPlayRef = useRef(false);
@@ -1788,8 +1792,6 @@ function Studio({
   const [draftCanRestore, setDraftCanRestore] = useState(false);
   const stripRef = useRef<HTMLDivElement>(null);
   const stripBrowseUntilRef = useRef(0);
-  sessionIdRef.current = sessionId;
-  sentencesRef.current = sentences;
 
   const sentence = sentences[index];
   const overlayEnglish =
@@ -1817,6 +1819,7 @@ function Studio({
       highlights: { sentenceId: number; word: string }[];
       score: ShadowScore | null;
       orientation: string;
+      save_reason?: string;
     },
     options?: { includeIndex?: boolean },
   ) {
@@ -1826,12 +1829,46 @@ function Studio({
   }
 
   function currentDraftSnapshot(source: Record<number, string> = draftsRef.current) {
-    return fullDraftSnapshot(source, sentencesRef.current.length);
+    return fullDraftSnapshot(source, boundSentenceCountRef.current);
   }
 
-  function persistDraftsCache(source: Record<number, string> = draftsRef.current, indexValue = indexRef.current) {
-    if (!sessionIdRef.current) return;
-    writeDraftsCache(draftsUserId, sessionIdRef.current, currentDraftSnapshot(source), indexValue);
+  function persistDraftsCache(
+    source: Record<number, string> = draftsRef.current,
+    indexValue = indexRef.current,
+    _reason = "cache",
+  ) {
+    const snap = captureLearningSnapshot({
+      sessionId: boundSessionRef.current,
+      drafts: source,
+      index: indexValue,
+      sentenceCount: boundSentenceCountRef.current,
+    });
+    if (!snap.sessionId) return;
+    writeDraftsCache(draftsUserId, snap.sessionId, snap.drafts, snap.index);
+  }
+
+  function saveProgress(
+    sid: string,
+    payload: Parameters<typeof postProgress>[1],
+    options?: Parameters<typeof postProgress>[2],
+  ) {
+    const snap = captureLearningSnapshot({
+      sessionId: boundSessionRef.current || sid,
+      drafts: payload.drafts ?? draftsRef.current,
+      index: payload.index ?? indexRef.current,
+      sentenceCount: boundSentenceCountRef.current,
+    });
+    return postProgress(
+      snap.sessionId,
+      {
+        ...payload,
+        drafts: payload.drafts ?? snap.drafts,
+        index: payload.index ?? snap.index,
+        source_session_id: snap.sessionId,
+        save_reason: payload.save_reason,
+      },
+      options,
+    );
   }
 
   function restoreDraftEdits() {
@@ -2102,6 +2139,11 @@ function Studio({
   }, [captionMode, overlayEnglish, index, sentences, zhMap]);
 
   useEffect(() => {
+    sessionIdRef.current = sessionId;
+    sentencesRef.current = sentences;
+  }, [sessionId, sentences]);
+
+  useEffect(() => {
     if (!sessionId) return;
     const timer = window.setTimeout(() => {
       void saveProgress(
@@ -2113,6 +2155,7 @@ function Studio({
           highlights,
           score,
           orientation,
+          save_reason: "autosave-250",
         }),
       );
       persistDraftsCache( draftsRef.current, indexRef.current);
@@ -2137,6 +2180,7 @@ function Studio({
           highlights,
           score,
           orientation,
+          save_reason: "autosave-120",
         }),
       );
       persistDraftsCache( draftsRef.current, indexRef.current);
@@ -2167,10 +2211,11 @@ function Studio({
           highlights,
           score,
           orientation,
+          save_reason: "unmount-flush",
         }),
         { keepalive: true },
       );
-      persistDraftsCache( draftsRef.current, indexRef.current);
+      persistDraftsCache(draftsRef.current, indexRef.current, "unmount-flush");
     };
     const onHide = () => {
       if (document.visibilityState === "hidden") flush();
@@ -2367,8 +2412,9 @@ function Studio({
         highlights,
         score,
         orientation,
+        save_reason: "switch-session",
       });
-      persistDraftsCache( draftsRef.current, indexRef.current);
+      persistDraftsCache(draftsRef.current, indexRef.current, "switch-session");
       await onSwitchSession(nextId);
       await onRefreshHistory();
     } catch (err) {

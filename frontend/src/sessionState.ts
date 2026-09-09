@@ -22,6 +22,36 @@ export function fullDraftSnapshot(
   return out;
 }
 
+export type LearningSnapshot = {
+  sessionId: string;
+  drafts: Record<number, string>;
+  index: number;
+  sentenceCount: number;
+  draftCount: number;
+  completedCount: number;
+};
+
+export function captureLearningSnapshot(state: {
+  sessionId: string;
+  drafts: Record<number, string> | undefined;
+  index: number;
+  sentenceCount: number;
+}): LearningSnapshot {
+  const drafts = fullDraftSnapshot(state.drafts, state.sentenceCount);
+  let completedCount = 0;
+  for (const value of Object.values(drafts)) {
+    if (value.trim()) completedCount += 1;
+  }
+  return {
+    sessionId: state.sessionId,
+    drafts,
+    index: state.index,
+    sentenceCount: state.sentenceCount,
+    draftCount: Object.keys(drafts).length,
+    completedCount,
+  };
+}
+
 export function createLoadGate() {
   let gen = 0;
   return {
