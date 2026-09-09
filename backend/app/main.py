@@ -1466,6 +1466,14 @@ def api_session(session_id: str, user: dict[str, Any] = Depends(require_session_
     return detail
 
 
+@app.get("/api/session/{session_id}/media")
+def api_session_media(session_id: str, user: dict[str, Any] = Depends(require_session_access)) -> dict[str, Any]:
+    folder = require_owned_session(session_id, user)
+    from .bilibili_media import media_payload
+
+    return media_payload(folder, session_id)
+
+
 @app.patch("/api/session/{session_id}")
 def api_save_progress(session_id: str, body: ProgressBody, user: dict[str, Any] = Depends(require_session_access)) -> dict[str, str]:
     source = str(body.source_session_id or "").strip()

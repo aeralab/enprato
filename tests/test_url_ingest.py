@@ -22,6 +22,7 @@ def _isolate_env():
         "auth": os.environ.get("ENPRATO_REQUIRE_AUTH"),
         "secure": os.environ.get("ENPRATO_COOKIE_SECURE"),
         "asr": os.environ.get("ENPRATO_ASR_BACKEND"),
+        "media_kick": patch("backend.app.bilibili_media.kick_bilibili_media"),
     }
     db.DB_PATH = Path(tmp.name) / "url-ingest.sqlite3"
     main.DATA = Path(tmp.name) / "sessions"
@@ -30,6 +31,7 @@ def _isolate_env():
     os.environ.pop("ENPRATO_REQUIRE_AUTH", None)
     os.environ["ENPRATO_COOKIE_SECURE"] = "0"
     os.environ["ENPRATO_ASR_BACKEND"] = "whisper"
+    old["media_kick"].start()
     return tmp, old
 
 
@@ -51,6 +53,9 @@ def _restore_env(tmp, old):
         os.environ.pop("ENPRATO_ASR_BACKEND", None)
     else:
         os.environ["ENPRATO_ASR_BACKEND"] = old["asr"]
+    patcher = old.get("media_kick")
+    if patcher:
+        patcher.stop()
     tmp.cleanup()
 
 

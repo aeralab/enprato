@@ -29,12 +29,14 @@ import {
   fetchRemoteInbox,
   fetchRemoteState,
   fetchProgress,
+  fetchSessionMedia,
   translateSentence,
   transcribeUtterance,
   warmupAsr,
 } from "./api";
 import { resumeTimeInSentence, splitWords } from "./diffWords";
 import { applyBurnWipeLayout } from "./videoBurnLayout";
+import { audioOnlyPanel, inferInitialMediaStatus, shouldAcceptMediaPoll, type SessionMediaStatus } from "./mediaStatus";
 import {
   createLoadGate,
   captureLearningSnapshot,
@@ -437,6 +439,7 @@ export default function App() {
   const [resumeHighlights, setResumeHighlights] = useState<Highlight[]>([]);
   const [resumeScore, setResumeScore] = useState<ShadowScore | null>(null);
   const [resumeHasVideo, setResumeHasVideo] = useState(true);
+  const [resumeMediaStatus, setResumeMediaStatus] = useState<SessionMediaStatus>("audio");
   const [progressFloor, setProgressFloor] = useState(0);
   const [license, setLicense] = useState<LicenseStatus | null>(null);
   const [user, setUser] = useState<CurrentUser | null>(null);
@@ -612,6 +615,7 @@ export default function App() {
     setResumeHighlights(detail.highlights || []);
     setResumeScore(detail.score || null);
     setResumeHasVideo(detail.has_video ?? true);
+    setResumeMediaStatus(inferInitialMediaStatus(detail.has_video, detail.source_url));
     setProgressFloor(detail.progress_floor || 0);
     localStorage.setItem(LAST_SESSION_KEY, detail.session_id);
     setPhase(restored);
@@ -815,7 +819,8 @@ export default function App() {
             initialDrafts={resumeDrafts}
             initialHighlights={resumeHighlights}
             initialScore={resumeScore}
-            audioOnly={!resumeHasVideo}
+            initialHasVideo={resumeHasVideo}
+            initialMediaStatus={resumeMediaStatus}
             progressFloor={progressFloor}
             history={history}
             onOrientation={setOrientation}
@@ -1733,7 +1738,8 @@ function Studio({
   initialDrafts,
   initialHighlights,
   initialScore,
-  audioOnly = false,
+  initialHasVideo = true,
+  initialMediaStatus = "audio",
   progressFloor = 0,
   history,
   onOrientation,
@@ -1753,7 +1759,8 @@ function Studio({
   initialDrafts: Record<number, string>;
   initialHighlights: Highlight[];
   initialScore: ShadowScore | null;
-  audioOnly?: boolean;
+  initialHasVideo?: boolean;
+  initialMediaStatus?: SessionMediaStatus;
   progressFloor?: number;
   history: SessionSummary[];
   onOrientation: (value: Orientation) => void;
@@ -1821,7 +1828,14 @@ function Studio({
   }, [ipadStudio]);
   const [phonePaired, setPhonePaired] = useState(false);
   const [switchingSession, setSwitchingSession] = useState(false);
-  const [localAudioOnly, setLocalAudioOnly] = useState(audioOnly);
+  const [hasVideo, setHasVideo] = useState(initialHasVideo);
+  const [mediaStatus, setMediaStatus] = useState<SessionMediaStatus>(
+    initialHasVideo ? "ready" : initialMediaStatus,
+  );
+  const [playerSrc, setPlayerSrc] = useState(videoUrl);
+  const pendingSeekRef = useRef<{ time: number; play: boolean; sessionId: string } | null>(null);
+  const switchingMediaRef = useRef(false);
+  const hasVideoRef = useRef(initialHasVideo);
   const remoteAfterRef = useRef(0);
   const userPausedRef = useRef(userPaused);
   const draftLocalEditUntilRef = useRef(0);
@@ -1839,7 +1853,8 @@ function Studio({
   const overlayZh = zhMap[overlayEnglish] || "";
 
   const captionLabel = captionMode === "off" ? "字幕：关" : captionMode === "en" ? "字幕：英语" : "字幕：双语";
-  const showAudioOnly = localAudioOnly || audioOnly;
+  const showAudioOnly = !hasVideo;
+  const audioOnlyCopy = audioOnlyPanel(mediaStatus, hasVideo);
 
   function draftContentEnd(text: string): number {
     if (!text.trim()) return 0;
@@ -2159,7 +2174,7 @@ function Studio({
       video.removeEventListener("loadedmetadata", sync);
       window.removeEventListener("resize", sync);
     };
-  }, [orientation, showAudioOnly, videoUrl]);
+  }, [orientation, showAudioOnly, playerSrc]);
 
   useEffect(() => {
     if (captionMode !== "bi") return;
@@ -2180,8 +2195,57 @@ function Studio({
 
   useEffect(() => {
     sessionIdRef.current = sessionId;
+    boundSessionRef.current = sessionId;
     sentencesRef.current = sentences;
+    switchingMediaRef.current = false;
   }, [sessionId, sentences]);
+
+  useEffect(() => {
+    hasVideoRef.current = hasVideo;
+  }, [hasVideo]);
+
+  useEffect(() => {
+    if (hasVideo) return;
+    const bound = sessionId;
+    let cancelled = false;
+    const tick = async () => {
+      if (cancelled || boundSessionRef.current !== bound) return;
+      try {
+        const data = await fetchSessionMedia(bound);
+        if (cancelled || boundSessionRef.current !== bound) return;
+        if (!shouldAcceptMediaPoll(bound, data.session_id)) return;
+        const status = (data.status || "audio") as SessionMediaStatus;
+        if (!data.has_video) {
+          setMediaStatus(status);
+          return;
+        }
+        if (switchingMediaRef.current) return;
+        switchingMediaRef.current = true;
+        const node = videoRef.current;
+        const wasPaused = node ? node.paused : true;
+        const time = node && Number.isFinite(node.currentTime) ? node.currentTime : sentencesRef.current[indexRef.current]?.start ?? 0;
+        pendingSeekRef.current = { time, play: !wasPaused, sessionId: bound };
+        const nextSrc = `/api/session/${bound}/video?v=${Date.now()}`;
+        if (node) {
+          node.src = nextSrc;
+          try {
+            node.load();
+          } catch {
+            /* Safari applies the new media source on load() */
+          }
+        }
+        setPlayerSrc(nextSrc);
+      } catch {
+        /* keep audio-only until the next poll */
+      }
+    };
+    void tick();
+    const timer = window.setInterval(() => void tick(), 2500);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [sessionId, hasVideo]);
 
   useEffect(() => {
     if (!sessionId) return;
@@ -2411,7 +2475,7 @@ function Studio({
     hideTracks();
     node.addEventListener("loadedmetadata", hideTracks);
     return () => node.removeEventListener("loadedmetadata", hideTracks);
-  }, [videoUrl]);
+  }, [playerSrc]);
 
   useEffect(() => {
     return () => {
@@ -3044,18 +3108,20 @@ function Studio({
           <div ref={monitorRef} className={`monitor hide-burn-subs${showAudioOnly ? " audio-only" : ""}`}>
             {showAudioOnly ? (
               <div className="audio-only-panel" aria-hidden="true">
-                <strong>仅音频，无画面</strong>
-                <p>本课导入时只拉到了声音。可听写、跟读；若要画面请重新导入或上传带画面的文件。</p>
+                <strong>{audioOnlyCopy.title}</strong>
+                <p>{audioOnlyCopy.body}</p>
               </div>
             ) : null}
             <div className="monitor-clip">
               <video
                 ref={videoRef}
-                src={videoUrl}
+                src={playerSrc}
                 playsInline
                 preload="auto"
                 onError={() => {
-                  setError("原片加载失败，请回课单重新打开或重新导入");
+                  switchingMediaRef.current = false;
+                  if (!hasVideoRef.current) return;
+                  setError("原片加载失败，可继续用音频学习");
                 }}
                 onLoadedMetadata={() => {
                   const node = videoRef.current;
@@ -3069,21 +3135,43 @@ function Studio({
                     /* ignore */
                   }
                   if (Number.isFinite(node.duration) && node.duration > 0) setDuration(node.duration);
-                  if (!node.videoWidth) setLocalAudioOnly(true);
-                  else if (node.videoWidth) {
-                    onOrientation(orientationFromSize(node.videoWidth, node.videoHeight));
-                    applyBurnWipeLayout(monitorRef.current, node, orientationFromSize(node.videoWidth, node.videoHeight));
+                  const pending = pendingSeekRef.current;
+                  const isHotSwitch = Boolean(pending && pending.sessionId === boundSessionRef.current);
+                  if (isHotSwitch && pending) {
+                    pendingSeekRef.current = null;
+                    try {
+                      node.currentTime = pending.time;
+                    } catch {
+                      /* Safari may reject until seekable */
+                    }
+                    setNow(node.currentTime);
+                    if (pending.play) {
+                      void node.play().catch(() => undefined);
+                    } else {
+                      try {
+                        node.pause();
+                      } catch {
+                        /* ignore */
+                      }
+                    }
+                  } else {
+                    try {
+                      const t = sentences[indexRef.current]?.start ?? 0.05;
+                      node.currentTime = Math.max(0.05, t);
+                      setNow(node.currentTime);
+                    } catch {
+                      /* ignore */
+                    }
+                  }
+                  if (node.videoWidth) {
+                    setHasVideo(true);
+                    setMediaStatus("ready");
+                    const nextOrientation = orientationFromSize(node.videoWidth, node.videoHeight);
+                    applyBurnWipeLayout(monitorRef.current, node, nextOrientation);
+                    if (!isHotSwitch) onOrientation(nextOrientation);
                   }
                   for (const track of Array.from(node.textTracks)) {
                     track.mode = "disabled";
-                  }
-                  // 拉一帧到句首，避免黑屏
-                  try {
-                    const t = sentences[indexRef.current]?.start ?? 0.05;
-                    node.currentTime = Math.max(0.05, t);
-                    setNow(node.currentTime);
-                  } catch {
-                    /* ignore */
                   }
                 }}
                 onDurationChange={() => {

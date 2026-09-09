@@ -42,6 +42,8 @@ class AsyncUrlImportTests(unittest.TestCase):
         os.environ["ENPRATO_REQUIRE_AUTH"] = "1"
         os.environ["ENPRATO_COOKIE_SECURE"] = "0"
         os.environ["ENPRATO_ASR_BACKEND"] = "whisper"
+        self.media_kick = patch("backend.app.bilibili_media.kick_bilibili_media")
+        self.media_kick.start()
 
     def tearDown(self):
         try:
@@ -65,6 +67,7 @@ class AsyncUrlImportTests(unittest.TestCase):
             os.environ.pop("DASHSCOPE_API_KEY", None)
         else:
             os.environ["DASHSCOPE_API_KEY"] = self.old["dashscope"]
+        self.media_kick.stop()
         self.tmp.cleanup()
 
     def _client(self, email: str) -> TestClient:

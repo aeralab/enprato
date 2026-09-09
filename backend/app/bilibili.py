@@ -11,7 +11,7 @@ import urllib.request
 from pathlib import Path
 from urllib.parse import parse_qs, urljoin, urlparse
 
-from .media import run_ffmpeg
+from .media import run_ffmpeg, stream_codec
 
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 REFERER = "https://www.bilibili.com/"
@@ -542,3 +542,77 @@ def ingest_bilibili(url: str, folder: Path, *, include_video: bool = False) -> t
     view["captions"] = bool(captions)
     view["audio_only"] = not include_video
     return dest, captions, view
+
+
+def source_mp4_complete(folder: Path) -> bool:
+    path = folder / "source.mp4"
+    if not path.is_file() or path.stat().st_size < 1000:
+        return False
+    return bool(stream_codec(path, "v")) and bool(stream_codec(path, "a"))
+
+
+def _confirm_av_streams(path: Path) -> None:
+    if not path.is_file() or path.stat().st_size < 1000:
+        raise BilibiliIngestError("bilibili_merge_failed", "merged file missing")
+    if not stream_codec(path, "v") or not stream_codec(path, "a"):
+        raise BilibiliIngestError("bilibili_merge_failed", "merged streams missing")
+
+
+def prepare_bilibili_video(url: str, folder: Path) -> dict:
+    """Download video DASH only and merge with existing playback.m4a. Never downloads audio."""
+    started = time.monotonic()
+    playback = folder / "playback.m4a"
+    if not playback.is_file() or playback.stat().st_size < 200:
+        raise BilibiliIngestError("bilibili_audio_missing", "playback.m4a missing")
+    if source_mp4_complete(folder):
+        return {
+            "skipped": True,
+            "t_video_download_ms": 0,
+            "t_video_merge_ms": 0,
+            "elapsed_ms": 0,
+        }
+    folder.mkdir(parents=True, exist_ok=True)
+    view = fetch_view(url)
+    play = fetch_playurl(view["bvid"], view["cid"])
+    dash = play.get("dash") if isinstance(play.get("dash"), dict) else None
+    dest = folder / "source.mp4"
+    tmp = folder / "source.mp4.tmp"
+    video_part = folder / "dash_video.m4s"
+    t_download = 0.0
+    t_merge = 0.0
+    try:
+        if tmp.exists():
+            tmp.unlink()
+        if dash:
+            video = pick_dash_video(dash.get("video") or [])
+            if not video:
+                raise BilibiliIngestError("bilibili_playurl_failed", "dash video missing")
+            t0 = time.monotonic()
+            download_with_backups(_stream_urls(video), video_part)
+            t_download = time.monotonic() - t0
+            t1 = time.monotonic()
+            merge_dash(video_part, playback, tmp)
+            t_merge = time.monotonic() - t1
+        else:
+            raise BilibiliIngestError("bilibili_playurl_failed", "dash video missing")
+        _confirm_av_streams(tmp)
+        tmp.replace(dest)
+    except Exception:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
+        raise
+    finally:
+        try:
+            if video_part.exists():
+                video_part.unlink()
+        except OSError:
+            pass
+    return {
+        "skipped": False,
+        "t_video_download_ms": int(t_download * 1000),
+        "t_video_merge_ms": int(t_merge * 1000),
+        "elapsed_ms": int((time.monotonic() - started) * 1000),
+    }

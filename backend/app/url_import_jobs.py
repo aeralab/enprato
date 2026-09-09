@@ -413,6 +413,23 @@ def run_job(job: dict[str, Any]) -> None:
             session_id,
             ready_ms,
         )
+        try:
+            from .bilibili_media import kick_bilibili_media
+
+            kick_bilibili_media(
+                url=url,
+                folder=folder,
+                session_id=session_id,
+                job_id=job_id,
+                host=host,
+                started=started,
+            )
+        except Exception:
+            logger.exception(
+                "url_import_job media_kick_failed job_id=%s session_id=%s",
+                job_id,
+                session_id,
+            )
     except Exception as exc:
         detail = str(getattr(exc, "detail", "") or exc)
         kind = classify_ingest_error(detail)

@@ -260,6 +260,7 @@ class UserIsolationTests(unittest.TestCase):
         patch = self.b.patch("/api/session/" + sid, json={"index": 0, "drafts": {"0": "hello world today"}, "phase": "dictate"})
         self.assertEqual(patch.status_code, 404)
         self.assertEqual(self.b.get("/api/session/" + sid + "/video").status_code, 404)
+        self.assertEqual(self.b.get("/api/session/" + sid + "/media").status_code, 404)
 
     def test_progress_is_per_user(self):
         a_id = self.a.get("/api/auth/me").json()["user"]["id"]

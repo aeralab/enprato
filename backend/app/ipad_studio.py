@@ -3,7 +3,7 @@ from __future__ import annotations
 _IPAD_BTN_SPEAK = "\u8bf4\u8bdd"
 _IPAD_BTN_STOP = "\u505c\u6b62"
 # 改 iPad 页后递增；固定入口 /ipad 会跳到最新版，页内也会自动检测并刷新
-IPAD_BUILD = "20260906a"
+IPAD_BUILD = "20260909a"
 
 IPAD_PAGE = """<!DOCTYPE html>
 <html lang="zh-CN">
@@ -93,6 +93,22 @@ IPAD_PAGE = """<!DOCTYPE html>
       object-fit: contain;
       object-position: center center;
     }
+    .media-hint {
+      position: absolute;
+      left: 12px;
+      right: 12px;
+      bottom: 14px;
+      z-index: 7;
+      padding: 10px 12px;
+      border-radius: 10px;
+      background: rgba(0,0,0,0.62);
+      color: #fff;
+      font-size: 0.86rem;
+      line-height: 1.35;
+      pointer-events: none;
+    }
+    .media-hint[hidden] { display: none; }
+    .media-hint strong { display: block; font-size: 0.92rem; margin-bottom: 2px; }
     #video {
       width: 100%;
       height: 100%;
@@ -511,6 +527,7 @@ IPAD_PAGE = """<!DOCTYPE html>
             <em id="captionZh"></em>
           </div>
         </div>
+        <div id="mediaHint" class="media-hint" hidden></div>
       </div>
       <div class="seek">
         <span id="seekNow">0:00</span>
@@ -593,6 +610,7 @@ IPAD_PAGE = """<!DOCTYPE html>
     const selectedDraftRows = new Set();
     const videoEl = document.getElementById('video');
     const videoWrapEl = document.getElementById('videoWrap');
+    const mediaHintEl = document.getElementById('mediaHint');
     const metaEl = document.getElementById('meta');
     const docEl = document.getElementById('doc');
     const docTailEl = document.getElementById('docTail');
@@ -1437,6 +1455,82 @@ IPAD_PAGE = """<!DOCTYPE html>
     }
 
     let boundVideoSession = '';
+    let hasVideo = false;
+    let mediaPollTimer = 0;
+    let switchingMedia = false;
+    let pendingMediaSeek = null;
+
+    function shouldAcceptMediaPoll(boundSessionId, payloadSessionId) {
+      const bound = String(boundSessionId || '').trim();
+      const incoming = String(payloadSessionId || '').trim();
+      if (!bound) return false;
+      if (!incoming) return true;
+      return bound === incoming;
+    }
+
+    function updateMediaHint(status) {
+      if (!mediaHintEl) return;
+      if (hasVideo) {
+        mediaHintEl.hidden = true;
+        mediaHintEl.textContent = '';
+        return;
+      }
+      let title = '仅音频';
+      let body = '本课没有视频画面，可使用音频听写、跟读。';
+      if (status === 'failed') {
+        title = '暂时无法加载视频画面';
+        body = '音频学习不受影响。';
+      } else if (status !== 'audio') {
+        title = '视频画面正在准备中';
+        body = '你可以先开始听写，画面准备好后会自动显示。';
+      }
+      mediaHintEl.hidden = false;
+      mediaHintEl.innerHTML = '<strong>' + title + '</strong>' + body;
+    }
+
+    function stopMediaPoll() {
+      if (mediaPollTimer) {
+        clearInterval(mediaPollTimer);
+        mediaPollTimer = 0;
+      }
+    }
+
+    function startMediaPoll() {
+      stopMediaPoll();
+      if (hasVideo) return;
+      void pollMedia();
+      mediaPollTimer = setInterval(() => { void pollMedia(); }, 2500);
+    }
+
+    async function pollMedia() {
+      const bound = sessionId;
+      if (!bound || hasVideo) {
+        stopMediaPoll();
+        return;
+      }
+      try {
+        const res = await fetch('/api/session/' + encodeURIComponent(bound) + '/media', { credentials: 'same-origin' });
+        if (!res.ok) return;
+        const data = await res.json();
+        if (sessionId !== bound) return;
+        if (!shouldAcceptMediaPoll(bound, data.session_id)) return;
+        if (!data.has_video) {
+          updateMediaHint(data.status || 'audio');
+          return;
+        }
+        if (switchingMedia) return;
+        switchingMedia = true;
+        const wasPaused = videoEl ? videoEl.paused : true;
+        const time = (videoEl && Number.isFinite(videoEl.currentTime))
+          ? videoEl.currentTime
+          : (sentences[index] && sentences[index].start) || 0;
+        pendingMediaSeek = { time: time, play: !wasPaused, sessionId: bound };
+        if (videoEl) {
+          videoEl.src = '/api/session/' + bound + '/video?v=' + Date.now();
+          try { videoEl.load(); } catch (e) {}
+        }
+      } catch (e) {}
+    }
 
     function clearVideoSrc(reason) {
       try {
@@ -1449,15 +1543,21 @@ IPAD_PAGE = """<!DOCTYPE html>
 
     function updateVideoSrc() {
       if (!sessionId || !videoEl) return;
-      if (boundVideoSession === sessionId && videoEl.getAttribute('src')) return;
+      if (boundVideoSession === sessionId && videoEl.getAttribute('src')) {
+        if (!hasVideo && !mediaPollTimer) startMediaPoll();
+        return;
+      }
       boundVideoSession = sessionId;
-      // 延后到下一帧再挂视频，避免首屏就拉超大 mp4 把 Safari 进程打崩
+      hasVideo = false;
+      switchingMedia = false;
+      pendingMediaSeek = null;
       const sid = sessionId;
       requestAnimationFrame(() => {
         if (sessionId !== sid) return;
         try {
           videoEl.src = '/api/session/' + sid + '/video';
           videoEl.load();
+          startMediaPoll();
         } catch (e) {
           clearVideoSrc('视频加载失败，请在电脑端换一门课再试');
         }
@@ -1466,7 +1566,12 @@ IPAD_PAGE = """<!DOCTYPE html>
 
     videoEl.addEventListener('error', () => {
       if (!sessionId) return;
-      clearVideoSrc('这门课的视频 iPad 暂时播不了（文件过大或格式不兼容）。请在下方换一门课，或电脑端重新导入。');
+      switchingMedia = false;
+      if (!hasVideo) {
+        updateMediaHint('failed');
+        return;
+      }
+      clearVideoSrc('这门课的视频 iPad 暂时播不了（文件过大或格式不兼容）。请在下方换一门课。');
     });
 
     function clipTime(time) {
@@ -1578,6 +1683,35 @@ IPAD_PAGE = """<!DOCTYPE html>
       if (Number.isFinite(videoEl.duration) && videoEl.duration > 0) {
         duration = videoEl.duration;
         updateSeekUi();
+      }
+      const pending = pendingMediaSeek;
+      if (pending && pending.sessionId === sessionId) {
+        pendingMediaSeek = null;
+        try { videoEl.currentTime = pending.time; } catch (e) {}
+        now = videoEl.currentTime;
+        pauseAt = now;
+        updateSeekUi();
+        if (pending.play) {
+          const playPromise = videoEl.play();
+          if (playPromise) {
+            void playPromise.catch((err) => {
+              const name = err && err.name ? err.name : '';
+              if (name === 'NotAllowedError') {
+                userPaused = true;
+                updateTransportBtn();
+              }
+            });
+          }
+        } else {
+          try { videoEl.pause(); } catch (e) {}
+          userPaused = true;
+          updateTransportBtn();
+        }
+      }
+      if (videoEl.videoWidth) {
+        hasVideo = true;
+        stopMediaPoll();
+        updateMediaHint('ready');
       }
     });
     videoEl.addEventListener('durationchange', () => {
@@ -1700,6 +1834,14 @@ IPAD_PAGE = """<!DOCTYPE html>
         sessionId = next;
         try { localStorage.setItem('enprato.ipad.lastSession', sessionId); } catch (e) {}
         boundVideoSession = '';
+        hasVideo = false;
+        switchingMedia = false;
+        pendingMediaSeek = null;
+        stopMediaPoll();
+        if (mediaHintEl) {
+          mediaHintEl.hidden = true;
+          mediaHintEl.textContent = '';
+        }
         localIndexControl = false;
         resumeKey = '';
         sentencesRev = '';

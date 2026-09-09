@@ -299,6 +299,12 @@ export async function loadSession(sessionId: string): Promise<SessionDetail> {
   return res.json();
 }
 
+export async function fetchSessionMedia(sessionId: string): Promise<{ has_video: boolean; status?: string; session_id?: string }> {
+  const res = await fetch(`/api/session/${encodeURIComponent(sessionId)}/media`, { credentials: "same-origin" });
+  if (!res.ok) throw new Error(await readError(res));
+  return res.json();
+}
+
 export async function saveProgress(
   sessionId: string,
   payload: ProgressPayload,
