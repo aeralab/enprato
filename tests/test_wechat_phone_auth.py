@@ -9,11 +9,11 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
-from backend.app import db, main, sms, wechat_oauth
+from backend.app import db, main, sms, url_import_jobs, wechat_oauth
 
 
 def _isolate():
-    tmp = tempfile.TemporaryDirectory()
+    tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
     old = {
         "db": db.DB_PATH,
         "data": main.DATA,
@@ -39,6 +39,10 @@ def _isolate():
 
 
 def _restore(tmp, old):
+    try:
+        url_import_jobs.wait_idle(20)
+    except Exception:
+        pass
     db.DB_PATH, main.DATA = old["db"], old["data"]
     mapping = {
         "auth": "ENPRATO_REQUIRE_AUTH",

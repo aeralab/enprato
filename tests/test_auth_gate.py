@@ -8,13 +8,14 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
-from backend.app import db, main
+from backend.app import db, main, url_import_jobs
 from backend.app.auth import cookie_secure, hash_password, verify_password
 from backend.app.license import checkout_license
+from job_wait import wait_job, wait_ready
 
 
 def _isolate_env():
-    tmp = tempfile.TemporaryDirectory()
+    tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
     old = {
         "db": db.DB_PATH,
         "data": main.DATA,
@@ -30,6 +31,10 @@ def _isolate_env():
 
 
 def _restore_env(tmp, old):
+    try:
+        url_import_jobs.wait_idle(20)
+    except Exception:
+        pass
     db.DB_PATH, main.DATA = old["db"], old["data"]
     for key, env_name in (("auth", "ENPRATO_REQUIRE_AUTH"), ("secure", "ENPRATO_COOKIE_SECURE"), ("mock", "ENPRATO_ALLOW_MOCK_PAY")):
         if old[key] is None:
@@ -198,6 +203,8 @@ class AuthRequiredApiTests(unittest.TestCase):
         client = TestClient(main.app)
         self.assertEqual(client.get("/api/sessions").status_code, 401)
         self.assertEqual(client.post("/api/prepare-url", json={"url": "https://example.com/video.mp4"}).status_code, 401)
+        self.assertEqual(client.get("/api/import-status/x").status_code, 401)
+        self.assertEqual(client.get("/api/import-jobs/active").status_code, 401)
         self.assertEqual(client.get("/api/progress").status_code, 401)
         self.assertEqual(client.get("/api/license").status_code, 401)
         self.assertEqual(client.post("/api/license/activate", json={"key": "ENP-x.y"}).status_code, 401)
@@ -274,7 +281,7 @@ class AccountTrialTests(unittest.TestCase):
         client.post("/api/auth/register", json={"email": email, "password": "password123"})
         return client
 
-    def _ok_ingest(self, _url, folder: Path):
+    def _ok_ingest(self, _url, folder: Path, **_kwargs):
         audio = folder / "audio.wav"
         audio.write_bytes(b"RIFF")
         (folder / "source.mp4").write_bytes(b"mp4")
@@ -296,6 +303,7 @@ class AccountTrialTests(unittest.TestCase):
             for i in range(5):
                 res = client.post("/api/prepare-url", json={"url": f"https://example.com/v{i}.mp4", "create_new_session": True})
                 self.assertEqual(res.status_code, 200, res.text)
+                wait_ready(client, res)
             sixth = client.post("/api/prepare-url", json={"url": "https://example.com/v6.mp4", "create_new_session": True})
         self.assertEqual(sixth.status_code, 402)
         self.assertEqual(client.get("/api/auth/me").json()["user"]["trial"]["used"], 5)
@@ -304,20 +312,24 @@ class AccountTrialTests(unittest.TestCase):
         client = self._login("fail@example.com")
         with patch.object(main, "ingest_url", side_effect=RuntimeError("download failed")):
             res = client.post("/api/prepare-url", json={"url": "https://example.com/bad.mp4"})
-        self.assertEqual(res.status_code, 400)
+            self.assertEqual(res.status_code, 200, res.text)
+            job, _ = wait_job(client, res.json()["job_id"])
+        self.assertEqual(job["status"], "failed")
         self.assertEqual(client.get("/api/auth/me").json()["user"]["trial"]["used"], 0)
 
     def test_empty_transcript_does_not_consume_quota(self):
         client = self._login("silent@example.com")
 
-        def ingest(_url, folder):
+        def ingest(_url, folder, **_kwargs):
             source, wav, _captions = self._ok_ingest(_url, folder)
             return source, wav, ""
 
         with patch.object(main, "ingest_url", side_effect=ingest), patch.object(main, "fetch_media_title", return_value="silent"), patch.object(main, "transcribe_sentences", return_value=[]):
             res = client.post("/api/prepare-url", json={"url": "https://example.com/silent.mp4", "create_new_session": True})
-        self.assertEqual(res.status_code, 400)
-        self.assertIn("分出句子", res.json()["detail"])
+            self.assertEqual(res.status_code, 200, res.text)
+            job, _ = wait_job(client, res.json()["job_id"])
+        self.assertEqual(job["status"], "failed")
+        self.assertIn("分出句子", job["message"])
         self.assertEqual(client.get("/api/auth/me").json()["user"]["trial"]["used"], 0)
 
     def test_idempotent_prepare_key_does_not_double_charge(self):

@@ -11,6 +11,7 @@ import time
 import urllib.request
 import logging
 from pathlib import Path
+from typing import Callable
 from urllib.parse import parse_qs, urlparse
 
 from .bilibili import BilibiliIngestError, ingest_bilibili
@@ -442,7 +443,7 @@ def _bili_ytdlp_fallback_allowed() -> bool:
     return (os.environ.get("ENPRATO_ENV") or "").strip().lower() != "production"
 
 
-def ingest_url(url: str, folder: Path) -> tuple[Path, Path, str | None]:
+def ingest_url(url: str, folder: Path, on_stage: Callable[..., None] | None = None) -> tuple[Path, Path, str | None]:
     """Fetch playable media + optional English captions. Returns (video_or_audio, wav, captions_text)."""
     url = validate_media_url(url)
     host = url_host_family(url)
@@ -450,15 +451,25 @@ def ingest_url(url: str, folder: Path) -> tuple[Path, Path, str | None]:
     folder.mkdir(parents=True, exist_ok=True)
     audio = folder / "audio.wav"
     if is_bilibili_url(url):
-        return _ingest_bilibili_url(url, folder, audio, started)
-    return _ingest_url_ytdlp(url, folder, audio, host, started)
+        return _ingest_bilibili_url(url, folder, audio, started, on_stage=on_stage)
+    return _ingest_url_ytdlp(url, folder, audio, host, started, on_stage=on_stage)
 
 
-def _ingest_bilibili_url(url: str, folder: Path, audio: Path, started: float) -> tuple[Path, Path, str | None]:
+def _ingest_bilibili_url(
+    url: str,
+    folder: Path,
+    audio: Path,
+    started: float,
+    on_stage: Callable[..., None] | None = None,
+) -> tuple[Path, Path, str | None]:
     host = "bilibili.com"
+    if on_stage:
+        on_stage("metadata")
     log_url_import_stage(host, "metadata_start", path="official_api")
     try:
         media_started = time.monotonic()
+        if on_stage:
+            on_stage("downloading")
         media, captions, view = ingest_bilibili(url, folder)
         if captions:
             (folder / "source.en.vtt").write_text(captions, encoding="utf-8")
@@ -480,12 +491,14 @@ def _ingest_bilibili_url(url: str, folder: Path, audio: Path, started: float) ->
         log_url_import_stage(host, "media_download", error_kind=exc.kind, path="official_api")
         if _bili_ytdlp_fallback_allowed():
             log_url_import_stage(host, "media_download", recovered="ytdlp_fallback", error_kind=exc.kind)
-            return _ingest_url_ytdlp(url, folder, audio, host, started)
+            return _ingest_url_ytdlp(url, folder, audio, host, started, on_stage=on_stage)
         raise RuntimeError(public_url_import_error(exc)) from exc
     if captions:
         log_url_import_stage(host, "audio_extract", elapsed_ms=0, skipped="captions")
     else:
         extract_started = time.monotonic()
+        if on_stage:
+            on_stage("processing_audio")
         log_url_import_stage(host, "audio_extract_start")
         try:
             extract_wav(media, audio)
@@ -508,7 +521,14 @@ def _ingest_bilibili_url(url: str, folder: Path, audio: Path, started: float) ->
     return media, audio, captions
 
 
-def _ingest_url_ytdlp(url: str, folder: Path, audio: Path, host: str, started: float) -> tuple[Path, Path, str | None]:
+def _ingest_url_ytdlp(
+    url: str,
+    folder: Path,
+    audio: Path,
+    host: str,
+    started: float,
+    on_stage: Callable[..., None] | None = None,
+) -> tuple[Path, Path, str | None]:
     ffmpeg = find_ffmpeg()
     ffmpeg_dir = str(Path(ffmpeg).parent)
     ytdlp = ytdlp_cmd()
@@ -516,6 +536,8 @@ def _ingest_url_ytdlp(url: str, folder: Path, audio: Path, host: str, started: f
     base = _ytdlp_common_base(ytdlp, ffmpeg_dir, url, cookies)
 
     meta_started = time.monotonic()
+    if on_stage:
+        on_stage("metadata")
     log_url_import_stage(host, "metadata_start")
     info = _fetch_url_metadata(base, url, folder)
     log_url_import_stage(host, "metadata", elapsed_ms=_elapsed_ms(meta_started))
@@ -533,6 +555,8 @@ def _ingest_url_ytdlp(url: str, folder: Path, audio: Path, host: str, started: f
 
     try:
         media_started = time.monotonic()
+        if on_stage:
+            on_stage("downloading")
         log_url_import_stage(host, "media_download_start")
         _download_with_retries(_media_cmd_base(base, folder), url)
         log_url_import_stage(host, "media_download", elapsed_ms=_elapsed_ms(media_started))
@@ -555,6 +579,8 @@ def _ingest_url_ytdlp(url: str, folder: Path, audio: Path, host: str, started: f
         log_url_import_stage(host, "audio_extract", elapsed_ms=0, skipped="captions")
     else:
         extract_started = time.monotonic()
+        if on_stage:
+            on_stage("processing_audio")
         log_url_import_stage(host, "audio_extract_start")
         try:
             extract_wav(media, audio)
@@ -908,6 +934,8 @@ def _friendly_ytdlp_error(url: str, detail: str) -> str:
 
 def public_url_import_error(exc: BaseException | str) -> str:
     text = str(exc or "").strip()
+    if text[:5] in {"400: ", "402: ", "404: "}:
+        text = text[5:].strip()
     if "无法从视频中分出句子" in text or "语音识别时间过长" in text:
         return text
     if "微信视频号" in text or "请粘贴 http" in text:

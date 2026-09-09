@@ -16,6 +16,9 @@ import {
   loadSession,
   prepareSession,
   prepareSessionFromUrl,
+  fetchActiveImportJob,
+  waitForImportJob,
+  IMPORT_JOB_KEY,
   saveProgress as postProgress,
   scoreShadow,
   speakerPlay,
@@ -445,6 +448,7 @@ export default function App() {
   const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null);
   const [catalog, setCatalog] = useState<CuratedLesson[]>([]);
   const [screen, setScreen] = useState<"home" | "progress">("home");
+  const [importMessage, setImportMessage] = useState("");
   const loadGateRef = useRef(createLoadGate());
   const draftsUserId = user?.id || "lan-local";
 
@@ -504,6 +508,30 @@ export default function App() {
         const rows = await listSessions();
         if (cancelled) return;
         setHistory(rows);
+        const active = await fetchActiveImportJob().catch(() => null);
+        const storedJob = localStorage.getItem(IMPORT_JOB_KEY);
+        const jobId = active?.job_id || storedJob;
+        if (jobId) {
+          const token = loadGateRef.current.bump();
+          setPhase("preparing");
+          setImportMessage(active?.message || "正在排队…");
+          try {
+            const prepared = await waitForImportJob(jobId, (status) => {
+              if (!loadGateRef.current.isCurrent(token)) return;
+              setImportMessage(status.message || "");
+            });
+            if (!loadGateRef.current.isCurrent(token) || cancelled) return;
+            openDetail({ ...prepared, phase: prepared.phase === "listen" ? "listen" : prepared.phase });
+            await refreshHistory();
+            await refreshLicense();
+            return;
+          } catch (err) {
+            if (!loadGateRef.current.isCurrent(token) || cancelled) return;
+            setPhase("import");
+            setError(friendlyUrlImportError(err));
+            return;
+          }
+        }
         const last = localStorage.getItem(LAST_SESSION_KEY);
         if (last && rows.some((row) => row.session_id === last)) {
           const token = loadGateRef.current.bump();
@@ -597,6 +625,7 @@ export default function App() {
     if (!file && !url) return;
     const token = loadGateRef.current.bump();
     setPhase("preparing");
+    setImportMessage("正在排队…");
     try {
       if (!file) {
         const existing = history.find((item) => sameSourceUrl(item.source_url, url));
@@ -608,7 +637,10 @@ export default function App() {
             return;
           }
         }
-        const prepared = await prepareSessionFromUrl(url, Boolean(existing));
+        const prepared = await prepareSessionFromUrl(url, Boolean(existing), (status) => {
+          if (!loadGateRef.current.isCurrent(token)) return;
+          setImportMessage(status.message || "");
+        });
         if (!loadGateRef.current.isCurrent(token)) return;
         openDetail({ ...prepared, phase: prepared.phase === "listen" ? "listen" : prepared.phase });
         await refreshHistory();
@@ -641,8 +673,12 @@ export default function App() {
     setSourceUrl(clean);
     setError("");
     setPhase("preparing");
+    setImportMessage("正在排队…");
     try {
-      const prepared = await prepareSessionFromUrl(clean);
+      const prepared = await prepareSessionFromUrl(clean, false, (status) => {
+        if (!loadGateRef.current.isCurrent(token)) return;
+        setImportMessage(status.message || "");
+      });
       if (!loadGateRef.current.isCurrent(token)) return;
       openDetail({ ...prepared, phase: prepared.phase === "listen" ? "listen" : prepared.phase });
       await refreshHistory();
@@ -748,6 +784,7 @@ export default function App() {
                 setError("");
               }
             }}
+            importMessage={importMessage}
             onStart={start}
             onStartCurated={startCurated}
             onResume={resume}
@@ -832,6 +869,7 @@ function ImportScreen({
   onRetryLicense,
   updateInfo,
   onOpenProgress,
+  importMessage,
 }: {
   phase: Phase;
   error: string;
@@ -855,15 +893,17 @@ function ImportScreen({
   onRetryLicense: () => void | Promise<void>;
   updateInfo: UpdateInfo | null;
   onOpenProgress: () => void;
+  importMessage: string;
 }) {
   if (phase === "preparing") {
     return (
       <div className="preparing">
         <h1>抽音、分句</h1>
         <p>
-          {sourceUrl.trim()
-            ? "正在下载视频 → 抽出音轨 → 按句切开。没有英文字幕的视频需要整段语音识别，视频越长越慢（约1小时片源通常要1–3分钟）。"
-            : "第一遍不会显示字幕。有现成英文字幕会快很多；没有则用语音模型整段识别后再按句切开，片源越长越慢。"}
+          {importMessage ||
+            (sourceUrl.trim()
+              ? "正在准备视频…"
+              : "第一遍不会显示字幕。有现成英文字幕会快很多；没有则用语音模型整段识别后再按句切开，片源越长越慢。")}
         </p>
         <div className="pulse" />
       </div>

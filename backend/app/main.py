@@ -37,14 +37,10 @@ from .auth import (
 from .curated import list_curated_lessons
 from .dictionary import lookup_word, translate_en_zh
 from .ingest import (
-    classify_ingest_error,
     fetch_media_title,
     find_session_media,
     ingest_url,
-    is_bilibili_url,
     log_url_import_stage,
-    public_url_import_error,
-    read_import_title,
     url_host_family,
     url_preview,
     validate_media_url,
@@ -72,6 +68,7 @@ from .score import score_shadowing
 from .sentences import parse_srt, parse_vtt
 from .speaker import play_speaker, stop_speaker
 from . import stt_jobs, stt_log
+from . import url_import_jobs
 from . import wechat_oauth
 from .store import (
     find_session_id_by_url,
@@ -190,6 +187,7 @@ async def stt_diag(payload: SttDiagIn, request: Request) -> dict[str, str]:
 def _startup_warm_asr() -> None:
     db.migrate()
     db.ensure_legacy_sessions(DATA)
+    url_import_jobs.ensure_worker()
 
     def _run() -> None:
         try:
@@ -1358,89 +1356,65 @@ async def prepare_url(body: PrepareUrlBody, user: dict[str, Any] = Depends(requi
         raise HTTPException(400, str(exc)) from exc
     preview = url_preview(url)
     host = url_host_family(url)
-    started = time.monotonic()
     logger.info("url_import_start host=%s preview=%s", host, preview)
-    existing = None if body.create_new_session else find_session_id_by_url(DATA, url)
-    can_reuse = bool(existing) and (
-        user["id"] == "lan-local" or db.owns_learning_session(existing, user["id"])
-    )
-    if can_reuse and existing:
-        folder_existing = DATA / existing
-        if find_session_media(folder_existing):
-            detail = session_detail(folder_existing, existing)
-            if detail:
-                logger.info("url_import_start host=%s reused_session=%s", preview, existing)
-                return detail
-        shutil.rmtree(folder_existing, ignore_errors=True)
-    require_member_or_trial(user)
-    session_id = uuid.uuid4().hex[:12]
-    folder = DATA / session_id
-    folder.mkdir(parents=True, exist_ok=True)
-    db.register_learning_session(session_id, user["id"])
-    if user["id"] != "lan-local":
-        if not db.membership_status(user["id"]).get("active") and not db.consume_trial(user["id"], "prepare:" + session_id):
-            shutil.rmtree(folder, ignore_errors=True)
-            raise HTTPException(402, "免费学习素材次数已用完")
-    try:
-        _media, audio, caption_text = await run_in_threadpool(ingest_url, url, folder)
-    except Exception as exc:
-        log_url_import_stage(
-            host,
-            "ingest",
-            elapsed_ms=int((time.monotonic() - started) * 1000),
-            error_kind=classify_ingest_error(str(exc)),
-            exception=type(exc).__name__,
-        )
-        _refund_failed_prepare(user, session_id)
-        shutil.rmtree(folder, ignore_errors=True)
-        raise HTTPException(400, public_url_import_error(exc)) from exc
-    sentences: list[dict[str, Any]] = []
-    if caption_text:
-        split_started = time.monotonic()
-        log_url_import_stage(host, "splitter_start")
-        sentences = _cues_from_text(caption_text)
-        log_url_import_stage(host, "splitter", elapsed_ms=int((time.monotonic() - split_started) * 1000), cues=len(sentences))
-        if not sentences:
-            log_url_import_stage(host, "splitter", subtitle_status="parse_failure", recovered="1")
-    display_title = read_import_title(folder)
-    if not display_title and is_bilibili_url(url):
-        display_title = await run_in_threadpool(fetch_media_title, url)
-    display_title = display_title or url
+    owner = url_import_jobs._owner_id(user)
+    with url_import_jobs.accept_lock:
+        active = url_import_jobs.find_active_job(owner, url)
+        if active:
+            logger.info(
+                "url_import_job job_id=%s session_id=%s stage=%s reused=1",
+                active.get("job_id"),
+                active.get("session_id"),
+                active.get("stage"),
+            )
+            return url_import_jobs.public_job(active)
+        if not body.create_new_session:
+            existing = find_session_id_by_url(DATA, url)
+            can_reuse = bool(existing) and (
+                user["id"] == "lan-local" or db.owns_learning_session(existing, user["id"])
+            )
+            if can_reuse and existing:
+                folder_existing = DATA / existing
+                if find_session_media(folder_existing):
+                    detail = session_detail(folder_existing, existing)
+                    if detail:
+                        logger.info("url_import_start host=%s reused_session=%s", preview, existing)
+                        return {"status": "ready", **detail}
+                shutil.rmtree(folder_existing, ignore_errors=True)
+        require_member_or_trial(user)
+        session_id = uuid.uuid4().hex[:12]
+        folder = DATA / session_id
+        folder.mkdir(parents=True, exist_ok=True)
+        db.register_learning_session(session_id, user["id"])
+        if user["id"] != "lan-local":
+            if not db.membership_status(user["id"]).get("active") and not db.consume_trial(user["id"], "prepare:" + session_id):
+                shutil.rmtree(folder, ignore_errors=True)
+                raise HTTPException(402, "免费学习素材次数已用完")
+        job = url_import_jobs.create_job(owner, session_id, url)
+        return {
+            "status": "processing",
+            "job_id": job["job_id"],
+            "session_id": session_id,
+            "stage": job["stage"],
+            "message": url_import_jobs.STAGE_MESSAGES[job["stage"]],
+        }
 
-    def complete_url_session() -> dict[str, Any]:
-        log_url_import_stage(host, "session_create_start")
-        return _finish_session(
-            folder,
-            session_id,
-            audio,
-            sentences,
-            title=display_title,
-            source_url=url,
-            source_kind="url",
-            host=host,
-        )
 
-    try:
-        detail = await run_in_threadpool(complete_url_session)
-        log_url_import_stage(
-            host,
-            "session_create",
-            elapsed_ms=int((time.monotonic() - started) * 1000),
-            session_id=session_id,
-        )
-        log_url_import_stage(host, "total", elapsed_ms=int((time.monotonic() - started) * 1000))
-        return detail
-    except Exception as exc:
-        log_url_import_stage(
-            host,
-            "session_create",
-            elapsed_ms=int((time.monotonic() - started) * 1000),
-            error_kind=classify_ingest_error(str(exc)),
-            exception=type(exc).__name__,
-        )
-        _refund_failed_prepare(user, session_id)
-        shutil.rmtree(folder, ignore_errors=True)
-        raise
+@app.get("/api/import-status/{job_id}")
+def import_status(job_id: str, user: dict[str, Any] = Depends(require_user_or_local)) -> dict[str, Any]:
+    job = url_import_jobs.get_job(job_id)
+    owner = url_import_jobs._owner_id(user)
+    if not job or str(job.get("user_id") or "") != owner:
+        raise HTTPException(404, "任务不存在")
+    return url_import_jobs.public_job(job)
+
+
+@app.get("/api/import-jobs/active")
+def import_jobs_active(user: dict[str, Any] = Depends(require_user_or_local)) -> dict[str, Any]:
+    job = url_import_jobs.find_active_job(url_import_jobs._owner_id(user))
+    if not job:
+        return {"job": None}
+    return {"job": url_import_jobs.public_job(job)}
 
 
 @app.get("/api/sessions")

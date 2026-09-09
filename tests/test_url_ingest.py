@@ -10,11 +10,12 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
-from backend.app import db, ingest, main
+from backend.app import db, ingest, main, url_import_jobs
+from job_wait import wait_job, wait_ready
 
 
 def _isolate_env():
-    tmp = tempfile.TemporaryDirectory()
+    tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
     old = {
         "db": db.DB_PATH,
         "data": main.DATA,
@@ -31,6 +32,10 @@ def _isolate_env():
 
 
 def _restore_env(tmp, old):
+    try:
+        url_import_jobs.wait_idle(20)
+    except Exception:
+        pass
     db.DB_PATH, main.DATA = old["db"], old["data"]
     if old["auth"] is None:
         os.environ.pop("ENPRATO_REQUIRE_AUTH", None)
@@ -435,13 +440,20 @@ class PrepareUrlFailureTests(unittest.TestCase):
     def tearDown(self):
         _restore_env(self.tmp, self.old)
 
+    def _failed_job(self, client, url, ingest_error):
+        with patch.object(main, "ingest_url", side_effect=RuntimeError(ingest_error)):
+            res = client.post("/api/prepare-url", json={"url": url})
+            self.assertEqual(res.status_code, 200, res.text)
+            self.assertEqual(res.json()["status"], "processing")
+            job, _ = wait_job(client, res.json()["job_id"])
+        self.assertEqual(job["status"], "failed")
+        return job
+
     def test_ytdlp_failure_returns_400_and_cleans_session(self):
         client = TestClient(main.app)
-        with patch.object(main, "ingest_url", side_effect=RuntimeError("yt-dlp 拉取失败")):
-            res = client.post("/api/prepare-url", json={"url": "https://www.youtube.com/watch?v=abc"})
-        self.assertEqual(res.status_code, 400)
-        self.assertEqual(res.json()["detail"], ingest.LOCAL_UPLOAD_HINT)
-        self.assertNotIn("yt-dlp", res.json()["detail"])
+        job = self._failed_job(client, "https://www.youtube.com/watch?v=abc", "yt-dlp 拉取失败")
+        self.assertEqual(job["message"], ingest.LOCAL_UPLOAD_HINT)
+        self.assertNotIn("yt-dlp", job["message"])
         self.assertEqual(list(main.DATA.iterdir()), [])
 
     def test_youtube_network_unreachable_returns_generic_fallback(self):
@@ -451,77 +463,69 @@ class PrepareUrlFailureTests(unittest.TestCase):
             "HTTPSConnection(host='www.youtube.com', port=443): "
             "Failed to establish a new connection: [Errno 101] Network is unreachable"
         )
-        with patch.object(main, "ingest_url", side_effect=RuntimeError(err)):
-            res = client.post("/api/prepare-url", json={"url": "https://www.youtube.com/watch?v=gpMe8ADa2_E"})
-        self.assertEqual(res.status_code, 400)
-        detail = res.json()["detail"]
-        self.assertEqual(detail, ingest.LOCAL_UPLOAD_HINT)
-        self.assertNotIn("Errno", detail)
-        self.assertNotIn("101", detail)
-        self.assertNotIn("youtube", detail.lower())
+        job = self._failed_job(client, "https://www.youtube.com/watch?v=gpMe8ADa2_E", err)
+        self.assertEqual(job["message"], ingest.LOCAL_UPLOAD_HINT)
+        self.assertNotIn("Errno", job["message"])
+        self.assertNotIn("101", job["message"])
+        self.assertNotIn("youtube", job["message"].lower())
         self.assertEqual(list(main.DATA.iterdir()), [])
 
     def test_download_timeout_returns_400(self):
         client = TestClient(main.app)
         err = ingest._friendly_ytdlp_error("https://www.youtube.com/watch?v=abc", "下载超时，已停止等待")
-        with patch.object(main, "ingest_url", side_effect=RuntimeError(err)):
-            res = client.post("/api/prepare-url", json={"url": "https://www.youtube.com/watch?v=abc"})
-        self.assertEqual(res.status_code, 400)
-        self.assertEqual(res.json()["detail"], ingest.LOCAL_UPLOAD_HINT)
+        job = self._failed_job(client, "https://www.youtube.com/watch?v=abc", err)
+        self.assertEqual(job["message"], ingest.LOCAL_UPLOAD_HINT)
         self.assertEqual(list(main.DATA.iterdir()), [])
 
     def test_bilibili_412_returns_local_upload_fallback(self):
         client = TestClient(main.app)
         url = "https://www.bilibili.com/video/BV1CMjq6nEu1/"
         err = ingest._friendly_ytdlp_error(url, "HTTP Error 412: Precondition Failed")
-        with patch.object(main, "ingest_url", side_effect=RuntimeError(err)):
-            res = client.post("/api/prepare-url", json={"url": url})
-        self.assertEqual(res.status_code, 400)
-        detail = res.json()["detail"]
-        self.assertEqual(detail, ingest.LOCAL_UPLOAD_HINT)
-        self.assertNotIn("412", detail)
-        self.assertNotIn("B站", detail)
+        job = self._failed_job(client, url, err)
+        self.assertNotIn("412", job["message"])
+        self.assertNotIn("B站", job["message"])
+        self.assertEqual(job["message"], ingest.LOCAL_UPLOAD_HINT)
 
     def test_ffmpeg_failure_returns_400(self):
         client = TestClient(main.app)
-        with patch.object(main, "ingest_url", side_effect=RuntimeError("ffmpeg 执行失败")):
-            res = client.post("/api/prepare-url", json={"url": "https://www.youtube.com/watch?v=abc"})
-        self.assertEqual(res.status_code, 400)
-        self.assertEqual(res.json()["detail"], ingest.LOCAL_UPLOAD_HINT)
+        job = self._failed_job(client, "https://www.youtube.com/watch?v=abc", "ffmpeg 执行失败")
+        self.assertEqual(job["message"], ingest.LOCAL_UPLOAD_HINT)
         self.assertEqual(list(main.DATA.iterdir()), [])
 
     def test_asr_failure_returns_400_and_does_not_leave_pending_session(self):
         client = TestClient(main.app)
 
-        def fake_ingest(_url, folder):
+        def fake_ingest(_url, folder, **_kwargs):
             return _ok_media(folder, None)
 
         with patch.object(main, "ingest_url", side_effect=fake_ingest), patch.object(
             main, "fetch_media_title", return_value="title"
         ), patch.object(main, "transcribe_sentences", return_value=[]):
             res = client.post("/api/prepare-url", json={"url": "https://www.youtube.com/watch?v=abc"})
-        self.assertEqual(res.status_code, 400)
-        self.assertIn("分出句子", res.json()["detail"])
+            self.assertEqual(res.status_code, 200, res.text)
+            job, _ = wait_job(client, res.json()["job_id"])
+        self.assertEqual(job["status"], "failed")
+        self.assertIn("分出句子", job["message"])
         self.assertEqual(list(main.DATA.iterdir()), [])
 
     def test_captions_skip_asr(self):
         client = TestClient(main.app)
 
-        def fake_ingest(_url, folder):
+        def fake_ingest(_url, folder, **_kwargs):
             return _ok_media(folder, CAPTION)
 
         with patch.object(main, "ingest_url", side_effect=fake_ingest), patch.object(
             main, "fetch_media_title", return_value="titled"
         ), patch.object(main, "transcribe_sentences") as asr:
             res = client.post("/api/prepare-url", json={"url": "https://www.youtube.com/watch?v=short"})
-        self.assertEqual(res.status_code, 200, res.text)
+            detail = wait_ready(client, res)
         asr.assert_not_called()
-        self.assertTrue((main.DATA / res.json()["session_id"] / "sentences.json").is_file())
+        self.assertTrue((main.DATA / detail["session_id"] / "sentences.json").is_file())
 
     def test_no_captions_uses_asr(self):
         client = TestClient(main.app)
 
-        def fake_ingest(_url, folder):
+        def fake_ingest(_url, folder, **_kwargs):
             return _ok_media(folder, None)
 
         with patch.object(main, "ingest_url", side_effect=fake_ingest), patch.object(
@@ -532,33 +536,34 @@ class PrepareUrlFailureTests(unittest.TestCase):
             return_value=[{"id": 0, "start": 0, "end": 2, "text": "Hello from asr."}],
         ):
             res = client.post("/api/prepare-url", json={"url": "https://www.youtube.com/watch?v=long"})
-        self.assertEqual(res.status_code, 200, res.text)
-        self.assertEqual(res.json()["sentences"][0]["text"], "Hello from asr.")
+            detail = wait_ready(client, res)
+        self.assertEqual(detail["sentences"][0]["text"], "Hello from asr.")
 
-    def test_asr_timeout_returns_400(self):
+    def test_url_import_slow_asr_still_ready(self):
         client = TestClient(main.app)
 
-        def fake_ingest(_url, folder):
+        def fake_ingest(_url, folder, **_kwargs):
             return _ok_media(folder, None)
 
         def hang(_audio):
-            time.sleep(2)
-            return [{"id": 0, "start": 0, "end": 1, "text": "too late"}]
+            time.sleep(0.3)
+            return [{"id": 0, "start": 0, "end": 1, "text": "still ready later"}]
 
-        with patch.object(main, "ASR_IMPORT_TIMEOUT_SEC", 0.2), patch.object(
+        with patch.object(main, "ASR_IMPORT_TIMEOUT_SEC", 0.05), patch.object(
             main, "ingest_url", side_effect=fake_ingest
         ), patch.object(main, "fetch_media_title", return_value="title"), patch.object(
             main, "transcribe_sentences", side_effect=hang
         ):
+            t0 = time.monotonic()
             res = client.post("/api/prepare-url", json={"url": "https://www.youtube.com/watch?v=abc"})
-        self.assertEqual(res.status_code, 400)
-        self.assertIn("语音识别", res.json()["detail"])
-        self.assertEqual(list(main.DATA.iterdir()), [])
+            self.assertLess(time.monotonic() - t0, 0.2)
+            detail = wait_ready(client, res, timeout=5)
+        self.assertEqual(detail["sentences"][0]["text"], "still ready later")
 
     def test_subtitle_429_ingest_falls_back_to_asr_session(self):
         client = TestClient(main.app)
 
-        def fake_ingest(_url, folder):
+        def fake_ingest(_url, folder, **_kwargs):
             (folder / "import_meta.json").write_text(
                 json.dumps({"title": "Rate Limited", "subtitle_status": "rate_limited"}),
                 encoding="utf-8",
@@ -573,15 +578,15 @@ class PrepareUrlFailureTests(unittest.TestCase):
             return_value=[{"id": 0, "start": 0, "end": 2, "text": "Recovered by asr."}],
         ):
             res = client.post("/api/prepare-url", json={"url": "https://www.youtube.com/watch?v=rate"})
-        self.assertEqual(res.status_code, 200, res.text)
+            detail = wait_ready(client, res)
         title_fn.assert_not_called()
-        self.assertEqual(res.json()["sentences"][0]["text"], "Recovered by asr.")
-        self.assertEqual(res.json()["title"], "Rate Limited")
+        self.assertEqual(detail["sentences"][0]["text"], "Recovered by asr.")
+        self.assertEqual(detail["title"], "Rate Limited")
 
     def test_caption_parse_failure_falls_back_to_asr(self):
         client = TestClient(main.app)
 
-        def fake_ingest(_url, folder):
+        def fake_ingest(_url, folder, **_kwargs):
             return _ok_media(folder, "WEBVTT\n\nthis has no timestamp cues")
 
         with patch.object(main, "ingest_url", side_effect=fake_ingest), patch.object(
@@ -592,15 +597,13 @@ class PrepareUrlFailureTests(unittest.TestCase):
             return_value=[{"id": 0, "start": 0, "end": 2, "text": "Parsed fallback."}],
         ):
             res = client.post("/api/prepare-url", json={"url": "https://www.youtube.com/watch?v=parse"})
-        self.assertEqual(res.status_code, 200, res.text)
-        self.assertEqual(res.json()["sentences"][0]["text"], "Parsed fallback.")
+            detail = wait_ready(client, res)
+        self.assertEqual(detail["sentences"][0]["text"], "Parsed fallback.")
 
     def test_ytdlp_download_failure_still_fails_import(self):
         client = TestClient(main.app)
-        with patch.object(main, "ingest_url", side_effect=RuntimeError("Requested format is not available")):
-            res = client.post("/api/prepare-url", json={"url": "https://www.youtube.com/watch?v=fail"})
-        self.assertEqual(res.status_code, 400)
-        self.assertEqual(res.json()["detail"], ingest.LOCAL_UPLOAD_HINT)
+        job = self._failed_job(client, "https://www.youtube.com/watch?v=fail", "Requested format is not available")
+        self.assertEqual(job["message"], ingest.LOCAL_UPLOAD_HINT)
 
 
 class FfmpegTimeoutTests(unittest.TestCase):

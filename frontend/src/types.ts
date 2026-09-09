@@ -184,3 +184,13 @@ export type CuratedLesson = {
   source_url: string;
   series?: string;
 };
+
+export type ImportJobStatus = {
+  status: "queued" | "processing" | "ready" | "failed";
+  stage?: string;
+  message?: string;
+  job_id?: string;
+  session_id?: string;
+  error_kind?: string;
+  error?: string;
+};

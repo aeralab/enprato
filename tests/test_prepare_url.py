@@ -7,7 +7,8 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
-from backend.app import db, main
+from backend.app import db, main, url_import_jobs
+from job_wait import wait_ready
 
 
 class PrepareUrlIsolationTests(unittest.TestCase):
@@ -31,7 +32,7 @@ class PrepareUrlIsolationTests(unittest.TestCase):
                 (old_folder / "source.mp4").write_bytes(b"old")
                 (old_folder / "audio.wav").write_bytes(b"old")
 
-                def fake_ingest(_url, folder):
+                def fake_ingest(_url, folder, **_kwargs):
                     audio = folder / "audio.wav"
                     audio.write_bytes(b"new")
                     return None, audio, "WEBVTT\n\n00:00:00.000 --> 00:00:04.000\nA newly imported sentence, with a natural split, for testing.\n"
@@ -40,17 +41,22 @@ class PrepareUrlIsolationTests(unittest.TestCase):
                     client = TestClient(main.app)
                     reused = client.post("/api/prepare-url", json={"url": "https://example.com/video"})
                     created = client.post("/api/prepare-url", json={"url": "https://example.com/video", "create_new_session": True})
+                    created_detail = wait_ready(client, created)
 
                 self.assertEqual(reused.status_code, 200)
                 self.assertEqual(reused.json()["session_id"], old_id)
                 self.assertEqual(created.status_code, 200)
-                new_id = created.json()["session_id"]
+                new_id = created_detail["session_id"]
                 self.assertNotEqual(new_id, old_id)
-                self.assertEqual(created.json()["index"], 0)
+                self.assertEqual(created_detail["index"], 0)
                 self.assertEqual(json.loads((old_folder / "sentences.json").read_text(encoding="utf-8")), old_sentences)
                 self.assertEqual((old_folder / "audio.wav").read_bytes(), b"old")
                 self.assertTrue((main.DATA / new_id / "sentences.json").is_file())
             finally:
+                try:
+                    url_import_jobs.wait_idle(20)
+                except Exception:
+                    pass
                 db.DB_PATH, main.DATA = old_db, old_data
                 if old_auth is None:
                     os.environ.pop("ENPRATO_REQUIRE_AUTH", None)

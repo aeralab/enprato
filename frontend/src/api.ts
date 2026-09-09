@@ -1,4 +1,4 @@
-import type { CurrentUser, CuratedLesson, LicenseStatus, Order, ProgressSummary, SessionDetail, SessionSummary, ShadowScore, UpdateInfo, WordSense } from "./types";
+import type { CurrentUser, CuratedLesson, ImportJobStatus, LicenseStatus, Order, ProgressSummary, SessionDetail, SessionSummary, ShadowScore, UpdateInfo, WordSense } from "./types";
 
 const progressSaveChains = new Map<string, Promise<void>>();
 
@@ -47,14 +47,79 @@ async function readError(res: Response): Promise<string> {
   }
 }
 
-function isAbortError(err: unknown): boolean {
-  return (
-    (typeof DOMException !== "undefined" && err instanceof DOMException && err.name === "AbortError") ||
-    (err instanceof Error && err.name === "AbortError")
-  );
+const URL_IMPORT_POLL_MS = 2000;
+const URL_IMPORT_POLL_MAX_MS = 45 * 60 * 1000;
+export const IMPORT_JOB_KEY = "enprato.importJob";
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    window.setTimeout(resolve, ms);
+  });
 }
 
-const URL_IMPORT_TIMEOUT_MS = 15 * 60 * 1000;
+export async function fetchImportStatus(jobId: string): Promise<ImportJobStatus> {
+  const res = await fetch(`/api/import-status/${encodeURIComponent(jobId)}`, { credentials: "same-origin" });
+  if (!res.ok) throw new Error(await readError(res));
+  return res.json();
+}
+
+export async function fetchActiveImportJob(): Promise<ImportJobStatus | null> {
+  const res = await fetch("/api/import-jobs/active", { credentials: "same-origin" });
+  if (!res.ok) throw new Error(await readError(res));
+  const data = (await res.json()) as { job?: ImportJobStatus | null };
+  return data.job || null;
+}
+
+export async function waitForImportJob(
+  jobId: string,
+  onStatus?: (status: ImportJobStatus) => void,
+): Promise<SessionDetail> {
+  const deadline = Date.now() + URL_IMPORT_POLL_MAX_MS;
+  while (Date.now() < deadline) {
+    const status = await fetchImportStatus(jobId);
+    onStatus?.(status);
+    if (status.status === "ready" && status.session_id) {
+      localStorage.removeItem(IMPORT_JOB_KEY);
+      return loadSession(status.session_id);
+    }
+    if (status.status === "failed") {
+      localStorage.removeItem(IMPORT_JOB_KEY);
+      throw new Error(status.message || status.error || "导入失败");
+    }
+    await sleep(URL_IMPORT_POLL_MS);
+  }
+  throw new Error("还在准备这条视频。请稍后刷新页面查看结果，不必重新提交链接。");
+}
+
+export async function prepareSessionFromUrl(
+  url: string,
+  createNewSession = false,
+  onStatus?: (status: ImportJobStatus) => void,
+): Promise<SessionDetail> {
+  const res = await fetch("/api/prepare-url", {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ url, create_new_session: createNewSession }),
+  });
+  if (!res.ok) throw new Error(await readError(res));
+  const data = await res.json();
+  if (data.status === "ready" && data.session_id && Array.isArray(data.sentences)) {
+    localStorage.removeItem(IMPORT_JOB_KEY);
+    return data as SessionDetail;
+  }
+  const jobId = String(data.job_id || "");
+  if (!jobId) throw new Error("导入任务创建失败");
+  localStorage.setItem(IMPORT_JOB_KEY, jobId);
+  onStatus?.({
+    status: data.status || "processing",
+    stage: data.stage,
+    message: data.message,
+    job_id: jobId,
+    session_id: data.session_id,
+  });
+  return waitForImportJob(jobId, onStatus);
+}
 
 function compareVersions(a: string, b: string): number {
   const pa = a.split(/[.-]/).map((part) => Number(part) || 0);
@@ -87,29 +152,6 @@ export async function prepareSession(
   const res = await fetch("/api/prepare", { method: "POST", body, credentials: "same-origin" });
   if (!res.ok) throw new Error(await readError(res));
   return res.json();
-}
-
-export async function prepareSessionFromUrl(url: string, createNewSession = false): Promise<SessionDetail> {
-  const controller = new AbortController();
-  const timer = window.setTimeout(() => controller.abort(), URL_IMPORT_TIMEOUT_MS);
-  try {
-    const res = await fetch("/api/prepare-url", {
-      method: "POST",
-      credentials: "same-origin",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ url, create_new_session: createNewSession }),
-      signal: controller.signal,
-    });
-    if (!res.ok) throw new Error(await readError(res));
-    return res.json();
-  } catch (err) {
-    if (isAbortError(err)) {
-      throw new Error("暂时无法直接读取该视频链接。你可以先将视频保存到本地，再上传到 Enprato 学习。");
-    }
-    throw err;
-  } finally {
-    window.clearTimeout(timer);
-  }
 }
 
 export async function fetchLicense(): Promise<LicenseStatus> {
