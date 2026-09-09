@@ -13,6 +13,7 @@ import logging
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+from .bilibili import BilibiliIngestError, ingest_bilibili
 from .media import ensure_playback_audio, extract_wav, find_ffmpeg, is_ipad_media, make_browser_mp4, media_has_audio, run_ffmpeg, stream_codec
 
 logger = logging.getLogger(__name__)
@@ -437,18 +438,82 @@ def pick_english_sub_lang(info: dict | None) -> tuple[str | None, bool]:
     return None, False
 
 
+def _bili_ytdlp_fallback_allowed() -> bool:
+    return (os.environ.get("ENPRATO_ENV") or "").strip().lower() != "production"
+
+
 def ingest_url(url: str, folder: Path) -> tuple[Path, Path, str | None]:
     """Fetch playable media + optional English captions. Returns (video_or_audio, wav, captions_text)."""
     url = validate_media_url(url)
     host = url_host_family(url)
     started = time.monotonic()
     folder.mkdir(parents=True, exist_ok=True)
+    audio = folder / "audio.wav"
+    if is_bilibili_url(url):
+        return _ingest_bilibili_url(url, folder, audio, started)
+    return _ingest_url_ytdlp(url, folder, audio, host, started)
+
+
+def _ingest_bilibili_url(url: str, folder: Path, audio: Path, started: float) -> tuple[Path, Path, str | None]:
+    host = "bilibili.com"
+    log_url_import_stage(host, "metadata_start", path="official_api")
+    try:
+        media_started = time.monotonic()
+        media, captions, view = ingest_bilibili(url, folder)
+        if captions:
+            (folder / "source.en.vtt").write_text(captions, encoding="utf-8")
+        playable = _ensure_playable(folder)
+        if playable is not None:
+            media = playable
+        title = str(view.get("title") or "").strip()
+        if title:
+            _write_import_meta(folder, title=title, duration=view.get("duration"))
+        _write_import_meta(folder, subtitle_status="ok" if captions else "unavailable")
+        log_url_import_stage(
+            host,
+            "media_download",
+            elapsed_ms=_elapsed_ms(media_started),
+            path="official_api",
+            captions="1" if captions else "0",
+        )
+    except BilibiliIngestError as exc:
+        log_url_import_stage(host, "media_download", error_kind=exc.kind, path="official_api")
+        if _bili_ytdlp_fallback_allowed():
+            log_url_import_stage(host, "media_download", recovered="ytdlp_fallback", error_kind=exc.kind)
+            return _ingest_url_ytdlp(url, folder, audio, host, started)
+        raise RuntimeError(public_url_import_error(exc)) from exc
+    if captions:
+        log_url_import_stage(host, "audio_extract", elapsed_ms=0, skipped="captions")
+    else:
+        extract_started = time.monotonic()
+        log_url_import_stage(host, "audio_extract_start")
+        try:
+            extract_wav(media, audio)
+            ensure_playback_audio(folder, media)
+        except Exception as exc:
+            log_url_import_stage(
+                host,
+                "audio_extract",
+                elapsed_ms=_elapsed_ms(extract_started),
+                error_kind="ffmpeg_failure",
+            )
+            raise RuntimeError(public_url_import_error(exc)) from exc
+        log_url_import_stage(host, "audio_extract", elapsed_ms=_elapsed_ms(extract_started))
+    try:
+        fetch_bilibili_thumbnail(url, folder / "thumb.jpg")
+    except Exception:
+        pass
+    adopt_downloaded_thumbnail(folder)
+    log_url_import_stage(host, "ingest_total", elapsed_ms=_elapsed_ms(started), path="official_api")
+    return media, audio, captions
+
+
+def _ingest_url_ytdlp(url: str, folder: Path, audio: Path, host: str, started: float) -> tuple[Path, Path, str | None]:
     ffmpeg = find_ffmpeg()
     ffmpeg_dir = str(Path(ffmpeg).parent)
     ytdlp = ytdlp_cmd()
     cookies = os.environ.get("ENPRATO_COOKIES", "").strip()
     base = _ytdlp_common_base(ytdlp, ffmpeg_dir, url, cookies)
-    audio = folder / "audio.wav"
 
     meta_started = time.monotonic()
     log_url_import_stage(host, "metadata_start")
@@ -816,6 +881,14 @@ def classify_ytdlp_error(detail: str) -> str:
 def classify_ingest_error(detail: str) -> str:
     text = detail or ""
     low = text.lower()
+    for kind in (
+        "bilibili_view_failed",
+        "bilibili_playurl_failed",
+        "bilibili_media_download_failed",
+        "bilibili_merge_failed",
+    ):
+        if kind in text:
+            return kind
     if "ffmpeg" in low:
         return "ffmpeg_failure"
     if "语音识别" in text or "分出句子" in text or "asr" in low:

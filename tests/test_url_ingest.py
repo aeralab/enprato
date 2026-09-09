@@ -356,30 +356,35 @@ class IngestDecoupleTests(unittest.TestCase):
         self.assertEqual(sum(1 for cmd in calls if _is_subtitle_cmd(cmd)), 0)
         self.assertEqual(sum(1 for cmd in calls if _is_media_cmd(cmd)), 1)
 
-    def test_bilibili_without_english_downloads_480_and_extracts(self):
+    def test_bilibili_without_english_uses_official_api(self):
         folder = Path(tempfile.mkdtemp())
-        calls = []
+        (folder / "source.mp4").write_bytes(b"mp4")
+        ytdlp_calls = []
 
-        def fake_run(cmd, timeout=None):
-            calls.append(list(cmd))
-            if _is_subtitle_cmd(cmd):
-                raise RuntimeError("WARNING: no subtitle")
-            if _is_media_cmd(cmd):
-                fmt = cmd[cmd.index("-f") + 1]
-                self.assertIn("height<=480", fmt)
-                (folder / "source.mp4").write_bytes(b"mp4")
-                return
-            raise AssertionError(_cmd_text(cmd))
+        def fake_native(url, dest):
+            self.assertIn("bilibili.com/video", url)
+            return dest / "source.mp4", None, {"title": "Bili Title", "duration": 12}
 
-        (_media, _audio, captions), extract, _playback = self._run_ingest(
-            "https://www.bilibili.com/video/BV1JUtj6QENd/",
-            folder,
-            fake_run,
-        )
+        old = os.environ.get("ENPRATO_ENV")
+        os.environ["ENPRATO_ENV"] = "production"
+        try:
+            with patch.object(ingest, "ingest_bilibili", side_effect=fake_native), patch.object(
+                ingest, "extract_wav"
+            ) as extract, patch.object(ingest, "ensure_playback_audio"), patch.object(
+                ingest, "_ensure_playable", side_effect=lambda f: f / "source.mp4"
+            ), patch.object(ingest, "fetch_bilibili_thumbnail", return_value=True), patch.object(
+                ingest, "adopt_downloaded_thumbnail", return_value=True
+            ), patch.object(ingest, "ytdlp_cmd", side_effect=lambda: ytdlp_calls.append("ytdlp") or ["yt-dlp"]):
+                _media, _audio, captions = ingest.ingest_url("https://www.bilibili.com/video/BV1JUtj6QENd/", folder)
+        finally:
+            if old is None:
+                os.environ.pop("ENPRATO_ENV", None)
+            else:
+                os.environ["ENPRATO_ENV"] = old
         self.assertIsNone(captions)
         extract.assert_called_once()
         self.assertEqual(ingest.read_import_title(folder), "Bili Title")
-        self.assertEqual(sum(1 for cmd in calls if _is_media_cmd(cmd)), 1)
+        self.assertEqual(ytdlp_calls, [])
 
     def test_480_unavailable_falls_back_to_720_once(self):
         folder = Path(tempfile.mkdtemp())
