@@ -40,7 +40,7 @@ STAGE_MESSAGES = {
     STAGE_METADATA: "正在读取视频信息…",
     STAGE_DOWNLOADING: "正在准备视频…",
     STAGE_AUDIO: "正在处理音频…",
-    STAGE_TRANSCRIBING: "正在识别语音，这可能需要几分钟…",
+    STAGE_TRANSCRIBING: "正在识别语音…",
     STAGE_FINALIZING: "正在生成听写内容…",
     STAGE_READY: "准备完成",
     STAGE_FAILED: "导入失败",
@@ -332,31 +332,59 @@ def run_job(job: dict[str, Any]) -> None:
 
         stage(STAGE_DOWNLOADING)
         try:
-            media, audio, caption_text = app_main.ingest_url(url, folder, on_stage=on_stage)
+            media, audio, caption_text = app_main.ingest_url(
+                url, folder, on_stage=on_stage, job_id=job_id, session_id=session_id
+            )
         except TypeError as exc:
             if "on_stage" not in str(exc) and "unexpected keyword" not in str(exc):
                 raise
             media, audio, caption_text = app_main.ingest_url(url, folder)
         stage(STAGE_AUDIO)
         sentences: list[dict[str, Any]] = []
+        t_split0 = time.monotonic()
         if caption_text:
             sentences = _cues_from_text(caption_text)
+            log_url_import_stage(
+                host,
+                "T_split",
+                elapsed_ms=int((time.monotonic() - t_split0) * 1000),
+                job_id=job_id,
+                session_id=session_id,
+                captions="1",
+            )
         if not sentences:
             if timed_out():
                 fail_job(job, "import_timeout", public_url_import_error("导入时间过长"))
                 return
             stage(STAGE_TRANSCRIBING)
+            asr_path = folder / "playback.m4a"
+            if not asr_path.is_file() or asr_path.stat().st_size < 200:
+                asr_path = audio
+            from .dashscope_asr import transcribe_url_import
+
             with _asr_lock:
-                sentences = app_main.transcribe_sentences(audio)
+                sentences = transcribe_url_import(
+                    asr_path,
+                    folder=folder,
+                    job_id=job_id,
+                    session_id=session_id,
+                    host=host,
+                    whisper_fn=app_main.transcribe_sentences,
+                    extract_wav_fn=app_main.extract_wav,
+                )
         if not sentences:
             fail_job(job, "asr_empty", "无法从视频中分出句子，请补一份英文字幕文件")
             return
         stage(STAGE_FINALIZING)
         title = read_import_title(folder) or url
+        finish_audio = audio
+        playback = folder / "playback.m4a"
+        if (not finish_audio.is_file() or finish_audio.stat().st_size < 200) and playback.is_file():
+            finish_audio = playback
         app_main._finish_session(
             folder,
             session_id,
-            audio,
+            finish_audio,
             sentences,
             title=title,
             source_url=url,
@@ -364,10 +392,18 @@ def run_job(job: dict[str, Any]) -> None:
             host=host,
         )
         update_job(job_id, status=STATUS_READY, stage=STAGE_READY, error_kind=None, error_message=None)
+        ready_ms = int((time.monotonic() - started) * 1000)
+        log_url_import_stage(
+            host,
+            "T_session_ready",
+            elapsed_ms=ready_ms,
+            job_id=job_id,
+            session_id=session_id,
+        )
         log_url_import_stage(
             host,
             STAGE_READY,
-            elapsed_ms=int((time.monotonic() - started) * 1000),
+            elapsed_ms=ready_ms,
             job_id=job_id,
             session_id=session_id,
         )
@@ -375,7 +411,7 @@ def run_job(job: dict[str, Any]) -> None:
             "url_import_job job_id=%s session_id=%s stage=ready elapsed_ms=%s",
             job_id,
             session_id,
-            int((time.monotonic() - started) * 1000),
+            ready_ms,
         )
     except Exception as exc:
         detail = str(getattr(exc, "detail", "") or exc)

@@ -16,8 +16,10 @@ class PrepareUrlIsolationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             old_db, old_data = db.DB_PATH, main.DATA
             old_auth = os.environ.get("ENPRATO_REQUIRE_AUTH")
+            old_asr = os.environ.get("ENPRATO_ASR_BACKEND")
             try:
                 os.environ.pop("ENPRATO_REQUIRE_AUTH", None)
+                os.environ["ENPRATO_ASR_BACKEND"] = "whisper"
                 db.DB_PATH = Path(tmp) / "sessions.sqlite3"
                 main.DATA = Path(tmp) / "sessions"
                 main.DATA.mkdir()
@@ -62,6 +64,10 @@ class PrepareUrlIsolationTests(unittest.TestCase):
                     os.environ.pop("ENPRATO_REQUIRE_AUTH", None)
                 else:
                     os.environ["ENPRATO_REQUIRE_AUTH"] = old_auth
+                if old_asr is None:
+                    os.environ.pop("ENPRATO_ASR_BACKEND", None)
+                else:
+                    os.environ["ENPRATO_ASR_BACKEND"] = old_asr
 
 
 if __name__ == "__main__":

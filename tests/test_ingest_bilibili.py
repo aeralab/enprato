@@ -234,23 +234,21 @@ class BilibiliIngestIntegrationTests(unittest.TestCase):
     def _ingest(self, url, fake, env="production"):
         folder = Path(tempfile.mkdtemp())
 
-        def fake_merge(video, audio, dest):
-            dest.write_bytes(b"mp4merged" * 40)
+        def fake_remux(src, dest):
+            dest.write_bytes(b"m4a" * 400)
 
-        def fake_extract(src, dest, sr=16000):
-            dest.write_bytes(b"RIFF" + b"\x00" * 100)
+        def forbid_merge(*_args, **_kwargs):
+            raise AssertionError("source.mp4 merge must not run on the session-ready path")
 
         old_env = os.environ.get("ENPRATO_ENV")
         os.environ["ENPRATO_ENV"] = env
         ytdlp_calls = []
         try:
             with patch("backend.app.bilibili.urllib.request.urlopen", side_effect=fake.urlopen), patch(
-                "backend.app.bilibili.merge_dash", side_effect=fake_merge
-            ), patch("backend.app.ingest.extract_wav", side_effect=fake_extract), patch(
-                "backend.app.ingest.ensure_playback_audio", return_value=None
-            ), patch(
-                "backend.app.ingest._ensure_playable", side_effect=lambda f: f / "source.mp4"
-            ), patch(
+                "backend.app.bilibili.remux_dash_audio", side_effect=fake_remux
+            ), patch("backend.app.bilibili.merge_dash", side_effect=forbid_merge), patch(
+                "backend.app.ingest.extract_wav", side_effect=lambda src, dest, sr=16000: dest.write_bytes(b"RIFF" + b"\x00" * 100)
+            ), patch("backend.app.ingest.ensure_playback_audio", side_effect=lambda folder, media=None: folder / "playback.m4a"), patch(
                 "backend.app.ingest.fetch_bilibili_thumbnail", return_value=True
             ), patch(
                 "backend.app.ingest.ytdlp_cmd", side_effect=lambda: ytdlp_calls.append("ytdlp") or ["yt-dlp"]
@@ -266,14 +264,16 @@ class BilibiliIngestIntegrationTests(unittest.TestCase):
     def test_bv_url_uses_official_api_and_ignores_html_412(self):
         fake = FakeHTTP()
         (media, audio, captions), folder, fake, ytdlp_calls = self._ingest(BV_URL, fake)
-        self.assertTrue(media.name.endswith(".mp4"))
-        self.assertEqual(audio.name, "audio.wav")
+        self.assertEqual(media.name, "playback.m4a")
+        self.assertEqual(audio.name, "playback.m4a")
         self.assertIsNone(captions)
         self.assertEqual(ytdlp_calls, [])
         self.assertTrue(any("web-interface/view" in u for u in fake.requested))
         self.assertTrue(any("player/playurl" in u for u in fake.requested))
-        self.assertTrue(any("bilivideo.com" in u for u in fake.requested))
+        self.assertTrue(any("bilivideo.com" in u and "/a.m4s" in u for u in fake.requested))
+        self.assertFalse(any("/v.m4s" in u for u in fake.requested))
         self.assertFalse(any("www.bilibili.com/video" in u for u in fake.requested))
+        self.assertFalse((folder / "source.mp4").exists())
         self.assertEqual(json.loads((folder / "import_meta.json").read_text(encoding="utf-8"))["title"], "Official Title")
 
     def test_b23_resolves_then_imports(self):
@@ -285,7 +285,7 @@ class BilibiliIngestIntegrationTests(unittest.TestCase):
 
         with patch("backend.app.bilibili.resolve_bilibili_url", side_effect=resolve):
             (media, _audio, _captions), _folder, fake, ytdlp_calls = self._ingest(B23_URL, fake)
-        self.assertTrue(media.name.endswith(".mp4"))
+        self.assertEqual(media.name, "playback.m4a")
         self.assertEqual(ytdlp_calls, [])
 
     def test_missing_english_captions_does_not_block_media(self):
@@ -315,9 +315,11 @@ class BilibiliIngestIntegrationTests(unittest.TestCase):
         (_media, audio, captions), folder, _fake, ytdlp_calls = self._ingest(BV_URL, fake)
         self.assertIsNotNone(captions)
         self.assertIn("Hello from official sub", captions)
-        self.assertFalse(audio.is_file() and audio.stat().st_size > 8)
+        self.assertTrue((folder / "playback.m4a").is_file())
+        self.assertFalse((folder / "source.mp4").exists())
         self.assertEqual(ytdlp_calls, [])
         self.assertTrue((folder / "source.en.vtt").is_file())
+        self.assertFalse(any("/v.m4s" in u for u in fake.requested))
 
     def test_youtube_still_uses_ytdlp(self):
         folder = Path(tempfile.mkdtemp())

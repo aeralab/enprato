@@ -290,7 +290,7 @@ def ensure_playback_audio(folder: Path, media: Path | None = None) -> Path | Non
         candidates: list[Path] = []
         if media and media.is_file():
             candidates.append(media)
-        for name in ("source.mp4", "source.webm", "source.mkv", "audio.wav"):
+        for name in ("playback.m4a", "dash_audio.m4s", "source.mp4", "source.webm", "source.mkv", "audio.wav"):
             path = folder / name
             if path.is_file() and path not in candidates:
                 candidates.append(path)

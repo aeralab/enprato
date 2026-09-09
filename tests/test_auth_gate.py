@@ -22,11 +22,13 @@ def _isolate_env():
         "auth": os.environ.get("ENPRATO_REQUIRE_AUTH"),
         "secure": os.environ.get("ENPRATO_COOKIE_SECURE"),
         "mock": os.environ.get("ENPRATO_ALLOW_MOCK_PAY"),
+        "asr": os.environ.get("ENPRATO_ASR_BACKEND"),
     }
     db.DB_PATH = Path(tmp.name) / "auth.sqlite3"
     main.DATA = Path(tmp.name) / "sessions"
     main.DATA.mkdir()
     db.migrate()
+    os.environ["ENPRATO_ASR_BACKEND"] = "whisper"
     return tmp, old
 
 
@@ -36,7 +38,12 @@ def _restore_env(tmp, old):
     except Exception:
         pass
     db.DB_PATH, main.DATA = old["db"], old["data"]
-    for key, env_name in (("auth", "ENPRATO_REQUIRE_AUTH"), ("secure", "ENPRATO_COOKIE_SECURE"), ("mock", "ENPRATO_ALLOW_MOCK_PAY")):
+    for key, env_name in (
+        ("auth", "ENPRATO_REQUIRE_AUTH"),
+        ("secure", "ENPRATO_COOKIE_SECURE"),
+        ("mock", "ENPRATO_ALLOW_MOCK_PAY"),
+        ("asr", "ENPRATO_ASR_BACKEND"),
+    ):
         if old[key] is None:
             os.environ.pop(env_name, None)
         else:

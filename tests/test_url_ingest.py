@@ -21,6 +21,7 @@ def _isolate_env():
         "data": main.DATA,
         "auth": os.environ.get("ENPRATO_REQUIRE_AUTH"),
         "secure": os.environ.get("ENPRATO_COOKIE_SECURE"),
+        "asr": os.environ.get("ENPRATO_ASR_BACKEND"),
     }
     db.DB_PATH = Path(tmp.name) / "url-ingest.sqlite3"
     main.DATA = Path(tmp.name) / "sessions"
@@ -28,6 +29,7 @@ def _isolate_env():
     db.migrate()
     os.environ.pop("ENPRATO_REQUIRE_AUTH", None)
     os.environ["ENPRATO_COOKIE_SECURE"] = "0"
+    os.environ["ENPRATO_ASR_BACKEND"] = "whisper"
     return tmp, old
 
 
@@ -45,6 +47,10 @@ def _restore_env(tmp, old):
         os.environ.pop("ENPRATO_COOKIE_SECURE", None)
     else:
         os.environ["ENPRATO_COOKIE_SECURE"] = old["secure"]
+    if old.get("asr") is None:
+        os.environ.pop("ENPRATO_ASR_BACKEND", None)
+    else:
+        os.environ["ENPRATO_ASR_BACKEND"] = old["asr"]
     tmp.cleanup()
 
 

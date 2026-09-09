@@ -32,6 +32,8 @@ class AsyncUrlImportTests(unittest.TestCase):
             "data": main.DATA,
             "auth": os.environ.get("ENPRATO_REQUIRE_AUTH"),
             "secure": os.environ.get("ENPRATO_COOKIE_SECURE"),
+            "asr": os.environ.get("ENPRATO_ASR_BACKEND"),
+            "dashscope": os.environ.get("DASHSCOPE_API_KEY"),
         }
         db.DB_PATH = Path(self.tmp.name) / "jobs.sqlite3"
         main.DATA = Path(self.tmp.name) / "sessions"
@@ -39,6 +41,7 @@ class AsyncUrlImportTests(unittest.TestCase):
         db.migrate()
         os.environ["ENPRATO_REQUIRE_AUTH"] = "1"
         os.environ["ENPRATO_COOKIE_SECURE"] = "0"
+        os.environ["ENPRATO_ASR_BACKEND"] = "whisper"
 
     def tearDown(self):
         try:
@@ -54,6 +57,14 @@ class AsyncUrlImportTests(unittest.TestCase):
             os.environ.pop("ENPRATO_COOKIE_SECURE", None)
         else:
             os.environ["ENPRATO_COOKIE_SECURE"] = self.old["secure"]
+        if self.old.get("asr") is None:
+            os.environ.pop("ENPRATO_ASR_BACKEND", None)
+        else:
+            os.environ["ENPRATO_ASR_BACKEND"] = self.old["asr"]
+        if self.old.get("dashscope") is None:
+            os.environ.pop("DASHSCOPE_API_KEY", None)
+        else:
+            os.environ["DASHSCOPE_API_KEY"] = self.old["dashscope"]
         self.tmp.cleanup()
 
     def _client(self, email: str) -> TestClient:
@@ -295,3 +306,66 @@ class AsyncUrlImportTests(unittest.TestCase):
         body = res.json()
         self.assertNotIn("job_id", body)
         self.assertEqual(body["sentences"][0]["text"], "Hello from asr.")
+
+    def test_aliyun_success_does_not_call_whisper_or_need_source_mp4(self):
+        os.environ["ENPRATO_ASR_BACKEND"] = "aliyun"
+        os.environ["DASHSCOPE_API_KEY"] = "test-not-a-real-key"
+        client = self._client("aliyun-ok@example.com")
+        whisper_calls: list[str] = []
+
+        def fake_ingest(_url, folder, **_kwargs):
+            playback = folder / "playback.m4a"
+            playback.write_bytes(b"m4a" * 400)
+            return playback, playback, None
+
+        def fake_aliyun(_self, _path, hints=None):
+            from backend.app.dashscope_asr import AliyunASRResult
+
+            return AliyunASRResult(
+                sentences=ASR_SENTENCE,
+                timings={"T_asr": 0.01},
+                has_word_ts=True,
+                has_sentence_ts=True,
+            )
+
+        def boom(_audio):
+            whisper_calls.append("whisper")
+            return ASR_SENTENCE
+
+        with patch.object(main, "ingest_url", side_effect=fake_ingest), patch(
+            "backend.app.dashscope_asr.AliyunASRBackend.transcribe", fake_aliyun
+        ), patch.object(main, "transcribe_sentences", side_effect=boom):
+            res = client.post("/api/prepare-url", json={"url": "https://www.bilibili.com/video/BV1CMjq6nEu1/"})
+            detail = wait_ready(client, res)
+        self.assertEqual(detail["sentences"][0]["text"], "Hello from asr.")
+        self.assertEqual(whisper_calls, [])
+        self.assertFalse(detail.get("has_video"))
+        self.assertEqual(client.get("/api/auth/me").json()["user"]["trial"]["used"], 1)
+        self.assertFalse((main.DATA / detail["session_id"] / "source.mp4").exists())
+
+    def test_aliyun_failure_falls_back_to_whisper_without_second_quota(self):
+        os.environ["ENPRATO_ASR_BACKEND"] = "aliyun"
+        os.environ["DASHSCOPE_API_KEY"] = "test-not-a-real-key"
+        client = self._client("aliyun-fb@example.com")
+
+        def fake_ingest(_url, folder, **_kwargs):
+            playback = folder / "playback.m4a"
+            playback.write_bytes(b"m4a" * 400)
+            return playback, playback, None
+
+        def fail_aliyun(_self, _path, hints=None):
+            from backend.app.dashscope_asr import AliyunASRError
+
+            raise AliyunASRError("aliyun_submit", "http=500")
+
+        with patch.object(main, "ingest_url", side_effect=fake_ingest), patch(
+            "backend.app.dashscope_asr.AliyunASRBackend.transcribe", fail_aliyun
+        ), patch.object(main, "transcribe_sentences", return_value=ASR_SENTENCE), patch.object(main, "extract_wav"):
+            res = client.post("/api/prepare-url", json={"url": "https://www.bilibili.com/video/BV1xx/"})
+            job, _ = wait_job(client, res.json()["job_id"])
+            detail = client.get("/api/session/" + job["session_id"])
+        self.assertEqual(job["status"], "ready")
+        self.assertEqual(detail.json()["sentences"][0]["text"], "Hello from asr.")
+        self.assertNotIn("Aliyun", job.get("message") or "")
+        self.assertNotIn("Whisper", job.get("message") or "")
+        self.assertEqual(client.get("/api/auth/me").json()["user"]["trial"]["used"], 1)

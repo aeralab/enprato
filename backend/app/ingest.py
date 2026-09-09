@@ -443,7 +443,13 @@ def _bili_ytdlp_fallback_allowed() -> bool:
     return (os.environ.get("ENPRATO_ENV") or "").strip().lower() != "production"
 
 
-def ingest_url(url: str, folder: Path, on_stage: Callable[..., None] | None = None) -> tuple[Path, Path, str | None]:
+def ingest_url(
+    url: str,
+    folder: Path,
+    on_stage: Callable[..., None] | None = None,
+    job_id: str | None = None,
+    session_id: str | None = None,
+) -> tuple[Path, Path, str | None]:
     """Fetch playable media + optional English captions. Returns (video_or_audio, wav, captions_text)."""
     url = validate_media_url(url)
     host = url_host_family(url)
@@ -451,7 +457,7 @@ def ingest_url(url: str, folder: Path, on_stage: Callable[..., None] | None = No
     folder.mkdir(parents=True, exist_ok=True)
     audio = folder / "audio.wav"
     if is_bilibili_url(url):
-        return _ingest_bilibili_url(url, folder, audio, started, on_stage=on_stage)
+        return _ingest_bilibili_url(url, folder, audio, started, on_stage=on_stage, job_id=job_id, session_id=session_id)
     return _ingest_url_ytdlp(url, folder, audio, host, started, on_stage=on_stage)
 
 
@@ -461,6 +467,8 @@ def _ingest_bilibili_url(
     audio: Path,
     started: float,
     on_stage: Callable[..., None] | None = None,
+    job_id: str | None = None,
+    session_id: str | None = None,
 ) -> tuple[Path, Path, str | None]:
     host = "bilibili.com"
     if on_stage:
@@ -482,10 +490,38 @@ def _ingest_bilibili_url(
         _write_import_meta(folder, subtitle_status="ok" if captions else "unavailable")
         log_url_import_stage(
             host,
+            "T_metadata",
+            elapsed_ms=int(view.get("t_metadata_ms") or _elapsed_ms(media_started)),
+            path="official_api",
+            job_id=job_id,
+            session_id=session_id,
+        )
+        log_url_import_stage(
+            host,
+            "T_subtitle",
+            elapsed_ms=int(view.get("t_subtitle_ms") or 0),
+            captions="1" if captions else "0",
+            path="official_api",
+            job_id=job_id,
+            session_id=session_id,
+        )
+        log_url_import_stage(
+            host,
+            "T_audio_download",
+            elapsed_ms=int(view.get("t_audio_download_ms") or 0),
+            path="official_api",
+            job_id=job_id,
+            session_id=session_id,
+        )
+        log_url_import_stage(
+            host,
             "media_download",
             elapsed_ms=_elapsed_ms(media_started),
             path="official_api",
             captions="1" if captions else "0",
+            audio_only="1" if view.get("audio_only") else "0",
+            job_id=job_id,
+            session_id=session_id,
         )
     except BilibiliIngestError as exc:
         log_url_import_stage(host, "media_download", error_kind=exc.kind, path="official_api")
@@ -493,32 +529,43 @@ def _ingest_bilibili_url(
             log_url_import_stage(host, "media_download", recovered="ytdlp_fallback", error_kind=exc.kind)
             return _ingest_url_ytdlp(url, folder, audio, host, started, on_stage=on_stage)
         raise RuntimeError(public_url_import_error(exc)) from exc
-    if captions:
-        log_url_import_stage(host, "audio_extract", elapsed_ms=0, skipped="captions")
-    else:
-        extract_started = time.monotonic()
-        if on_stage:
-            on_stage("processing_audio")
-        log_url_import_stage(host, "audio_extract_start")
-        try:
+    playback = folder / "playback.m4a"
+    if on_stage:
+        on_stage("processing_audio")
+    extract_started = time.monotonic()
+    try:
+        if playback.is_file() and playback.stat().st_size >= 200:
+            ensure_playback_audio(folder, playback)
+            asr_audio = playback
+        else:
             extract_wav(media, audio)
             ensure_playback_audio(folder, media)
-        except Exception as exc:
-            log_url_import_stage(
-                host,
-                "audio_extract",
-                elapsed_ms=_elapsed_ms(extract_started),
-                error_kind="ffmpeg_failure",
-            )
-            raise RuntimeError(public_url_import_error(exc)) from exc
-        log_url_import_stage(host, "audio_extract", elapsed_ms=_elapsed_ms(extract_started))
+            asr_audio = audio
+        log_url_import_stage(
+            host,
+            "T_audio_prepare",
+            elapsed_ms=int(view.get("t_audio_prepare_ms") or _elapsed_ms(extract_started)),
+            skipped="0",
+            job_id=job_id,
+            session_id=session_id,
+        )
+    except Exception as exc:
+        log_url_import_stage(
+            host,
+            "audio_extract",
+            elapsed_ms=_elapsed_ms(extract_started),
+            error_kind="ffmpeg_failure",
+        )
+        raise RuntimeError(public_url_import_error(exc)) from exc
+    if captions:
+        log_url_import_stage(host, "audio_extract", elapsed_ms=0, skipped="captions")
     try:
         fetch_bilibili_thumbnail(url, folder / "thumb.jpg")
     except Exception:
         pass
     adopt_downloaded_thumbnail(folder)
     log_url_import_stage(host, "ingest_total", elapsed_ms=_elapsed_ms(started), path="official_api")
-    return media, audio, captions
+    return media, asr_audio, captions
 
 
 def _ingest_url_ytdlp(

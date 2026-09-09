@@ -369,6 +369,18 @@ def download_with_backups(urls: list[str], dest: Path) -> str:
     raise last or BilibiliIngestError("bilibili_media_download_failed", "no cdn url")
 
 
+def remux_dash_audio(src: Path, dest: Path) -> None:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        run_ffmpeg(["-i", str(src), "-vn", "-c:a", "copy", "-movflags", "+faststart", str(dest)])
+    except Exception:
+        run_ffmpeg(
+            ["-i", str(src), "-vn", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(dest)]
+        )
+    if not dest.is_file() or dest.stat().st_size < 200:
+        raise BilibiliIngestError("bilibili_media_download_failed", "audio remux missing")
+
+
 def merge_dash(video: Path, audio: Path, dest: Path) -> None:
     try:
         run_ffmpeg(
@@ -468,36 +480,65 @@ def fetch_english_captions(view: dict) -> str | None:
         return None
 
 
-def ingest_bilibili(url: str, folder: Path) -> tuple[Path, str | None, dict]:
+def ingest_bilibili(url: str, folder: Path, *, include_video: bool = False) -> tuple[Path, str | None, dict]:
+    """Download DASH audio for playback/ASR. Video merge is off the session-ready path."""
     started = time.monotonic()
+    t0 = time.monotonic()
     view = fetch_view(url)
     play = fetch_playurl(view["bvid"], view["cid"])
+    view["t_metadata_ms"] = int((time.monotonic() - t0) * 1000)
+    t1 = time.monotonic()
     captions = fetch_english_captions(view)
-    dest = folder / "source.mp4"
+    view["t_subtitle_ms"] = int((time.monotonic() - t1) * 1000)
+    folder.mkdir(parents=True, exist_ok=True)
+    playback = folder / "playback.m4a"
     dash = play.get("dash") if isinstance(play.get("dash"), dict) else None
     if dash:
-        video = pick_dash_video(dash.get("video") or [])
         audio = pick_dash_audio(dash.get("audio") or [])
-        if not video or not audio:
-            raise BilibiliIngestError("bilibili_playurl_failed", "dash streams missing")
-        video_part = folder / "dash_video.m4s"
+        if not audio:
+            raise BilibiliIngestError("bilibili_playurl_failed", "dash audio missing")
         audio_part = folder / "dash_audio.m4s"
+        t2 = time.monotonic()
+        download_with_backups(_stream_urls(audio), audio_part)
+        view["t_audio_download_ms"] = int((time.monotonic() - t2) * 1000)
+        t3 = time.monotonic()
+        remux_dash_audio(audio_part, playback)
+        view["t_audio_prepare_ms"] = int((time.monotonic() - t3) * 1000)
         try:
-            download_with_backups(_stream_urls(video), video_part)
-            download_with_backups(_stream_urls(audio), audio_part)
-            merge_dash(video_part, audio_part, dest)
-        finally:
-            for part in (video_part, audio_part):
+            if audio_part.exists():
+                audio_part.unlink()
+        except OSError:
+            pass
+        dest = playback
+        if include_video:
+            video = pick_dash_video(dash.get("video") or [])
+            if not video:
+                raise BilibiliIngestError("bilibili_playurl_failed", "dash video missing")
+            video_part = folder / "dash_video.m4s"
+            merged = folder / "source.mp4"
+            try:
+                download_with_backups(_stream_urls(video), video_part)
+                merge_dash(video_part, playback, merged)
+                dest = merged
+            finally:
                 try:
-                    if part.exists():
-                        part.unlink()
+                    if video_part.exists():
+                        video_part.unlink()
                 except OSError:
                     pass
     else:
         durl = play.get("durl") if isinstance(play.get("durl"), list) else []
         if not durl or not isinstance(durl[0], dict):
             raise BilibiliIngestError("bilibili_playurl_failed", "no playable stream")
+        dest = folder / "source.mp4"
+        t2 = time.monotonic()
         download_with_backups(_stream_urls(durl[0]), dest)
+        view["t_audio_download_ms"] = int((time.monotonic() - t2) * 1000)
+        t3 = time.monotonic()
+        remux_dash_audio(dest, playback)
+        view["t_audio_prepare_ms"] = int((time.monotonic() - t3) * 1000)
+        dest = playback
     view["elapsed_ms"] = int((time.monotonic() - started) * 1000)
     view["captions"] = bool(captions)
+    view["audio_only"] = not include_video
     return dest, captions, view
