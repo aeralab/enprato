@@ -91,11 +91,20 @@ class TrialStudyTests(unittest.TestCase):
     def _beat(self, sid: str, seconds: int):
         return self.client.post(f"/api/session/{sid}/study-heartbeat", json={"active_seconds": seconds})
 
+    def _warp_last_study(self, sid: str, seconds_ago: int) -> None:
+        conn = db.connect()
+        try:
+            past = db.iso(db.utc_now() - timedelta(seconds=max(1, int(seconds_ago))))
+            conn.execute("UPDATE learning_sessions SET last_study_at=? WHERE session_id=?", (past, sid))
+        finally:
+            conn.close()
+
     def _add(self, sid: str, total: int):
         left = total
         last = None
         while left > 0:
             chunk = min(20, left)
+            self._warp_last_study(sid, chunk + db.STUDY_HEARTBEAT_SLACK_MIN_ELAPSED)
             last = self._beat(sid, chunk)
             self.assertEqual(last.status_code, 200, last.text)
             left -= chunk
@@ -118,6 +127,14 @@ class TrialStudyTests(unittest.TestCase):
         for i in range(15):
             self._import(f"https://example.com/more{i}.mp4")
         self.assertEqual(self._used(), 0)
+        conn = db.connect()
+        try:
+            n = conn.execute(
+                "SELECT COUNT(*) FROM payment_events WHERE provider='trial' AND result='consumed' AND instr(event_id, ':prepare:') > 0"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(n, 0)
 
     def test_import_failure_and_duplicate_keep_quota(self):
         with patch.object(main, "ingest_url", side_effect=RuntimeError("download failed")):
@@ -204,8 +221,10 @@ class TrialStudyTests(unittest.TestCase):
         a = self._make_session("bindaaaaaaa")
         b = self._make_session("bindbbbbbbb")
         self.assertEqual(self._beat(a, 10).json()["active_study_seconds"], 10)
-        self.assertEqual(self._beat(b, 7).json()["active_study_seconds"], 7)
+        self._warp_last_study(a, 12)
         self.assertEqual(self._beat(a, 2).json()["active_study_seconds"], 12)
+        self.assertEqual(self._beat(b, 7).json()["active_study_seconds"], 7)
+        self._warp_last_study(b, 12)
         self.assertEqual(self._beat(b, 1).json()["active_study_seconds"], 8)
         self.assertEqual(self._beat(a, 21).status_code, 400)
         self.assertEqual(self._beat(a, -1).status_code, 400)
@@ -213,6 +232,34 @@ class TrialStudyTests(unittest.TestCase):
         other.post("/api/auth/register", json={"email": "other@example.com", "password": "password123"})
         hidden = other.post(f"/api/session/{a}/study-heartbeat", json={"active_seconds": 5})
         self.assertEqual(hidden.status_code, 404)
+
+    def test_rapid_heartbeats_cannot_farm_study_time(self):
+        a = self._make_session("farmrapidxxx")
+        first = self._beat(a, 20)
+        self.assertEqual(first.status_code, 200, first.text)
+        for _ in range(25):
+            res = self._beat(a, 20)
+            self.assertEqual(res.status_code, 200, res.text)
+        total = int(self._beat(a, 0).json()["active_study_seconds"])
+        self.assertLess(total, 80)
+        self.assertEqual(self._used(), 0)
+
+    def test_heartbeat_credits_elapsed_wall_time_after_gap(self):
+        a = self._make_session("farmwallxxxx")
+        self.assertEqual(self._beat(a, 20).json()["active_study_seconds"], 20)
+        self._warp_last_study(a, 12)
+        body = self._beat(a, 20).json()
+        self.assertGreaterEqual(body["active_study_seconds"], 32)
+        self.assertLessEqual(body["active_study_seconds"], 45)
+        self.assertEqual(self._used(), 0)
+
+    def test_credited_study_seconds_helper(self):
+        now = db.utc_now()
+        self.assertEqual(db.credited_study_seconds(20, None, now), 20)
+        self.assertEqual(db.credited_study_seconds(20, db.iso(now), now), 0)
+        self.assertEqual(db.credited_study_seconds(20, db.iso(now - timedelta(seconds=1)), now), 1)
+        self.assertEqual(db.credited_study_seconds(12, db.iso(now - timedelta(seconds=12)), now), 12)
+        self.assertEqual(db.credited_study_seconds(20, db.iso(now - timedelta(seconds=12)), now), 17)
 
     def test_migration_idempotent_and_non_negative(self):
         user = db.create_user("migrate@example.com", hash_password("password123"))

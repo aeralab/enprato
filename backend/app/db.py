@@ -39,6 +39,8 @@ def connect(path: Path | None = None) -> sqlite3.Connection:
 
 DEEP_STUDY_SECONDS = 300
 STUDY_HEARTBEAT_MAX_SECONDS = 20
+STUDY_HEARTBEAT_SLACK_SECONDS = 5
+STUDY_HEARTBEAT_SLACK_MIN_ELAPSED = 8
 DEEP_STUDY_DONE_MESSAGE = "免费深度学习的 5 个素材已用完，开通会员后可继续学习新的素材。"
 
 
@@ -467,6 +469,25 @@ def can_deep_study(user_id: str, session_id: str, conn: sqlite3.Connection | Non
             conn.close()
 
 
+def credited_study_seconds(claimed: int, last_study_at: str | None, now_dt: datetime) -> int:
+    """Credit at most elapsed wall time between heartbeats, plus small flush slack."""
+    if claimed <= 0:
+        return 0
+    if not last_study_at:
+        return claimed
+    try:
+        prev = parse_time(str(last_study_at))
+    except Exception:
+        return claimed
+    elapsed = (now_dt - prev).total_seconds()
+    if elapsed < 0:
+        elapsed = 0.0
+    allowed = elapsed
+    if elapsed >= STUDY_HEARTBEAT_SLACK_MIN_ELAPSED:
+        allowed = elapsed + STUDY_HEARTBEAT_SLACK_SECONDS
+    return min(claimed, max(0, int(allowed)))
+
+
 def apply_study_heartbeat(user_id: str, session_id: str, active_seconds: int) -> dict[str, Any]:
     try:
         seconds = int(active_seconds)
@@ -478,7 +499,7 @@ def apply_study_heartbeat(user_id: str, session_id: str, active_seconds: int) ->
     try:
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
-            "SELECT owner_user_id, active_study_seconds, trial_consumed FROM learning_sessions WHERE session_id=?",
+            "SELECT owner_user_id, active_study_seconds, trial_consumed, last_study_at FROM learning_sessions WHERE session_id=?",
             (session_id,),
         ).fetchone()
         if not row or str(row["owner_user_id"] or "") != user_id:
@@ -487,12 +508,14 @@ def apply_study_heartbeat(user_id: str, session_id: str, active_seconds: int) ->
         if not can_deep_study(user_id, session_id, conn):
             conn.execute("ROLLBACK")
             raise PermissionError("deep_study")
-        now = iso()
+        now_dt = utc_now()
+        now = iso(now_dt)
+        credit = credited_study_seconds(seconds, row["last_study_at"], now_dt) if seconds else 0
         if seconds:
             conn.execute(
                 "UPDATE learning_sessions SET active_study_seconds=active_study_seconds+?, last_study_at=?, updated_at=? "
                 "WHERE session_id=? AND owner_user_id=?",
-                (seconds, now, now, session_id, user_id),
+                (credit, now, now, session_id, user_id),
             )
         row = conn.execute(
             "SELECT active_study_seconds, trial_consumed FROM learning_sessions WHERE session_id=?",
