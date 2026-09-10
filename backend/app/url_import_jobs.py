@@ -275,7 +275,6 @@ def recover_stale_jobs() -> int:
 def fail_job(job: dict[str, Any], error_kind: str, message: str) -> None:
     job_id = str(job.get("job_id") or "")
     session_id = str(job.get("session_id") or "")
-    user_id = str(job.get("user_id") or "")
     update_job(
         job_id,
         status=STATUS_FAILED,
@@ -289,8 +288,6 @@ def fail_job(job: dict[str, Any], error_kind: str, message: str) -> None:
         session_id,
         error_kind,
     )
-    if user_id and user_id != "lan-local" and session_id:
-        db.refund_trial(user_id, "prepare:" + session_id)
     if session_id:
         from . import main as app_main
 

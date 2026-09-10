@@ -167,7 +167,7 @@ class BilibiliMediaJobTests(unittest.TestCase):
             session_id = detail["session_id"]
             self.assertFalse(detail.get("has_video"))
             self.assertFalse((main.DATA / session_id / "source.mp4").exists())
-            self.assertEqual(client.get("/api/auth/me").json()["user"]["trial"]["used"], 1)
+            self.assertEqual(client.get("/api/auth/me").json()["user"]["trial"]["used"], 0)
             media = client.get("/api/session/" + session_id + "/media")
             self.assertEqual(media.status_code, 200)
             self.assertEqual(media.json()["status"], "preparing")
@@ -199,7 +199,7 @@ class BilibiliMediaJobTests(unittest.TestCase):
         fail_job.assert_not_called()
         job = url_import_jobs.get_job(res.json()["job_id"])
         self.assertEqual(job["status"], "ready")
-        self.assertEqual(client.get("/api/auth/me").json()["user"]["trial"]["used"], 1)
+        self.assertEqual(client.get("/api/auth/me").json()["user"]["trial"]["used"], 0)
         media = client.get("/api/session/" + detail["session_id"] + "/media").json()
         self.assertFalse(media["has_video"])
         self.assertEqual(media["status"], "failed")

@@ -249,7 +249,6 @@ class AsyncUrlImportTests(unittest.TestCase):
         session_id = "stalesession1"
         db.register_learning_session(session_id, user_id)
         (main.DATA / session_id).mkdir()
-        db.consume_trial(user_id, "prepare:" + session_id)
         now = db.iso()
         conn = db.connect()
         try:
@@ -343,7 +342,7 @@ class AsyncUrlImportTests(unittest.TestCase):
         self.assertEqual(detail["sentences"][0]["text"], "Hello from asr.")
         self.assertEqual(whisper_calls, [])
         self.assertFalse(detail.get("has_video"))
-        self.assertEqual(client.get("/api/auth/me").json()["user"]["trial"]["used"], 1)
+        self.assertEqual(client.get("/api/auth/me").json()["user"]["trial"]["used"], 0)
         self.assertFalse((main.DATA / detail["session_id"] / "source.mp4").exists())
 
     def test_aliyun_failure_falls_back_to_whisper_without_second_quota(self):
@@ -371,4 +370,4 @@ class AsyncUrlImportTests(unittest.TestCase):
         self.assertEqual(detail.json()["sentences"][0]["text"], "Hello from asr.")
         self.assertNotIn("Aliyun", job.get("message") or "")
         self.assertNotIn("Whisper", job.get("message") or "")
-        self.assertEqual(client.get("/api/auth/me").json()["user"]["trial"]["used"], 1)
+        self.assertEqual(client.get("/api/auth/me").json()["user"]["trial"]["used"], 0)

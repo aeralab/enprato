@@ -219,11 +219,6 @@ def _cues_from_text(raw: str, filename: str = "") -> list[dict[str, Any]]:
     return parse_srt(raw)
 
 
-def _refund_failed_prepare(user: dict[str, Any], session_id: str) -> None:
-    if user.get("id") and user["id"] != "lan-local":
-        db.refund_trial(user["id"], "prepare:" + session_id)
-
-
 def _transcribe_import(audio: Path, host: str = "unknown") -> list[dict[str, Any]]:
     log_url_import_stage(host, "asr_start")
     started = time.monotonic()
@@ -298,6 +293,10 @@ class ProgressBody(BaseModel):
     orientation: str | None = None
     source_session_id: str | None = None
     save_reason: str | None = None
+
+
+class StudyHeartbeatBody(BaseModel):
+    active_seconds: int
 
 
 class LearningCompleteBody(BaseModel):
@@ -375,7 +374,24 @@ def require_member_or_trial(user: dict[str, Any]) -> None:
         return
     quota = db.trial_status(user["id"])
     if quota["remaining"] <= 0:
-        raise HTTPException(402, "免费学习素材次数已用完")
+        raise HTTPException(402, db.DEEP_STUDY_DONE_MESSAGE)
+
+
+def require_deep_study(user: dict[str, Any], session_id: str) -> None:
+    if user.get("id") == "lan-local":
+        require_member_or_trial(user)
+        return
+    sid = str(session_id or "").strip()
+    if not sid:
+        raise HTTPException(400, "缺少 session_id")
+    if not db.can_deep_study(user["id"], sid):
+        raise HTTPException(402, db.DEEP_STUDY_DONE_MESSAGE)
+
+
+def _incoming_has_draft_content(drafts: dict[str, str] | None) -> bool:
+    if not drafts:
+        return False
+    return any(str(v or "").strip() for v in drafts.values())
 
 
 def require_session_access(session_id: str, request: Request) -> dict[str, Any]:
@@ -919,6 +935,8 @@ def _match_sentence_index(sentences: list[Any], text: str, hint: int) -> int:
 @app.post("/api/session/{session_id}/remote-draft")
 def remote_draft(session_id: str, body: RemoteDraftBody, user: dict[str, Any] = Depends(require_session_access)) -> dict[str, Any]:
     folder = require_owned_session(session_id, user)
+    if str(body.text or "").strip():
+        require_deep_study(user, session_id)
     sentences = read_json(folder / "sentences.json", [])
     if not isinstance(sentences, list) or not sentences:
         raise HTTPException(404, "没有句子")
@@ -971,6 +989,8 @@ def remote_drafts_bulk(session_id: str, body: RemoteDraftsBody, user: dict[str, 
             continue
         if 0 <= i <= max_i:
             incoming[str(i)] = str(value or "")
+    if _incoming_has_draft_content(incoming):
+        require_deep_study(user, session_id)
     previous = dict(drafts)
     drafts = collapse_identical_drafts(apply_draft_snapshot(drafts, incoming))
     _safe_record_dictations(user, session_id, folder, previous, drafts)
@@ -1177,7 +1197,7 @@ async def remote_stt(
     mode: str = Form("replace"),
     user: dict[str, Any] = Depends(require_session_access),
 ) -> dict[str, Any]:
-    require_member_or_trial(user)
+    require_deep_study(user, session_id)
     folder = require_owned_session(session_id, user)
     request_id = str(getattr(request.state, "request_id", "") or uuid.uuid4().hex[:12])
     tmp_dir = DATA / "_stt"
@@ -1212,7 +1232,7 @@ async def _stt_from_raw_bytes(
     mode: str,
     body: bytes,
 ) -> dict[str, Any]:
-    require_member_or_trial(user)
+    require_deep_study(user, session_id)
     folder = require_owned_session(session_id, user)
     request_id = str(getattr(request.state, "request_id", "") or uuid.uuid4().hex[:12])
     client_request_id = str(getattr(request.state, "client_request_id", "") or "")
@@ -1307,15 +1327,10 @@ async def prepare(
     captions: UploadFile | None = File(default=None),
     user: dict[str, Any] = Depends(require_user_or_local),
 ) -> dict[str, Any]:
-    require_member_or_trial(user)
     session_id = uuid.uuid4().hex[:12]
     folder = DATA / session_id
     folder.mkdir(parents=True, exist_ok=True)
     db.register_learning_session(session_id, user["id"])
-    if user["id"] != "lan-local":
-        if not db.membership_status(user["id"]).get("active") and not db.consume_trial(user["id"], "prepare:" + session_id):
-            shutil.rmtree(folder, ignore_errors=True)
-            raise HTTPException(402, "免费学习素材次数已用完")
 
     suffix = Path(video.filename or "video.mp4").suffix or ".mp4"
     source = folder / f"source{suffix}"
@@ -1326,7 +1341,6 @@ async def prepare(
         extract_wav(media, audio)
         ensure_playback_audio(folder, media)
     except Exception as exc:
-        _refund_failed_prepare(user, session_id)
         shutil.rmtree(folder, ignore_errors=True)
         raise HTTPException(400, f"抽音频失败（需要视频里有音轨，并已安装 ffmpeg）: {exc}") from exc
 
@@ -1344,7 +1358,7 @@ async def prepare(
             source_kind="file",
         )
     except Exception:
-        _refund_failed_prepare(user, session_id)
+        shutil.rmtree(folder, ignore_errors=True)
         raise
 
 
@@ -1381,15 +1395,10 @@ async def prepare_url(body: PrepareUrlBody, user: dict[str, Any] = Depends(requi
                         logger.info("url_import_start host=%s reused_session=%s", preview, existing)
                         return {"status": "ready", **detail}
                 shutil.rmtree(folder_existing, ignore_errors=True)
-        require_member_or_trial(user)
         session_id = uuid.uuid4().hex[:12]
         folder = DATA / session_id
         folder.mkdir(parents=True, exist_ok=True)
         db.register_learning_session(session_id, user["id"])
-        if user["id"] != "lan-local":
-            if not db.membership_status(user["id"]).get("active") and not db.consume_trial(user["id"], "prepare:" + session_id):
-                shutil.rmtree(folder, ignore_errors=True)
-                raise HTTPException(402, "免费学习素材次数已用完")
         job = url_import_jobs.create_job(owner, session_id, url)
         return {
             "status": "processing",
@@ -1463,7 +1472,48 @@ def api_session(session_id: str, user: dict[str, Any] = Depends(require_session_
     detail = session_detail(folder, session_id)
     if not detail:
         raise HTTPException(404, "session 不存在")
+    if user.get("id") == "lan-local":
+        detail["can_deep_study"] = True
+        detail["trial_consumed"] = False
+    else:
+        detail["can_deep_study"] = db.can_deep_study(user["id"], session_id)
+        conn = db.connect()
+        try:
+            row = conn.execute(
+                "SELECT trial_consumed, active_study_seconds FROM learning_sessions WHERE session_id=?",
+                (session_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+        detail["trial_consumed"] = bool(row and int(row["trial_consumed"] or 0))
+        detail["active_study_seconds"] = int(row["active_study_seconds"] or 0) if row else 0
     return detail
+
+
+@app.post("/api/session/{session_id}/study-heartbeat")
+def study_heartbeat(
+    session_id: str,
+    body: StudyHeartbeatBody,
+    user: dict[str, Any] = Depends(require_session_access),
+) -> dict[str, Any]:
+    require_owned_session(session_id, user)
+    if user.get("id") == "lan-local":
+        require_deep_study(user, session_id)
+        return {
+            "session_id": session_id,
+            "active_study_seconds": 0,
+            "trial_consumed": False,
+            "trial": {"limit": 5, "used": 0, "remaining": 5},
+        }
+    require_deep_study(user, session_id)
+    try:
+        return db.apply_study_heartbeat(user["id"], session_id, body.active_seconds)
+    except LookupError:
+        raise HTTPException(404, "session not found") from None
+    except PermissionError:
+        raise HTTPException(402, db.DEEP_STUDY_DONE_MESSAGE) from None
+    except ValueError:
+        raise HTTPException(400, "invalid active_seconds") from None
 
 
 @app.get("/api/session/{session_id}/media")
@@ -1485,6 +1535,8 @@ def api_save_progress(session_id: str, body: ProgressBody, user: dict[str, Any] 
         )
         raise HTTPException(400, "source_session_id mismatch")
     folder = require_owned_session(session_id, user)
+    if _incoming_has_draft_content(body.drafts):
+        require_deep_study(user, session_id)
     fields: dict[str, Any] = {
         "phase": body.phase,
         "index": body.index,
@@ -1632,9 +1684,15 @@ async def stt(
     audio: UploadFile = File(...),
     context: str = Form(default=""),
     target: str = Form(default=""),
+    session_id: str = Form(default=""),
     user: dict[str, Any] = Depends(require_user_or_local),
 ) -> dict[str, str]:
-    require_member_or_trial(user)
+    sid = str(session_id or "").strip()
+    if user.get("id") != "lan-local":
+        if not sid:
+            raise HTTPException(400, "缺少 session_id")
+        require_owned_session(sid, user)
+    require_deep_study(user, sid)
     tmp_dir = DATA / "_stt"
     tmp_dir.mkdir(parents=True, exist_ok=True)
     request_id = str(getattr(request.state, "request_id", "") or uuid.uuid4().hex[:12])
@@ -1688,8 +1746,8 @@ async def score(
     session_id: str = Form(...),
     user: dict[str, Any] = Depends(require_user_or_local),
 ) -> dict[str, Any]:
-    require_member_or_trial(user)
     folder = require_owned_session(session_id, user)
+    require_deep_study(user, session_id)
     original = folder / "audio.wav"
     if not original.is_file():
         media = find_session_media(folder)

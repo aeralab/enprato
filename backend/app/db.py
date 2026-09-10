@@ -37,6 +37,43 @@ def connect(path: Path | None = None) -> sqlite3.Connection:
     return conn
 
 
+DEEP_STUDY_SECONDS = 300
+STUDY_HEARTBEAT_MAX_SECONDS = 20
+DEEP_STUDY_DONE_MESSAGE = "免费深度学习的 5 个素材已用完，开通会员后可继续学习新的素材。"
+
+
+def _add_column_if_missing(conn: sqlite3.Connection, table: str, column: str, ddl: str) -> None:
+    cols = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+    if column in cols:
+        return
+    try:
+        conn.execute(ddl)
+    except sqlite3.OperationalError as exc:
+        if "duplicate column" not in str(exc).lower():
+            raise
+
+
+def ensure_learning_session_study_columns(conn: sqlite3.Connection) -> None:
+    _add_column_if_missing(
+        conn,
+        "learning_sessions",
+        "active_study_seconds",
+        "ALTER TABLE learning_sessions ADD COLUMN active_study_seconds INTEGER NOT NULL DEFAULT 0",
+    )
+    _add_column_if_missing(
+        conn,
+        "learning_sessions",
+        "trial_consumed",
+        "ALTER TABLE learning_sessions ADD COLUMN trial_consumed INTEGER NOT NULL DEFAULT 0",
+    )
+    _add_column_if_missing(
+        conn,
+        "learning_sessions",
+        "last_study_at",
+        "ALTER TABLE learning_sessions ADD COLUMN last_study_at TEXT",
+    )
+
+
 def migrate(path: Path | None = None) -> None:
     conn = connect(path)
     try:
@@ -45,10 +82,16 @@ def migrate(path: Path | None = None) -> None:
         for file in sorted(MIGRATIONS.glob("*.sql")):
             if file.name in applied:
                 continue
-            conn.executescript(file.read_text(encoding="utf-8"))
+            try:
+                conn.executescript(file.read_text(encoding="utf-8"))
+            except sqlite3.OperationalError as exc:
+                if "duplicate column" not in str(exc).lower():
+                    raise
             conn.execute("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)", (file.name, iso()))
+        ensure_learning_session_study_columns(conn)
     finally:
         conn.close()
+    refund_historical_prepare_trials(path)
 
 
 def ensure_legacy_sessions(data_root: Path) -> None:
@@ -285,29 +328,61 @@ def trial_status(user_id: str) -> dict[str, int]:
         conn.close()
 
 
+def _quota_row(conn: sqlite3.Connection, user_id: str) -> sqlite3.Row:
+    row = conn.execute("SELECT trial_limit, trial_used FROM usage_quotas WHERE user_id=?", (user_id,)).fetchone()
+    if row:
+        return row
+    conn.execute(
+        "INSERT INTO usage_quotas(user_id,trial_limit,trial_used,updated_at) VALUES(?,?,?,?)",
+        (user_id, 5, 0, iso()),
+    )
+    row = conn.execute("SELECT trial_limit, trial_used FROM usage_quotas WHERE user_id=?", (user_id,)).fetchone()
+    if not row:
+        raise RuntimeError("usage_quotas missing")
+    return row
+
+
+def _membership_active_on_conn(conn: sqlite3.Connection, user_id: str) -> bool:
+    row = conn.execute(
+        "SELECT expires_at, status FROM memberships WHERE user_id=? ORDER BY expires_at DESC LIMIT 1",
+        (user_id,),
+    ).fetchone()
+    if not row:
+        return False
+    return str(row["expires_at"] or "") > iso() and row["status"] == "active"
+
+
+def _consume_trial_on_conn(conn: sqlite3.Connection, user_id: str, request_key: str) -> bool:
+    event_id = f"{user_id}:{request_key}"
+    row = _quota_row(conn, user_id)
+    if conn.execute("SELECT 1 FROM payment_events WHERE provider='trial' AND event_id=?", (event_id,)).fetchone():
+        return True
+    if int(row["trial_used"]) >= int(row["trial_limit"]):
+        return False
+    now = iso()
+    conn.execute("UPDATE usage_quotas SET trial_used=trial_used+1,updated_at=? WHERE user_id=?", (now, user_id))
+    conn.execute(
+        "INSERT INTO payment_events(provider,event_id,order_no,payload_hash,verified_at,processed_at,result) VALUES(?,?,?,?,?,?,?)",
+        ("trial", event_id, request_key, "trial", now, now, "consumed"),
+    )
+    return True
+
+
 def consume_trial(user_id: str, request_key: str) -> bool:
     conn = connect()
-    event_id = f"{user_id}:{request_key}"
     try:
         conn.execute("BEGIN IMMEDIATE")
-        row = conn.execute("SELECT trial_limit, trial_used FROM usage_quotas WHERE user_id=?", (user_id,)).fetchone()
-        if not row:
-            conn.execute("INSERT INTO usage_quotas(user_id,trial_limit,trial_used,updated_at) VALUES(?,?,?,?)", (user_id, 5, 0, iso()))
-            row = conn.execute("SELECT trial_limit, trial_used FROM usage_quotas WHERE user_id=?", (user_id,)).fetchone()
-        if conn.execute("SELECT 1 FROM payment_events WHERE provider='trial' AND event_id=?", (event_id,)).fetchone():
+        ok = _consume_trial_on_conn(conn, user_id, request_key)
+        if ok:
             conn.execute("COMMIT")
-            return True
-        if int(row["trial_used"]) >= int(row["trial_limit"]):
+        else:
             conn.execute("ROLLBACK")
-            return False
-        now = iso()
-        conn.execute("UPDATE usage_quotas SET trial_used=trial_used+1,updated_at=? WHERE user_id=?", (now, user_id))
-        conn.execute("INSERT INTO payment_events(provider,event_id,order_no,payload_hash,verified_at,processed_at,result) VALUES(?,?,?,?,?,?,?)", ("trial", event_id, request_key, "trial", now, now, "consumed"))
-        conn.execute("COMMIT")
-        return True
+        return ok
     except Exception:
-        try: conn.execute("ROLLBACK")
-        except Exception: pass
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
         raise
     finally:
         conn.close()
@@ -327,6 +402,133 @@ def refund_trial(user_id: str, request_key: str) -> None:
     except Exception:
         try: conn.execute("ROLLBACK")
         except Exception: pass
+        raise
+    finally:
+        conn.close()
+
+
+def _recount_study_trial_used(conn: sqlite3.Connection, user_id: str, now: str) -> int:
+    used = int(
+        conn.execute(
+            "SELECT COUNT(*) FROM payment_events WHERE provider='trial' AND result='consumed' AND event_id LIKE ?",
+            (f"{user_id}:study:%",),
+        ).fetchone()[0]
+    )
+    conn.execute(
+        "UPDATE usage_quotas SET trial_used=?, updated_at=? WHERE user_id=?",
+        (used, now, user_id),
+    )
+    return used
+
+
+def refund_historical_prepare_trials(path: Path | None = None) -> dict[str, int]:
+    """Idempotent: refund leftover prepare: trial rows and recount study: usage."""
+    conn = connect(path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        now = iso()
+        cur = conn.execute(
+            "UPDATE payment_events SET result='refunded', processed_at=? "
+            "WHERE provider='trial' AND result='consumed' AND instr(event_id, ':prepare:') > 0",
+            (now,),
+        )
+        refunded = int(cur.rowcount or 0)
+        for row in conn.execute("SELECT user_id FROM usage_quotas").fetchall():
+            _recount_study_trial_used(conn, str(row["user_id"]), now)
+        conn.execute("COMMIT")
+        return {"refunded": refunded}
+    except Exception:
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+    finally:
+        conn.close()
+
+
+def can_deep_study(user_id: str, session_id: str, conn: sqlite3.Connection | None = None) -> bool:
+    own = conn is None
+    if own:
+        conn = connect()
+    try:
+        if _membership_active_on_conn(conn, user_id):
+            return True
+        row = conn.execute(
+            "SELECT trial_consumed FROM learning_sessions WHERE session_id=? AND owner_user_id=?",
+            (session_id, user_id),
+        ).fetchone()
+        if row and int(row["trial_consumed"] or 0):
+            return True
+        quota = _quota_row(conn, user_id)
+        return int(quota["trial_used"]) < int(quota["trial_limit"])
+    finally:
+        if own:
+            conn.close()
+
+
+def apply_study_heartbeat(user_id: str, session_id: str, active_seconds: int) -> dict[str, Any]:
+    try:
+        seconds = int(active_seconds)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("invalid active_seconds") from exc
+    if seconds < 0 or seconds > STUDY_HEARTBEAT_MAX_SECONDS:
+        raise ValueError("invalid active_seconds")
+    conn = connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT owner_user_id, active_study_seconds, trial_consumed FROM learning_sessions WHERE session_id=?",
+            (session_id,),
+        ).fetchone()
+        if not row or str(row["owner_user_id"] or "") != user_id:
+            conn.execute("ROLLBACK")
+            raise LookupError("session")
+        if not can_deep_study(user_id, session_id, conn):
+            conn.execute("ROLLBACK")
+            raise PermissionError("deep_study")
+        now = iso()
+        if seconds:
+            conn.execute(
+                "UPDATE learning_sessions SET active_study_seconds=active_study_seconds+?, last_study_at=?, updated_at=? "
+                "WHERE session_id=? AND owner_user_id=?",
+                (seconds, now, now, session_id, user_id),
+            )
+        row = conn.execute(
+            "SELECT active_study_seconds, trial_consumed FROM learning_sessions WHERE session_id=?",
+            (session_id,),
+        ).fetchone()
+        total = int(row["active_study_seconds"] or 0)
+        consumed = int(row["trial_consumed"] or 0)
+        member = _membership_active_on_conn(conn, user_id)
+        quota = _quota_row(conn, user_id)
+        if (
+            not member
+            and not consumed
+            and total >= DEEP_STUDY_SECONDS
+            and int(quota["trial_used"]) < int(quota["trial_limit"])
+        ):
+            if _consume_trial_on_conn(conn, user_id, "study:" + session_id):
+                conn.execute(
+                    "UPDATE learning_sessions SET trial_consumed=1, updated_at=? WHERE session_id=?",
+                    (now, session_id),
+                )
+                consumed = 1
+        conn.execute("COMMIT")
+        quota = trial_status(user_id)
+        return {
+            "session_id": session_id,
+            "active_study_seconds": total,
+            "trial_consumed": bool(consumed),
+            "trial": quota,
+        }
+    except (LookupError, PermissionError, ValueError):
+        raise
+    except Exception:
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
         raise
     finally:
         conn.close()

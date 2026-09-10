@@ -3,7 +3,7 @@ from __future__ import annotations
 _IPAD_BTN_SPEAK = "\u8bf4\u8bdd"
 _IPAD_BTN_STOP = "\u505c\u6b62"
 # 改 iPad 页后递增；固定入口 /ipad 会跳到最新版，页内也会自动检测并刷新
-IPAD_BUILD = "20260909a"
+IPAD_BUILD = "20260910a"
 
 IPAD_PAGE = """<!DOCTYPE html>
 <html lang="zh-CN">
@@ -668,6 +668,76 @@ IPAD_PAGE = """<!DOCTYPE html>
     videoEl.playsInline = true;
     videoEl.setAttribute('playsinline', '');
     videoEl.setAttribute('webkit-playsinline', '');
+
+    const STUDY_ACTIVE_WINDOW_MS = 20000;
+    const STUDY_HEARTBEAT_FLUSH_MS = 12000;
+    let lastStudyActivityAt = 0;
+    let studyAccum = 0;
+    let lastStudyTickAt = Date.now();
+    let studyBlocked = false;
+    let studyHeartbeatSession = sessionId || '';
+
+    function markStudyActivity() {
+      lastStudyActivityAt = Date.now();
+    }
+
+    function mediaActuallyPlaying() {
+      try {
+        return !!(videoEl && !videoEl.paused && !videoEl.ended);
+      } catch (e) {
+        return false;
+      }
+    }
+
+    function resetStudyHeartbeat(nextId) {
+      studyAccum = 0;
+      lastStudyTickAt = Date.now();
+      lastStudyActivityAt = 0;
+      studyBlocked = false;
+      studyHeartbeatSession = String(nextId || '');
+    }
+
+    function noteDeepStudyDenied(res, data) {
+      const status = res && res.status;
+      const detail = data && data.detail;
+      if (status === 402 || (typeof detail === 'string' && detail.indexOf('免费深度学习') >= 0)) {
+        studyBlocked = true;
+        const msg = typeof detail === 'string' && detail
+          ? detail
+          : '免费深度学习的 5 个素材已用完，开通会员后可继续学习新的素材。';
+        setStatus(msg, 'err');
+        return true;
+      }
+      return false;
+    }
+
+    async function flushStudyHeartbeat() {
+      const sid = studyHeartbeatSession || sessionId;
+      const n = Math.min(20, Math.floor(studyAccum));
+      if (!sid || studyBlocked || n <= 0) return;
+      studyAccum = Math.max(0, studyAccum - n);
+      try {
+        const res = await fetch('/api/session/' + sid + '/study-heartbeat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ active_seconds: n }),
+        });
+        let data = null;
+        try { data = await res.json(); } catch (e) {}
+        noteDeepStudyDenied(res, data);
+      } catch (e) {}
+    }
+
+    setInterval(() => {
+      const nowTs = Date.now();
+      const dt = Math.min(1.5, (nowTs - lastStudyTickAt) / 1000);
+      lastStudyTickAt = nowTs;
+      if (studyBlocked) return;
+      if (document.visibilityState !== 'visible') return;
+      const recent = lastStudyActivityAt && nowTs - lastStudyActivityAt < STUDY_ACTIVE_WINDOW_MS;
+      if (mediaActuallyPlaying() || recent) studyAccum += dt;
+    }, 1000);
+    setInterval(() => { void flushStudyHeartbeat(); }, STUDY_HEARTBEAT_FLUSH_MS);
 
     function fmt(seconds) {
       const s = Number(seconds) || 0;
@@ -1820,6 +1890,7 @@ IPAD_PAGE = """<!DOCTYPE html>
       switchingSession = true;
       try {
         if (sessionId) {
+          try { await flushStudyHeartbeat(); } catch (e) {}
           try { await saveAll(); } catch (e) {}
         }
         if (claimActive) {
@@ -1832,6 +1903,7 @@ IPAD_PAGE = """<!DOCTYPE html>
           } catch (e) {}
         }
         sessionId = next;
+        resetStudyHeartbeat(next);
         try { localStorage.setItem('enprato.ipad.lastSession', sessionId); } catch (e) {}
         boundVideoSession = '';
         hasVideo = false;
@@ -2047,6 +2119,9 @@ IPAD_PAGE = """<!DOCTYPE html>
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ drafts: payload, index }),
         });
+        let data = null;
+        try { data = await res.json(); } catch (e) {}
+        if (noteDeepStudyDenied(res, data)) return;
         if (!res.ok) throw new Error('fail');
         lastSent = snap;
         markDraftsSaved();
@@ -2064,6 +2139,7 @@ IPAD_PAGE = """<!DOCTYPE html>
       if (!editBaseline) resetEditBaseline();
     });
     docEl.addEventListener('input', () => {
+      markStudyActivity();
       syncCurrentDraft();
       renderDocTail();
       updateRestoreBtn();
@@ -2283,6 +2359,7 @@ IPAD_PAGE = """<!DOCTYPE html>
 
         recStartedAt = Date.now();
         recording = true;
+        markStudyActivity();
         setBtnLabel(true);
       } catch (e) {
         recState = 'idle';
@@ -2404,6 +2481,13 @@ IPAD_PAGE = """<!DOCTYPE html>
       });
       job.lastResult = result;
       try { console.log(JSON.stringify({ stage: 'UPLOAD_RESULT', client_request_id: job.clientRequestId, ok: !!(result && result.ok), status: result && result.status, kind: result && result.kind, server_request_id: result && result.serverRequestId, attempt: result && result.attempt })); } catch (e) {}
+      if (result && result.status === 402) {
+        studyBlocked = true;
+        recState = 'failed';
+        showRetry(false);
+        setStatus('免费深度学习的 5 个素材已用完，开通会员后可继续学习新的素材。', 'err');
+        return result;
+      }
       if (result && result.ok) {
         recState = 'success';
         showRetry(false);

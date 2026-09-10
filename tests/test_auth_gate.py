@@ -305,7 +305,7 @@ class AccountTrialTests(unittest.TestCase):
         self.assertEqual(a.get("/api/auth/me").json()["user"]["trial"]["remaining"], 5)
         self.assertEqual(b.get("/api/auth/me").json()["user"]["trial"]["remaining"], 5)
 
-    def test_sixth_successful_import_is_rejected(self):
+    def test_sixth_successful_import_does_not_consume_quota(self):
         client = self._login("cap@example.com")
         with patch.object(main, "ingest_url", side_effect=self._ok_ingest), patch.object(main, "fetch_media_title", return_value="title"):
             for i in range(5):
@@ -313,8 +313,9 @@ class AccountTrialTests(unittest.TestCase):
                 self.assertEqual(res.status_code, 200, res.text)
                 wait_ready(client, res)
             sixth = client.post("/api/prepare-url", json={"url": "https://example.com/v6.mp4", "create_new_session": True})
-        self.assertEqual(sixth.status_code, 402)
-        self.assertEqual(client.get("/api/auth/me").json()["user"]["trial"]["used"], 5)
+            self.assertEqual(sixth.status_code, 200, sixth.text)
+            wait_ready(client, sixth)
+        self.assertEqual(client.get("/api/auth/me").json()["user"]["trial"]["used"], 0)
 
     def test_failed_import_does_not_consume_quota(self):
         client = self._login("fail@example.com")

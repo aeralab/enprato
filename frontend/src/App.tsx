@@ -33,6 +33,7 @@ import {
   translateSentence,
   transcribeUtterance,
   warmupAsr,
+  postStudyHeartbeat,
 } from "./api";
 import { resumeTimeInSentence, splitWords } from "./diffWords";
 import { applyBurnWipeLayout } from "./videoBurnLayout";
@@ -962,16 +963,17 @@ function ImportScreen({
         <section className="import-source">
           {updateInfo ? <UpdateBanner info={updateInfo} /> : null}
           {user && requireAuth ? (
-            <section className="license-panel" aria-label="免费试用">
+            <section className="license-panel" aria-label="免费体验">
               <div className="license-summary">
                 <div>
-                  <strong>免费试用</strong>
-                  <span>免费学习素材 {user.trial.used} / {user.trial.limit}</span>
+                  <strong>免费体验</strong>
+                  <span>已学习素材 {user.trial.used} / {user.trial.limit}</span>
+                  <span className="meta">可免费深度学习 5 个素材</span>
                 </div>
                 <b>{user.membership.status === "active" ? "会员" : user.trial.remaining > 0 ? "可用" : "已用完"}</b>
               </div>
               {user.membership.status !== "active" && user.trial.remaining <= 0 ? (
-                <p className="meta">试用已用完。开通会员后可继续导入学习素材。</p>
+                <p className="meta">免费深度学习的 5 个素材已用完。开通会员后可继续学习新的素材。</p>
               ) : null}
             </section>
           ) : user ? (
@@ -1316,18 +1318,18 @@ function AuthPanel({ user, onAuth }: { user: CurrentUser | null; onAuth: (user: 
     onAuth(null);
   }
   if (user) {
-    const trialLabel = `免费学习素材 ${user.trial.used} / ${user.trial.limit}`;
+    const trialLabel = `已学习素材 ${user.trial.used} / ${user.trial.limit}`;
     return (
       <div className="account-compact">
         <button type="button" className="account-status" onClick={() => setOpen(!open)}>
-          <strong>{user.membership.status === "active" ? "Enprato Pro" : "免费试用"}</strong>
-          <span>{user.membership.status === "active" ? "" : `剩余 ${user.trial.remaining} / ${user.trial.limit}`}</span>
+          <strong>{user.membership.status === "active" ? "Enprato Pro" : "免费体验"}</strong>
+          <span>{user.membership.status === "active" ? "" : `已学习素材 ${user.trial.used} / ${user.trial.limit}`}</span>
           <b>我的账号</b>
         </button>
         {open ? (
           <div className="account-popover">
             <p className="account-email">{user.login_label || user.email || "已登录"}</p>
-            <p>会员状态：{user.membership.status === "active" ? "Enprato Pro" : "免费试用"}</p>
+            <p>会员状态：{user.membership.status === "active" ? "Enprato Pro" : "免费体验"}</p>
             <p>{trialLabel}</p>
             {user.membership.status === "active" ? <p>到期时间：{formatLicenseDate(user.membership.expires_at)}</p> : null}
             <button type="button" className="ghost" onClick={() => void logout()}>退出登录</button>
@@ -1823,6 +1825,13 @@ function Studio({
   const [ipadLink, setIpadLink] = useState("");
   const [ipadHome, setIpadHome] = useState("");
   const [ipadBuild, setIpadBuild] = useState("");
+  const STUDY_ACTIVE_WINDOW_MS = 20_000;
+  const STUDY_HEARTBEAT_FLUSH_MS = 12_000;
+  const lastStudyActivityAtRef = useRef(0);
+  const studyAccumRef = useRef(0);
+  const lastStudyTickAtRef = useRef(Date.now());
+  const studyBlockedRef = useRef(false);
+  const studyFlushSessionRef = useRef(sessionId);
   useEffect(() => {
     ipadStudioRef.current = ipadStudio;
   }, [ipadStudio]);
@@ -1923,7 +1932,13 @@ function Studio({
         save_reason: payload.save_reason,
       },
       options,
-    );
+    ).catch((err: unknown) => {
+      const msg = err instanceof Error ? err.message : "";
+      if (msg.includes("免费深度学习") || msg.includes("已用完")) {
+        studyBlockedRef.current = true;
+        setError(msg);
+      }
+    });
   }
 
   function restoreDraftEdits() {
@@ -2033,6 +2048,7 @@ function Studio({
       setCaptionMode("off");
     }
     prevIndexForCaptionRef.current = index;
+    lastStudyActivityAtRef.current = Date.now();
   }, [index]);
 
   useEffect(() => {
@@ -2199,6 +2215,69 @@ function Studio({
     sentencesRef.current = sentences;
     switchingMediaRef.current = false;
   }, [sessionId, sentences]);
+
+  function markStudyActivity() {
+    lastStudyActivityAtRef.current = Date.now();
+  }
+
+  async function flushStudyHeartbeat() {
+    const sid = studyFlushSessionRef.current;
+    const n = Math.min(20, Math.floor(studyAccumRef.current));
+    if (!sid || studyBlockedRef.current || n <= 0) return;
+    studyAccumRef.current = Math.max(0, studyAccumRef.current - n);
+    try {
+      await postStudyHeartbeat(sid, n);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "";
+      if (msg.includes("免费深度学习") || msg.includes("已用完")) {
+        studyBlockedRef.current = true;
+        setError(msg);
+      }
+    }
+  }
+
+  useEffect(() => {
+    const prev = studyFlushSessionRef.current;
+    if (prev && prev !== sessionId && studyAccumRef.current >= 1 && !studyBlockedRef.current) {
+      const leftover = Math.min(20, Math.floor(studyAccumRef.current));
+      studyAccumRef.current = 0;
+      if (leftover > 0) void postStudyHeartbeat(prev, leftover).catch(() => undefined);
+    }
+    studyFlushSessionRef.current = sessionId;
+    studyAccumRef.current = 0;
+    studyBlockedRef.current = false;
+    lastStudyTickAtRef.current = Date.now();
+    lastStudyActivityAtRef.current = 0;
+  }, [sessionId]);
+
+  useEffect(() => {
+    if (!sessionId) return;
+    const tick = () => {
+      const nowTs = Date.now();
+      const dt = Math.min(1.5, (nowTs - lastStudyTickAtRef.current) / 1000);
+      lastStudyTickAtRef.current = nowTs;
+      if (studyBlockedRef.current) return;
+      if (document.visibilityState !== "visible") return;
+      const video = videoRef.current;
+      const playing = Boolean(video && !video.paused && !video.ended);
+      const recent =
+        lastStudyActivityAtRef.current > 0 &&
+        nowTs - lastStudyActivityAtRef.current < STUDY_ACTIVE_WINDOW_MS;
+      if (playing || recent) studyAccumRef.current += dt;
+    };
+    const tickTimer = window.setInterval(tick, 1000);
+    const flushTimer = window.setInterval(() => void flushStudyHeartbeat(), STUDY_HEARTBEAT_FLUSH_MS);
+    const onVis = () => {
+      lastStudyTickAtRef.current = Date.now();
+    };
+    document.addEventListener("visibilitychange", onVis);
+    return () => {
+      window.clearInterval(tickTimer);
+      window.clearInterval(flushTimer);
+      document.removeEventListener("visibilitychange", onVis);
+      void flushStudyHeartbeat();
+    };
+  }, [sessionId]);
 
   useEffect(() => {
     hasVideoRef.current = hasVideo;
@@ -2969,7 +3048,8 @@ function Studio({
           try {
             const prevDraft = i > 0 ? String(draftsRef.current[i - 1] ?? "").trim() : "";
             const context = prevDraft.length > 160 ? prevDraft.slice(-160) : prevDraft;
-            const text = await transcribeUtterance(blob, context, target);
+            markStudyActivity();
+            const text = await transcribeUtterance(blob, context, target, boundSessionRef.current);
             const piece = String(text || "").trim();
             setDrafts((prev) => {
               if ((draftManualEditAtRef.current[i] || 0) >= micStartedAtRef.current) return prev;
@@ -3038,6 +3118,7 @@ function Studio({
       setRecording(false);
     });
     try {
+      markStudyActivity();
       const result = await scoreShadow(sessionId, blob);
       setScore(result);
       setPhase("result");
@@ -3403,6 +3484,7 @@ function Studio({
                     }
                     draftsRef.current = next;
                     setDrafts(next);
+                    markStudyActivity();
                     setDraftCanRestore(JSON.stringify(next) !== draftBaselineRef.current);
                   }}
                   onBlur={() => {

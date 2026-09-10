@@ -199,12 +199,14 @@ export async function transcribeUtterance(
   blob: Blob,
   context: string,
   target = "",
+  sessionId = "",
 ): Promise<string> {
   const makeBody = () => {
     const body = new FormData();
     body.append("audio", blob, "dictation.webm");
     body.append("context", context);
     body.append("target", target);
+    if (sessionId) body.append("session_id", sessionId);
     return body;
   };
   const controller = new AbortController();
@@ -299,6 +301,20 @@ export async function loadSession(sessionId: string): Promise<SessionDetail> {
   return res.json();
 }
 
+export async function postStudyHeartbeat(
+  sessionId: string,
+  activeSeconds: number,
+): Promise<{ active_study_seconds: number; trial_consumed: boolean; trial?: { used: number; limit: number } }> {
+  const res = await fetch(`/api/session/${encodeURIComponent(sessionId)}/study-heartbeat`, {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ active_seconds: activeSeconds }),
+  });
+  if (!res.ok) throw new Error(await readError(res));
+  return res.json();
+}
+
 export async function fetchSessionMedia(sessionId: string): Promise<{ has_video: boolean; status?: string; session_id?: string }> {
   const res = await fetch(`/api/session/${encodeURIComponent(sessionId)}/media`, { credentials: "same-origin" });
   if (!res.ok) throw new Error(await readError(res));
@@ -313,12 +329,15 @@ export async function saveProgress(
   if (!sessionId) return;
   const body = snapshotProgressBody(payload);
   const request = async () => {
-    await fetch(`/api/session/${sessionId}`, {
+    const res = await fetch(`/api/session/${sessionId}`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       keepalive: options?.keepalive ?? false,
       body: JSON.stringify(body),
     }).catch(() => undefined);
+    if (res && res.status === 402) {
+      throw new Error(await readError(res));
+    }
   };
   const prev = progressSaveChains.get(sessionId) || Promise.resolve();
   const next = prev.then(request, request);
