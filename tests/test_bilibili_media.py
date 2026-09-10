@@ -71,6 +71,25 @@ class PrepareBilibiliVideoTests(unittest.TestCase):
         self.assertTrue(result["skipped"])
         download.assert_not_called()
 
+    def test_merge_tmp_forces_mp4_muxer(self):
+        from backend.app.bilibili import merge_dash
+
+        folder = Path(tempfile.mkdtemp())
+        video = folder / "dash_video.m4s"
+        audio = folder / "playback.m4a"
+        dest = folder / "source.mp4.tmp"
+        video.write_bytes(b"v" * 400)
+        audio.write_bytes(b"a" * 400)
+        dest.write_bytes(b"merged" * 400)
+
+        def fake_run(args, timeout=None):
+            self.assertIn("-f", args)
+            self.assertEqual(args[args.index("-f") + 1], "mp4")
+            self.assertEqual(args[-1], str(dest))
+
+        with patch("backend.app.bilibili.run_ffmpeg", side_effect=fake_run):
+            merge_dash(video, audio, dest)
+
 
 class BilibiliMediaJobTests(unittest.TestCase):
     def setUp(self):

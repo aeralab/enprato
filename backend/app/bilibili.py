@@ -398,6 +398,8 @@ def merge_dash(video: Path, audio: Path, dest: Path) -> None:
                 "-shortest",
                 "-movflags",
                 "+faststart",
+                "-f",
+                "mp4",
                 str(dest),
             ]
         )
