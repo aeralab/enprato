@@ -486,14 +486,37 @@ export async function grantDevMembership(): Promise<CurrentUser["membership"]> {
   return data.membership;
 }
 
-export async function createOrder(): Promise<Order> {
-  const res = await fetch("/api/payments/wechat/native", { method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ plan: "monthly_30d", provider: "wechat" }) });
+export async function createOrder(plan: string): Promise<Order> {
+  const res = await fetch("/api/payments/wechat/native", { method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ plan, provider: "wechat" }) });
   if (!res.ok) throw new Error(await readError(res));
   return res.json();
 }
 
 export async function fetchOrder(orderNo: string): Promise<Order> {
   const res = await fetch("/api/payments/orders/" + encodeURIComponent(orderNo), { credentials: "same-origin" });
+  if (!res.ok) throw new Error(await readError(res));
+  return res.json();
+}
+
+export async function syncWechatOrder(orderNo: string): Promise<Order> {
+  const res = await fetch("/api/payments/orders/" + encodeURIComponent(orderNo) + "/sync", { method: "POST", credentials: "same-origin" });
+  if (!res.ok) throw new Error(await readError(res));
+  return res.json();
+}
+
+export async function confirmMockPay(orderNo: string): Promise<{ status: string; membership: CurrentUser["membership"] }> {
+  const res = await fetch("/api/dev/orders/" + encodeURIComponent(orderNo) + "/pay", { method: "POST", credentials: "same-origin" });
+  if (!res.ok) throw new Error(await readError(res));
+  return res.json();
+}
+
+export async function redeemMembership(code: string): Promise<CurrentUser> {
+  const res = await fetch("/api/membership/redeem", {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ code }),
+  });
   if (!res.ok) throw new Error(await readError(res));
   return res.json();
 }

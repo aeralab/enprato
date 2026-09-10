@@ -84,6 +84,32 @@ class MembershipTests(unittest.TestCase):
                 order2 = db.create_order(user["id"], "monthly_30d", "mock")
                 db.complete_payment(provider="mock", event_id="ok2", payload_hash="y", order_no=order2["order_no"], trade_no="t2", amount_fen=1990, payment_status="SUCCESS")
                 self.assertGreater(db.membership_status(user["id"])["expires_at"], first["expires_at"])
+                yearly = db.create_order(user["id"], "yearly_365d", "mock")
+                self.assertEqual(yearly["amount_fen"], 19900)
+                self.assertEqual(db.complete_payment(provider="mock", event_id="year", payload_hash="z", order_no=yearly["order_no"], trade_no="t3", amount_fen=19900, payment_status="SUCCESS"), "paid")
+                yearly_status = db.membership_status(user["id"])
+                self.assertEqual(yearly_status["plan"], "yearly_365d")
+                self.assertTrue(yearly_status["active"])
+            finally:
+                db.DB_PATH = old
+
+    def test_redeem_code_grants_membership_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old = db.DB_PATH
+            try:
+                db.DB_PATH = Path(tmp) / "redeem.sqlite3"
+                db.migrate()
+                user = db.create_user("redeem@example.com", "hash")
+                other = db.create_user("other@example.com", "hash")
+                code = db.issue_redeem_code("monthly_30d", "xh-test-001")
+                self.assertEqual(code, "XH-TEST-001")
+                granted = db.redeem_membership_code(user["id"], "xh-test-001")
+                self.assertTrue(granted["active"])
+                self.assertEqual(granted["plan"], "monthly_30d")
+                with self.assertRaises(ValueError):
+                    db.redeem_membership_code(other["id"], "XH-TEST-001")
+                with self.assertRaises(ValueError):
+                    db.redeem_membership_code(user["id"], "no-such-code")
             finally:
                 db.DB_PATH = old
 

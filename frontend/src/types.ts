@@ -97,6 +97,7 @@ export type SessionDetail = SessionSummary & {
   created_at: string;
   progress_floor?: number;
   progress_anchor_count?: number;
+  can_deep_study?: boolean;
 };
 
 export type MembershipStatus = {
@@ -175,7 +176,7 @@ export type ProgressSummary = {
   };
 };
 
-export type Order = { id?: string; order_no: string; plan_code?: string; amount_fen: number; currency?: string; status: string; expires_at: string; payment?: { provider: string; code_url?: string } };
+export type Order = { id?: string; order_no: string; plan?: string; plan_code?: string; amount_fen: number; currency?: string; status: string; expires_at: string; payment?: { provider: string; code_url?: string } };
 
 export type CuratedLesson = {
   id: string;

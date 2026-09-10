@@ -682,7 +682,7 @@ def create_order(user_id: str, plan_code: str, provider: str) -> dict[str, Any]:
         now_dt=utc_now();now=iso(now_dt);expires=iso(now_dt+timedelta(minutes=15))
         order_no="EN"+now_dt.strftime("%y%m%d%H%M%S")+secrets.token_hex(4)
         conn.execute("INSERT INTO orders(order_no,user_id,plan_id,amount_fen,status,provider,created_at,expires_at) VALUES(?,?,?,?,?,?,?,?)",(order_no,user_id,plan["id"],plan["price_fen"],"pending",provider,now,expires))
-        return {"id":order_no,"order_no":order_no,"plan":plan["code"],"amount_fen":plan["price_fen"],"currency":"CNY","status":"pending","created_at":now,"expires_at":expires}
+        return {"id":order_no,"order_no":order_no,"plan":plan["code"],"plan_name":plan["name"],"duration_days":plan["duration_days"],"amount_fen":plan["price_fen"],"currency":"CNY","status":"pending","created_at":now,"expires_at":expires}
     finally: conn.close()
 
 
@@ -698,6 +698,34 @@ def get_order(order_no: str, user_id: str) -> dict[str, Any] | None:
     finally:conn.close()
 
 
+def _grant_plan_membership(conn: sqlite3.Connection, *, user_id: str, plan_id: int, duration_days: int, source_order_id: str | None, now: str) -> None:
+    current = conn.execute(
+        "SELECT expires_at FROM memberships WHERE user_id=? AND status='active' ORDER BY expires_at DESC LIMIT 1",
+        (user_id,),
+    ).fetchone()
+    start_time = max(parse_time(now), parse_time(current[0])) if current else parse_time(now)
+    expires = start_time + timedelta(days=int(duration_days))
+    conn.execute("UPDATE memberships SET status='expired', updated_at=? WHERE user_id=? AND status='active'", (now, user_id))
+    conn.execute(
+        "INSERT INTO memberships(user_id,plan_id,starts_at,started_at,expires_at,status,source_order_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+        (user_id, plan_id, iso(start_time), iso(start_time), iso(expires), "active", source_order_id, now, now),
+    )
+    subscription = conn.execute(
+        "SELECT id FROM subscriptions WHERE user_id=? AND provider='wechat' ORDER BY id DESC LIMIT 1",
+        (user_id,),
+    ).fetchone()
+    if subscription:
+        conn.execute(
+            "UPDATE subscriptions SET mode='one_time',status='active',current_period_start=?,current_period_end=?,auto_renew=0,updated_at=? WHERE id=?",
+            (iso(start_time), iso(expires), now, subscription["id"]),
+        )
+    else:
+        conn.execute(
+            "INSERT INTO subscriptions(user_id,provider,mode,status,current_period_start,current_period_end,auto_renew,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+            (user_id, "wechat", "one_time", "active", iso(start_time), iso(expires), 0, now, now),
+        )
+
+
 def complete_payment(*,provider:str,event_id:str,payload_hash:str,order_no:str,trade_no:str,amount_fen:int,payment_status:str,merchant_id:str|None=None,app_id:str|None=None)->str:
     conn=connect()
     try:
@@ -706,7 +734,7 @@ def complete_payment(*,provider:str,event_id:str,payload_hash:str,order_no:str,t
             conn.execute("COMMIT");return "duplicate"
         order=conn.execute("SELECT * FROM orders WHERE order_no=?",(order_no,)).fetchone()
         if not order:raise ValueError("order not found")
-        if int(order["amount_fen"])!=int(amount_fen) or int(amount_fen)!=1990:raise ValueError("payment amount mismatch")
+        if int(order["amount_fen"])!=int(amount_fen):raise ValueError("payment amount mismatch")
         if merchant_id is not None and merchant_id!=os.environ.get("WECHATPAY_MCH_ID","").strip():raise ValueError("merchant mismatch")
         if app_id is not None and app_id!=os.environ.get("WECHATPAY_APP_ID","").strip():raise ValueError("app mismatch")
         now=iso()
@@ -716,16 +744,74 @@ def complete_payment(*,provider:str,event_id:str,payload_hash:str,order_no:str,t
             conn.execute("INSERT INTO payment_events(provider,event_id,order_no,payload_hash,verified_at,processed_at,result) VALUES(?,?,?,?,?,?,?)",(provider,event_id,order_no,payload_hash,now,now,"already_paid"));conn.execute("COMMIT");return "already_paid"
         conn.execute("INSERT INTO payment_events(provider,event_id,order_no,payload_hash,verified_at,processed_at,result) VALUES(?,?,?,?,?,?,?)",(provider,event_id,order_no,payload_hash,now,now,"paid"))
         conn.execute("UPDATE orders SET status='paid',provider_trade_no=?,paid_at=? WHERE order_no=?",(trade_no,now,order_no))
-        current=conn.execute("SELECT expires_at FROM memberships WHERE user_id=? AND status='active' ORDER BY expires_at DESC LIMIT 1",(order["user_id"],)).fetchone()
-        paid_at=parse_time(now);start_time=max(paid_at,parse_time(current[0])) if current else paid_at;expires=start_time+timedelta(days=30)
-        conn.execute("UPDATE memberships SET status='expired',updated_at=? WHERE user_id=? AND status='active'",(now,order["user_id"]))
-        conn.execute("INSERT INTO memberships(user_id,plan_id,starts_at,started_at,expires_at,status,source_order_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",(order["user_id"],order["plan_id"],iso(start_time),iso(start_time),iso(expires),"active",order_no,now,now))
-        subscription=conn.execute("SELECT id FROM subscriptions WHERE user_id=? AND provider='wechat' ORDER BY id DESC LIMIT 1",(order["user_id"],)).fetchone()
-        if subscription:conn.execute("UPDATE subscriptions SET mode='one_time',status='active',current_period_start=?,current_period_end=?,auto_renew=0,updated_at=? WHERE id=?",(iso(start_time),iso(expires),now,subscription["id"]))
-        else:conn.execute("INSERT INTO subscriptions(user_id,provider,mode,status,current_period_start,current_period_end,auto_renew,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",(order["user_id"],"wechat","one_time","active",iso(start_time),iso(expires),0,now,now))
+        plan=conn.execute("SELECT duration_days FROM plans WHERE id=?",(order["plan_id"],)).fetchone()
+        duration_days=int(plan["duration_days"]) if plan else 30
+        _grant_plan_membership(conn, user_id=order["user_id"], plan_id=order["plan_id"], duration_days=duration_days, source_order_id=order_no, now=now)
         conn.execute("COMMIT");return "paid"
     except Exception:
         try:conn.execute("ROLLBACK")
         except Exception:pass
         raise
     finally:conn.close()
+
+
+def normalize_redeem_code(raw: str) -> str:
+    return "".join(str(raw or "").split()).upper()
+
+
+def issue_redeem_code(plan_code: str, code: str | None = None, note: str = "") -> str:
+    conn = connect()
+    try:
+        plan = conn.execute("SELECT id FROM plans WHERE code=? AND active=1", (plan_code,)).fetchone()
+        if not plan:
+            raise ValueError("plan not found")
+        token = normalize_redeem_code(code) if code else secrets.token_hex(8).upper()
+        if len(token) < 6:
+            raise ValueError("兑换码过短")
+        conn.execute(
+            "INSERT INTO redeem_codes(code, plan_id, plan_code, status, note, created_at) VALUES(?,?,?,?,?,?)",
+            (token, plan["id"], plan_code, "unused", note, iso()),
+        )
+        return token
+    finally:
+        conn.close()
+
+
+def redeem_membership_code(user_id: str, raw_code: str) -> dict[str, Any]:
+    token = normalize_redeem_code(raw_code)
+    if len(token) < 6:
+        raise ValueError("请输入兑换码")
+    conn = connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT * FROM redeem_codes WHERE code=?", (token,)).fetchone()
+        if not row:
+            raise ValueError("兑换码无效")
+        if row["status"] != "unused" or row["redeemed_by"]:
+            raise ValueError("兑换码已被使用")
+        plan = conn.execute("SELECT * FROM plans WHERE id=? AND active=1", (row["plan_id"],)).fetchone()
+        if not plan:
+            raise ValueError("兑换码对应套餐不可用")
+        now = iso()
+        _grant_plan_membership(
+            conn,
+            user_id=user_id,
+            plan_id=plan["id"],
+            duration_days=int(plan["duration_days"]),
+            source_order_id="REDEEM:" + token,
+            now=now,
+        )
+        conn.execute(
+            "UPDATE redeem_codes SET status='redeemed', redeemed_by=?, redeemed_at=? WHERE code=?",
+            (user_id, now, token),
+        )
+        conn.execute("COMMIT")
+    except Exception:
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+    finally:
+        conn.close()
+    return membership_status(user_id)

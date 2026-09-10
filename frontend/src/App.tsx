@@ -1,12 +1,19 @@
 ﻿import { useEffect, useRef, useState, type FormEvent } from "react";
+import QRCode from "qrcode";
 import {
   activateLicense,
+  confirmMockPay,
+  createOrder,
   fetchAuthState,
   fetchCatalog,
+  fetchCurrentUser,
+  fetchOrder,
   loginAccount,
   logoutAccount,
+  redeemMembership,
   registerAccount,
   sendPhoneCode,
+  syncWechatOrder,
   verifyPhoneLogin,
   checkUpdate,
   defineWord,
@@ -16,9 +23,6 @@ import {
   loadSession,
   prepareSession,
   prepareSessionFromUrl,
-  fetchActiveImportJob,
-  waitForImportJob,
-  IMPORT_JOB_KEY,
   saveProgress as postProgress,
   scoreShadow,
   speakerPlay,
@@ -38,6 +42,7 @@ import {
 import { resumeTimeInSentence, splitWords } from "./diffWords";
 import { applyBurnWipeLayout } from "./videoBurnLayout";
 import { audioOnlyPanel, inferInitialMediaStatus, shouldAcceptMediaPoll, type SessionMediaStatus } from "./mediaStatus";
+import { canEnterDictation, DICTATION_LOCKED_MESSAGE } from "./studioAccess";
 import {
   createLoadGate,
   captureLearningSnapshot,
@@ -51,6 +56,7 @@ import type {
   CuratedLesson,
   Highlight,
   LicenseStatus,
+  Order,
   ProgressSummary,
   Orientation,
   Phase,
@@ -65,6 +71,16 @@ import type {
 const LAST_SESSION_KEY = "enprato.lastSession";
 const ENABLE_SERVER_SPEAKER = import.meta.env.VITE_ENABLE_SERVER_SPEAKER === "1";
 
+
+function extractMediaUrl(raw: string): string {
+  const text = String(raw || "").trim();
+  if (!text) return "";
+  if (/^https?:\/\/\S+$/i.test(text)) return text.replace(/[),.;]+$/g, "");
+  const nested = text.match(/https?:\/\/[^\s<>"'）】]+/i);
+  if (nested) return nested[0].replace(/[),.;]+$/g, "");
+  if (/^(www\.|b23\.tv\/|bilibili\.com\/|youtu\.be\/|youtube\.com\/)/i.test(text)) return `https://${text}`;
+  return text;
+}
 
 function backendHint(err: unknown): string {
   const msg = err instanceof Error ? err.message : String(err);
@@ -505,51 +521,24 @@ export default function App() {
 
   useEffect(() => {
     if (authLoading) return;
-    if (requireAuth && !user) return;
     let cancelled = false;
-    (async () => {
-      try {
-        const rows = await listSessions();
-        if (cancelled) return;
-        setHistory(rows);
-        const active = await fetchActiveImportJob().catch(() => null);
-        const storedJob = localStorage.getItem(IMPORT_JOB_KEY);
-        const jobId = active?.job_id || storedJob;
-        if (jobId) {
-          const token = loadGateRef.current.bump();
-          setPhase("preparing");
-          setImportMessage(active?.message || "正在排队…");
-          try {
-            const prepared = await waitForImportJob(jobId, (status) => {
-              if (!loadGateRef.current.isCurrent(token)) return;
-              setImportMessage(status.message || "");
-            });
-            if (!loadGateRef.current.isCurrent(token) || cancelled) return;
-            openDetail({ ...prepared, phase: prepared.phase === "listen" ? "listen" : prepared.phase });
-            await refreshHistory();
-            await refreshLicense();
-            return;
-          } catch (err) {
-            if (!loadGateRef.current.isCurrent(token) || cancelled) return;
-            setPhase("import");
-            setError(friendlyUrlImportError(err));
-            return;
+    if (requireAuth && !user) {
+      setHistory([]);
+    } else {
+      (async () => {
+        try {
+          const rows = await listSessions();
+          if (cancelled) return;
+          setHistory(rows);
+        } catch (err) {
+          if (!cancelled) {
+            setHistory([]);
+            setError(backendHint(err));
           }
         }
-        const last = localStorage.getItem(LAST_SESSION_KEY);
-        if (last && rows.some((row) => row.session_id === last)) {
-          const token = loadGateRef.current.bump();
-          const detail = await loadSession(last);
-          if (!loadGateRef.current.isCurrent(token)) return;
-          openDetail(detail);
-        }
-      } catch (err) {
-        if (!cancelled) {
-          setHistory([]);
-          setError(backendHint(err));
-        }
-      }
-    })();
+      })();
+      if (!requireAuth) void refreshLicense();
+    }
     void fetchCatalog()
       .then((lessons) => {
         if (!cancelled) setCatalog(lessons);
@@ -557,7 +546,6 @@ export default function App() {
       .catch(() => {
         if (!cancelled) setCatalog([]);
       });
-    if (!requireAuth) void refreshLicense();
     return () => {
       cancelled = true;
     };
@@ -602,6 +590,21 @@ export default function App() {
     }
   }
 
+  function studioLocked(sessionCanDeepStudy?: boolean | null): string {
+    if (requireAuth && !user) return "请先登录后再开始听写";
+    if (
+      canEnterDictation({
+        requireAuth,
+        user,
+        licenseActive: license?.active,
+        sessionCanDeepStudy,
+      })
+    ) {
+      return "";
+    }
+    return DICTATION_LOCKED_MESSAGE;
+  }
+
   function openDetail(detail: SessionDetail) {
     const restored = (detail.phase === "import" || detail.phase === "preparing" ? "listen" : detail.phase) as Phase;
     setSessionId(detail.session_id);
@@ -624,6 +627,11 @@ export default function App() {
 
   async function start() {
     setError("");
+    const locked = studioLocked();
+    if (locked) {
+      setError(locked);
+      return;
+    }
     const file = videoFile;
     const url = sourceUrl.trim();
     // 有本地文件优先用文件，避免错误链接挡住进入
@@ -647,6 +655,12 @@ export default function App() {
           setImportMessage(status.message || "");
         });
         if (!loadGateRef.current.isCurrent(token)) return;
+        const preparedLocked = studioLocked(prepared.can_deep_study);
+        if (preparedLocked) {
+          setPhase("import");
+          setError(preparedLocked);
+          return;
+        }
         openDetail({ ...prepared, phase: prepared.phase === "listen" ? "listen" : prepared.phase });
         await refreshHistory();
         await refreshLicense();
@@ -656,6 +670,12 @@ export default function App() {
         ? await prepareSession(file, null)
         : await prepareSessionFromUrl(url);
       if (!loadGateRef.current.isCurrent(token)) return;
+      const fileLocked = studioLocked(prepared.can_deep_study);
+      if (fileLocked) {
+        setPhase("import");
+        setError(fileLocked);
+        return;
+      }
       openDetail({ ...prepared, phase: prepared.phase === "listen" ? "listen" : prepared.phase });
       await refreshHistory();
       await refreshLicense();
@@ -673,6 +693,11 @@ export default function App() {
   async function startCurated(url: string) {
     const clean = url.trim();
     if (!clean) return;
+    const locked = studioLocked();
+    if (locked) {
+      setError(locked);
+      return;
+    }
     const token = loadGateRef.current.bump();
     setVideoFile(null);
     setSourceUrl(clean);
@@ -685,6 +710,12 @@ export default function App() {
         setImportMessage(status.message || "");
       });
       if (!loadGateRef.current.isCurrent(token)) return;
+      const curatedLocked = studioLocked(prepared.can_deep_study);
+      if (curatedLocked) {
+        setPhase("import");
+        setError(curatedLocked);
+        return;
+      }
       openDetail({ ...prepared, phase: prepared.phase === "listen" ? "listen" : prepared.phase });
       await refreshHistory();
       await refreshLicense();
@@ -703,6 +734,12 @@ export default function App() {
     try {
       const detail = await loadSession(id);
       if (!loadGateRef.current.isCurrent(token)) return;
+      const locked = studioLocked(detail.can_deep_study);
+      if (locked) {
+        setPhase("import");
+        setError(locked);
+        return;
+      }
       openDetail(detail);
     } catch (err) {
       if (!loadGateRef.current.isCurrent(token)) return;
@@ -743,19 +780,7 @@ export default function App() {
     );
   }
 
-  if (requireAuth && !user) {
-    return (
-      <AuthScreen
-        error={authError}
-        onAuthed={(next) => {
-          setUser(next);
-          setAuthError("");
-        }}
-      />
-    );
-  }
-
-  if (screen === "progress") {
+  if (screen === "progress" && !(requireAuth && !user)) {
     return <ProgressPage onBack={() => setScreen("home")} />;
   }
 
@@ -766,9 +791,10 @@ export default function App() {
           <ImportScreen
             phase={phase}
             error={error}
+            authError={authError}
             videoFile={videoFile}
             sourceUrl={sourceUrl}
-            history={history}
+            history={requireAuth && !user ? [] : history}
             catalog={catalog}
             onVideo={async (file) => {
               setVideoFile(file);
@@ -801,7 +827,6 @@ export default function App() {
             licenseBusy={licenseBusy}
             licenseLoadError={licenseLoadError}
             onActivateLicense={onActivateLicense}
-            onRetryLicense={refreshLicense}
             updateInfo={updateInfo}
             onOpenProgress={() => setScreen("progress")}
           />
@@ -855,6 +880,7 @@ export default function App() {
 function ImportScreen({
   phase,
   error,
+  authError = "",
   videoFile,
   sourceUrl,
   history,
@@ -872,13 +898,13 @@ function ImportScreen({
   licenseBusy,
   licenseLoadError,
   onActivateLicense,
-  onRetryLicense,
   updateInfo,
   onOpenProgress,
   importMessage,
 }: {
   phase: Phase;
   error: string;
+  authError?: string;
   videoFile: File | null;
   sourceUrl: string;
   history: SessionSummary[];
@@ -896,11 +922,22 @@ function ImportScreen({
   licenseBusy: boolean;
   licenseLoadError: string;
   onActivateLicense: (key: string) => void | Promise<void>;
-  onRetryLicense: () => void | Promise<void>;
   updateInfo: UpdateInfo | null;
   onOpenProgress: () => void;
   importMessage: string;
 }) {
+  const urlInputRef = useRef<HTMLInputElement>(null);
+  const [historyMenu, setHistoryMenu] = useState<string | null>(null);
+
+  async function pasteSourceFromClipboard() {
+    try {
+      const text = extractMediaUrl(await navigator.clipboard.readText());
+      if (text) onSourceUrl(text);
+    } catch {
+      urlInputRef.current?.focus();
+    }
+  }
+
   if (phase === "preparing") {
     return (
       <div className="preparing">
@@ -917,7 +954,6 @@ function ImportScreen({
   }
   const weixinLink = /weixin\.qq\.com|channels\.weixin\.qq\.com|\/sph\//i.test(sourceUrl);
   const canStart = Boolean(videoFile || (sourceUrl.trim() && !weixinLink));
-  const [historyMenu, setHistoryMenu] = useState<string | null>(null);
   return (
     <>
       <header className="topbar">
@@ -926,8 +962,7 @@ function ImportScreen({
           <span>dictation booth</span>
         </div>
         <div className="topbar-actions">
-          <button type="button" className="ghost progress-nav" onClick={onOpenProgress}>我的成长</button>
-          <AuthPanel user={user} onAuth={onAuth} />
+          <AuthPanel user={user} onAuth={onAuth} error={authError} requireAuth={requireAuth} />
         </div>
       </header>
       <div className="import">
@@ -957,54 +992,20 @@ function ImportScreen({
               </div>
             ))
           ) : (
-            <p className="meta">还没有课，从右边导入开始</p>
+            <p className="meta">{requireAuth && !user ? "登录后查看你的课程" : "还没有课，从右边导入开始"}</p>
           )}
         </aside>
         <section className="import-source">
           {updateInfo ? <UpdateBanner info={updateInfo} /> : null}
-          {user && requireAuth ? (
-            <section className="license-panel" aria-label="免费体验">
-              <div className="license-summary">
-                <div>
-                  <strong>免费体验</strong>
-                  <span>已学习素材 {user.trial.used} / {user.trial.limit}</span>
-                  <span className="meta">可免费深度学习 5 个素材</span>
-                </div>
-                <b>{user.membership.status === "active" ? "会员" : user.trial.remaining > 0 ? "可用" : "已用完"}</b>
-              </div>
-              {user.membership.status !== "active" && user.trial.remaining <= 0 ? (
-                <p className="meta">免费深度学习的 5 个素材已用完。开通会员后可继续学习新的素材。</p>
-              ) : null}
-            </section>
-          ) : user ? (
-            <section className="license-panel license-compat" aria-label="本机兼容授权">
-              <div className="license-summary">
-                <div>
-                  <strong>本机兼容授权</strong>
-                  <span>账号会员与免费次数以右上角「我的账号」为准；下方授权码仅影响本机/LAN 兼容层，不改变账号会员。</span>
-                </div>
-              </div>
-              <details className="license-compat-details">
-                <summary>展开本机授权码入口</summary>
-                <LicensePanel
-                  status={license}
-                  busy={licenseBusy}
-                  loadError={licenseLoadError}
-                  onActivate={onActivateLicense}
-                  onRetry={onRetryLicense}
-                  localCompat
-                />
-              </details>
-            </section>
-          ) : (
-            <LicensePanel
-              status={license}
-              busy={licenseBusy}
-              loadError={licenseLoadError}
-              onActivate={onActivateLicense}
-              onRetry={onRetryLicense}
-            />
-          )}
+          <PayPanel
+            user={user}
+            license={license}
+            licenseBusy={licenseBusy}
+            loadError={licenseLoadError}
+            requireAuth={requireAuth}
+            onAuth={onAuth}
+            onActivateLicense={onActivateLicense}
+          />
           <div
             className="intake"
             onDragOver={(e) => e.preventDefault()}
@@ -1014,15 +1015,43 @@ function ImportScreen({
               if (file) void onVideo(file);
             }}
           >
-            <div className="intake-header"><span>学习入口</span><strong>粘贴链接或上传本地视频</strong></div>
-            <label className="intake-option"><span>粘贴视频链接</span><input
-              className="intake-url"
-              type="url"
-              placeholder="粘贴 YouTube / B站 / mp4 链接"
-              value={sourceUrl}
-              onChange={(e) => onSourceUrl(e.target.value)}
-              onClick={(e) => e.stopPropagation()}
-            /></label>
+            <div
+              className="intake-link"
+              onClick={(event) => {
+                if ((event.target as HTMLElement).closest(".intake-url")) return;
+                urlInputRef.current?.focus();
+                void pasteSourceFromClipboard();
+              }}
+            >
+              <p className="intake-link-title">粘贴链接</p>
+              <input
+                ref={urlInputRef}
+                className="intake-url"
+                type="text"
+                inputMode="url"
+                autoComplete="url"
+                spellCheck={false}
+                aria-label="粘贴链接"
+                placeholder="点击此处粘贴 B站 / YouTube / 新闻链接"
+                value={sourceUrl}
+                onChange={(e) => onSourceUrl(e.target.value)}
+                onPaste={(event) => {
+                  const raw = event.clipboardData.getData("text") || event.clipboardData.getData("text/plain");
+                  const extracted = extractMediaUrl(raw);
+                  if (!extracted) return;
+                  event.preventDefault();
+                  onSourceUrl(extracted);
+                }}
+                onBlur={(event) => {
+                  const extracted = extractMediaUrl(event.target.value);
+                  if (extracted && extracted !== event.target.value.trim()) onSourceUrl(extracted);
+                }}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  if (!sourceUrl.trim()) void pasteSourceFromClipboard();
+                }}
+              />
+            </div>
             <label className="intake-file">
               <input
                 type="file"
@@ -1038,7 +1067,7 @@ function ImportScreen({
           </div>
           {error ? <p className="err">{error}</p> : null}
           <button className="primary" disabled={!canStart} onClick={onStart}>
-            进入听写室
+            听写
           </button>
           {catalog.length ? (
             <section className="curated-lessons" aria-label="推荐课程">
@@ -1068,17 +1097,78 @@ function ImportScreen({
               </div>
             </section>
           ) : null}
-          <aside className="home-notice" aria-label="产品说明">
-            <p>
-              Enprato 是一款英语学习工具，你可以使用自己选择的英语素材进行听写、跟读与练习。
-            </p>
-            <p>
-              英语素材推荐：BBC News、Bilibili、TED、YouTube 及各类英文 Podcast。
-            </p>
-            <p>
-              第三方内容的版权及使用规则归相应内容提供方所有，请遵守原平台及权利人的相关规定。
-            </p>
-          </aside>
+        </section>
+        <section className="method-block" aria-label="Enprato 学习法">
+          <header className="method-head">
+            <div className="method-head-row">
+              <h2>Enprato 学习法</h2>
+              {requireAuth && !user ? null : (
+                <button type="button" className="ghost progress-nav" onClick={onOpenProgress}>我的成长</button>
+              )}
+            </div>
+            <p className="method-head-copy">不要急着背一万个单词，先真正吃透 10 个真实语境的视频：10 则新闻或播客 × 每则 20 分钟左右 × 逐句听懂 × 逐句说对</p>
+          </header>
+          <ol className="method-steps">
+            <li>
+              <span className="method-num" aria-hidden="true">01</span>
+              <div>
+                <strong>选</strong>
+                <p>选择你想学习的语言，找到 10 则约 20 分钟左右的新闻或播客。</p>
+              </div>
+            </li>
+            <li>
+              <span className="method-num" aria-hidden="true">02</span>
+              <div>
+                <strong>听懂</strong>
+                <p>导入 Enprato，不显示字幕，尽量听写，听写不出来再看字幕，把不会的单词和句子弄懂，关掉字幕再听写。</p>
+              </div>
+            </li>
+            <li>
+              <span className="method-num" aria-hidden="true">03</span>
+              <div>
+                <strong>仿</strong>
+                <p>一句一句跟读和模仿，反复练习发音、连读、重音、停顿、语速和语调。</p>
+              </div>
+            </li>
+            <li>
+              <span className="method-num" aria-hidden="true">04</span>
+              <div>
+                <strong>背</strong>
+                <p>背诵整个内容，发音、语速、语调接近原视频。</p>
+              </div>
+            </li>
+          </ol>
+          <section className="method-sources" aria-label="推荐学习素材">
+            <h3>推荐学习素材</h3>
+            <ul>
+              <li>
+                <strong>English</strong>
+                <span>BBC News · NPR · BBC Learning English</span>
+              </li>
+              <li>
+                <strong>中文</strong>
+                <span>CCTV-13 央视新闻 · 新华社</span>
+              </li>
+              <li>
+                <strong>Français</strong>
+                <span>France 24 · RFI</span>
+              </li>
+              <li>
+                <strong>한국어</strong>
+                <span>KBS News</span>
+              </li>
+              <li>
+                <strong>Español</strong>
+                <span>RTVE Noticias</span>
+              </li>
+              <li>
+                <strong>Deutsch</strong>
+                <span>Tagesschau · DW</span>
+              </li>
+            </ul>
+          </section>
+          <p className="method-wish">其他未列语言参考以上方法找素材学习。愿你用极短的时间、极低的成本、极高效的方法，掌握一门新的语言。</p>
+          <p className="method-copy">第三方内容的版权及使用规则归相应内容提供方所有，请遵守原平台及权利人的相关规定。</p>
         </section>
       </div>
       <footer className="site-footer" aria-label="网站备案信息">
@@ -1311,7 +1401,17 @@ export function PhoneAuthForm({
   );
 }
 
-function AuthPanel({ user, onAuth }: { user: CurrentUser | null; onAuth: (user: CurrentUser | null) => void }) {
+function AuthPanel({
+  user,
+  onAuth,
+  error = "",
+  requireAuth = false,
+}: {
+  user: CurrentUser | null;
+  onAuth: (user: CurrentUser | null) => void;
+  error?: string;
+  requireAuth?: boolean;
+}) {
   const [open, setOpen] = useState(false);
   async function logout() {
     await logoutAccount();
@@ -1338,169 +1438,248 @@ function AuthPanel({ user, onAuth }: { user: CurrentUser | null; onAuth: (user: 
       </div>
     );
   }
-  return null;
+  if (!requireAuth) return null;
+  return (
+    <>
+      <button type="button" className="account-register" onClick={() => setOpen(true)}>登录</button>
+      {open ? (
+        <div className="auth-modal-backdrop" onClick={() => setOpen(false)}>
+          <div
+            className="auth-modal"
+            role="dialog"
+            aria-label="登录 / 注册"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <button type="button" className="auth-modal-close" aria-label="关闭" onClick={() => setOpen(false)}>
+              ×
+            </button>
+            <h2>登录 / 注册</h2>
+            <EmailAuthForm
+              error={error}
+              onAuthed={(next) => {
+                onAuth(next);
+                setOpen(false);
+              }}
+            />
+          </div>
+        </div>
+      ) : null}
+    </>
+  );
 }
 
-function LicensePanel({
-  status,
-  busy,
+function PayPanel({
+  user,
+  license,
+  licenseBusy,
   loadError,
-  onActivate,
-  onRetry,
-  localCompat = false,
+  requireAuth = false,
+  onAuth,
+  onActivateLicense,
 }: {
-  status: LicenseStatus | null;
-  busy: boolean;
+  user: CurrentUser | null;
+  license: LicenseStatus | null;
+  licenseBusy: boolean;
   loadError: string;
-  onActivate: (key: string) => void | Promise<void>;
-  onRetry: () => void | Promise<void>;
-  localCompat?: boolean;
+  requireAuth?: boolean;
+  onAuth: (user: CurrentUser | null) => void;
+  onActivateLicense: (key: string) => void | Promise<void>;
 }) {
-  const [key, setKey] = useState("");
-  const [payError, setPayError] = useState("");
-  const [payPlan, setPayPlan] = useState<"monthly" | "lifetime" | null>(null);
-  const [payMethod, setPayMethod] = useState<"wechat" | "alipay" | null>(null);
+  const [code, setCode] = useState("");
+  const [message, setMessage] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [payOrder, setPayOrder] = useState<Order | null>(null);
+  const [qrSrc, setQrSrc] = useState("");
+  const memberActive = user?.membership.status === "active";
+  const trialUsed = user ? user.trial.used : license?.trial_uses ?? 0;
+  const trialLimit = user ? user.trial.limit : license?.trial_uses_limit ?? 5;
+  const trialRemaining = user ? user.trial.remaining : Math.max(0, trialLimit - trialUsed);
+  const payBusy = busy || licenseBusy;
 
-  function openPay(plan: "monthly" | "lifetime") {
-    const url = plan === "monthly" ? status?.pay_monthly_url : status?.pay_lifetime_url;
-    if (url?.trim()) {
-      setPayError("");
-      window.open(url.trim(), "_blank", "noopener,noreferrer");
+  useEffect(() => {
+    const url = payOrder?.payment?.code_url || "";
+    if (!url || url.startsWith("mock://")) {
+      setQrSrc("");
       return;
     }
-    setPayError("");
-    setPayPlan(plan);
-    setPayMethod(null);
+    let cancelled = false;
+    void QRCode.toDataURL(url, { width: 220, margin: 1, color: { dark: "#111827", light: "#ffffff" } })
+      .then((data) => {
+        if (!cancelled) setQrSrc(data);
+      })
+      .catch(() => {
+        if (!cancelled) setQrSrc("");
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [payOrder]);
+
+  useEffect(() => {
+    if (!payOrder || payOrder.status === "paid") return;
+    let cancelled = false;
+    const tick = async () => {
+      try {
+        const latest =
+          payOrder.payment?.provider === "mock"
+            ? await fetchOrder(payOrder.order_no)
+            : await syncWechatOrder(payOrder.order_no).catch(() => fetchOrder(payOrder.order_no));
+        if (cancelled || latest.status !== "paid") return;
+        setPayOrder(latest);
+        const me = await fetchCurrentUser();
+        if (me) onAuth(me);
+        setMessage("支付成功，会员已开通。");
+      } catch {
+        /* keep polling until paid or cancelled */
+      }
+    };
+    const timer = window.setInterval(() => {
+      void tick();
+    }, 2500);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [payOrder, onAuth]);
+
+  function describeTrial() {
+    if (memberActive && user) {
+      setMessage(`会员有效期至 ${formatLicenseDate(user.membership.expires_at)}`);
+      return;
+    }
+    if (trialRemaining > 0) {
+      setMessage(`还可免费深度学习 ${trialRemaining} 个素材`);
+      return;
+    }
+    setMessage("免费深度学习的 5 个素材已用完。开通会员后可继续学习新的素材。");
   }
 
-  const payTitle = payPlan === "lifetime" ? "年付版 ¥199/年" : payPlan === "monthly" ? "会员版 ¥19.9/月" : "";
-  const payNote = payPlan === "lifetime" ? "Enprato年付" : payPlan === "monthly" ? "Enprato月付" : "";
-  const payMethodLabel = payMethod === "wechat" ? "微信支付" : payMethod === "alipay" ? "支付宝" : "";
-  const payQrSrc =
-    payPlan && payMethod
-      ? `/pay/${payMethod}-${payPlan === "lifetime" ? "lifetime" : "monthly"}.jpg`
-      : "";
+  async function startPay(plan: "monthly_30d" | "yearly_365d") {
+    setMessage("");
+    if (!user) {
+      setMessage("请先登录后再开通会员");
+      return;
+    }
+    setBusy(true);
+    try {
+      setPayOrder(await createOrder(plan));
+    } catch (err) {
+      setMessage(err instanceof Error ? err.message : "暂时无法发起支付");
+    } finally {
+      setBusy(false);
+    }
+  }
 
-  const used = status
-    ? `${status.trial_uses ?? status.trial_imports}/${status.trial_uses_limit ?? status.trial_imports_limit}`
-    : "-";
+  async function mockConfirm() {
+    if (!payOrder) return;
+    setBusy(true);
+    try {
+      await confirmMockPay(payOrder.order_no);
+      const me = await fetchCurrentUser();
+      if (me) onAuth(me);
+      setPayOrder({ ...payOrder, status: "paid" });
+      setMessage("支付成功，会员已开通。");
+    } catch (err) {
+      setMessage(err instanceof Error ? err.message : "确认支付失败");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function submitRedeem(event: FormEvent) {
+    event.preventDefault();
+    const clean = code.trim();
+    if (!clean) return;
+    setBusy(true);
+    setMessage("");
+    try {
+      if (user) {
+        onAuth(await redeemMembership(clean));
+        setCode("");
+        setMessage("兑换成功，会员已开通。");
+      } else if (!requireAuth) {
+        await onActivateLicense(clean);
+        setCode("");
+        setMessage("兑换成功。");
+      } else {
+        setMessage("请先登录后再兑换。");
+      }
+    } catch (err) {
+      setMessage(err instanceof Error ? err.message : "兑换码无效");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const payLabel =
+    payOrder?.plan === "yearly_365d" || payOrder?.plan_code === "yearly_365d" ? "199元/年" : "19.9元/月";
 
   return (
-    <section className={`license-panel ${localCompat ? "license-compat-inner" : ""} ${status?.active ? "license-ok" : "license-locked"}`}>
-      {!localCompat ? (
-        !status?.licensed ? (
-          <div className="license-summary">
-            <div>
-              <span>免费试用 {used} 次</span>
-            </div>
-            <b>{status?.active ? "可用" : "需激活"}</b>
+    <section className={`license-panel ${memberActive ? "license-ok" : "license-locked"}`} aria-label="开通会员">
+      {memberActive && user ? (
+        <div className="license-summary">
+          <div>
+            <strong>会员已开通</strong>
+            <span>有效期至 {formatLicenseDate(user.membership.expires_at)}</span>
           </div>
-        ) : null
-      ) : (
-        <p className="meta license-compat-note">本机兼容授权 · {status?.active ? "可用" : "需激活"}</p>
-      )}
-      {!localCompat ? (
+          <b>可用</b>
+        </div>
+      ) : null}
       <div className="price-grid">
-        <button type="button" className="price-card" disabled={busy} onClick={() => void openPay("monthly")}>
-          <strong>¥19.9/月</strong>
+        <button type="button" className="price-card" disabled={payBusy} onClick={describeTrial}>
+          <strong>5次免费使用权</strong>
+          <span>已用 {trialUsed} / {trialLimit}</span>
+        </button>
+        <button type="button" className="price-card" disabled={payBusy} onClick={() => void startPay("monthly_30d")}>
+          <strong>19.9元/月</strong>
           <span>适合持续练习，按月续费</span>
         </button>
-        <button type="button" className="price-card" disabled={busy} onClick={() => void openPay("lifetime")}>
-          <strong>¥199/年</strong>
+        <button type="button" className="price-card" disabled={payBusy} onClick={() => void startPay("yearly_365d")}>
+          <strong>199元/年</strong>
           <span>适合长期练习，按年续费</span>
         </button>
       </div>
-      ) : null}
       {loadError ? <p className="err">{loadError}</p> : null}
-      {!status && !loadError ? (
-        <p className="err">正在读取授权状态…若长时间无响应，请点下方重新检测。</p>
-      ) : null}
-      {payError ? <p className="err">{payError}</p> : null}
-      {!localCompat ? (
-      <p className="meta pay-hint">
-        {payPlan ? "请选择付款方式，打开对应收款码" : "点上方套餐选择付款方式，付款后粘贴授权码激活"}
-      </p>
-      ) : (
-        <p className="meta pay-hint">仅用于本机/LAN 兼容；账号会员请走右上角账号体系。</p>
-      )}
-      {!localCompat && payPlan ? (
+      {message ? <p className={/成功|开通|还可免费|有效期/.test(message) ? "pay-ok" : "err"}>{message}</p> : null}
+      {payOrder && payOrder.status !== "paid" ? (
         <div className="pay-inline">
           <div className="pay-inline-head">
-            <strong>{payTitle}</strong>
+            <strong>微信扫码支付 {payLabel}</strong>
             <button
               type="button"
               className="ghost pay-inline-close"
               onClick={() => {
-                setPayPlan(null);
-                setPayMethod(null);
+                setPayOrder(null);
+                setQrSrc("");
               }}
             >
-              收起
+              取消
             </button>
           </div>
-          <p className="pay-modal-note">
-            付款金额 <strong>{payPlan === "lifetime" ? "¥199" : "¥19.9"}</strong>，备注写
-            <strong> {payNote}</strong>。
-          </p>
-          <div className="pay-method-grid">
-            <button type="button" className="pay-method-card" onClick={() => setPayMethod("wechat")}>
-              <strong>微信支付</strong>
-              <span>打开微信收款码</span>
+          {qrSrc ? <img className="pay-qr-img" src={qrSrc} alt="微信支付二维码" /> : null}
+          {payOrder.payment?.provider === "mock" ? (
+            <button type="button" className="primary" disabled={payBusy} onClick={() => void mockConfirm()}>
+              开发环境确认支付
             </button>
-            <button type="button" className="pay-method-card" onClick={() => setPayMethod("alipay")}>
-              <strong>支付宝</strong>
-              <span>打开支付宝收款码</span>
-            </button>
-          </div>
-          <p className="meta pay-modal-foot">付款后把截图发给客服获取授权码，收到后在下方输入并点击「激活」。</p>
+          ) : (
+            <p className="meta pay-hint">支付完成后将自动开通会员并记录有效期，无需授权码。</p>
+          )}
         </div>
       ) : null}
-      {!localCompat && payPlan && payMethod ? (
-        <div className="pay-modal-backdrop" role="presentation" onClick={() => setPayMethod(null)}>
-          <div
-            className="pay-modal"
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby="pay-modal-title"
-            onClick={(event) => event.stopPropagation()}
-          >
-            <button type="button" className="pay-modal-close" aria-label="关闭" onClick={() => setPayMethod(null)}>
-              ×
-            </button>
-            <h3 id="pay-modal-title">{payMethodLabel}</h3>
-            <p className="pay-modal-note">
-              {payTitle}，付款金额 <strong>{payPlan === "lifetime" ? "¥199" : "¥19.9"}</strong>，备注写
-              <strong> {payNote}</strong>。
-            </p>
-            <figure className="pay-qr-single">
-              <img src={payQrSrc} alt={`${payMethodLabel}收款码`} />
-              <figcaption>{payMethodLabel}</figcaption>
-            </figure>
-            <p className="meta pay-modal-foot">付款后把截图发给客服获取授权码。</p>
-          </div>
-        </div>
-      ) : null}
-      <form
-        className="license-activate"
-        onSubmit={(event) => {
-          event.preventDefault();
-          const clean = key.trim();
-          if (clean) void onActivate(clean);
-        }}
-      >
-        <input
-          value={key}
-          onChange={(event) => setKey(event.target.value)}
-          placeholder={localCompat ? "输入本机兼容授权码（可选）" : "输入付款后获得的授权码"}
-          spellCheck={false}
-        />
-        <button type="submit" className="primary" disabled={busy || !key.trim()}>
-          {busy ? "激活中" : "激活"}
-        </button>
-      </form>
-      <button type="button" className="ghost pay-retry" disabled={busy} onClick={() => void onRetry()}>
-        重新检测授权
-      </button>
+      <details className="redeem-details">
+        <summary>我有兑换码</summary>
+        <form className="license-activate" onSubmit={(event) => void submitRedeem(event)}>
+          <input
+            value={code}
+            onChange={(event) => setCode(event.target.value)}
+            placeholder="输入兑换码"
+            spellCheck={false}
+          />
+          <button className="primary" type="submit" disabled={payBusy || !code.trim()}>
+            {payBusy ? "兑换中" : "兑换"}
+          </button>
+        </form>
+      </details>
     </section>
   );
 }

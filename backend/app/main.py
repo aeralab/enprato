@@ -335,6 +335,13 @@ class OrderBody(BaseModel):
     provider: str = "wechat"
 
 
+class RedeemBody(BaseModel):
+    code: str
+
+
+ALLOWED_PAY_PLANS = {"monthly_30d", "yearly_365d"}
+
+
 def public_user(user):
     email = user["email"] if isinstance(user, dict) else user["email"]
     user_id = user["id"]
@@ -587,12 +594,13 @@ def api_plans(user: dict[str, Any] = Depends(require_user)):
 def api_create_order(request: Request, body: OrderBody, user: dict[str, Any] = Depends(require_user)):
     enforce_rate_limit(request, "payment-create")
     if body.provider != "wechat": raise HTTPException(400, "当前仅支持微信支付")
+    if body.plan not in ALLOWED_PAY_PLANS: raise HTTPException(400, "套餐不存在")
     try:
         order = db.create_order(user["id"], body.plan, body.provider)
         if mock_provider_enabled():
             logger.warning("payment mock order created order=%s provider=mock", order["order_no"])
             return {**order, "payment": {"provider": "mock", "code_url": "mock://" + order["order_no"]}}
-        payment = provider_for(body.provider).create_native_payment(order_no=order["order_no"], description="Enprato 月度会员 30 天", amount_fen=order["amount_fen"])
+        payment = provider_for(body.provider).create_native_payment(order_no=order["order_no"], description=str(order.get("plan_name") or "Enprato 会员"), amount_fen=order["amount_fen"])
         logger.info("payment order created order=%s provider=%s", order["order_no"], body.provider)
         return {**order, "payment": payment}
     except (ValueError, PaymentConfigError) as exc:
@@ -640,7 +648,7 @@ def sync_wechat_order(request: Request, order_no: str, user: dict[str, Any] = De
         amount = int((payload.get("amount") or {}).get("total") or 0)
         trade_no = str(payload.get("transaction_id") or "")
         if str(payload.get("mchid") or "") != os.environ.get("WECHATPAY_MCH_ID", "").strip(): raise ValueError("merchant mismatch")
-        if payload.get("trade_state") == "SUCCESS" and (amount != 1990 or not trade_no): raise ValueError("payment transaction mismatch")
+        if payload.get("trade_state") == "SUCCESS" and (amount != int(order["amount_fen"]) or not trade_no): raise ValueError("payment transaction mismatch")
         if payload.get("trade_state") == "SUCCESS": db.complete_payment(provider="wechat", event_id=trade_no, payload_hash="query", order_no=order_no, trade_no=trade_no, amount_fen=amount, payment_status="SUCCESS", merchant_id=str(payload.get("mchid")), app_id=str(payload.get("appid") or ""))
     except (ValueError, PaymentConfigError, RuntimeError) as exc: raise HTTPException(400, str(exc)) from exc
     return db.get_order(order_no, user["id"])
@@ -654,6 +662,16 @@ def dev_pay(order_no: str, user: dict[str, Any] = Depends(require_user)):
         result = db.complete_payment(provider="mock", event_id="mock-" + order_no, payload_hash="dev", order_no=order_no, trade_no="mock-" + order_no, amount_fen=order["amount_fen"], payment_status="SUCCESS")
     except ValueError as exc: raise HTTPException(400, str(exc)) from exc
     return {"status": result, "membership": db.membership_status(user["id"])}
+
+
+@app.post("/api/membership/redeem")
+def api_redeem_membership(request: Request, body: RedeemBody, user: dict[str, Any] = Depends(require_user)):
+    enforce_rate_limit(request, "membership-redeem")
+    try:
+        db.redeem_membership_code(user["id"], body.code)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return public_user(user)
 
 
 @app.post("/api/dev/membership")
