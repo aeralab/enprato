@@ -350,7 +350,7 @@ class RedeemBody(BaseModel):
     code: str
 
 
-ALLOWED_PAY_PLANS = {"monthly_30d", "yearly_365d"}
+ALLOWED_PAY_PLANS = {"monthly_30d", "quarterly_90d", "yearly_365d"}
 
 
 def public_user(user):

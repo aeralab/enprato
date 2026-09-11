@@ -932,6 +932,7 @@ function ImportScreen({
 }) {
   const urlInputRef = useRef<HTMLInputElement>(null);
   const [historyMenu, setHistoryMenu] = useState<string | null>(null);
+  const [loginOpen, setLoginOpen] = useState(false);
 
   async function pasteSourceFromClipboard() {
     try {
@@ -969,7 +970,14 @@ function ImportScreen({
           <span>dictation booth</span>
         </div>
         <div className="topbar-actions">
-          <AuthPanel user={user} onAuth={onAuth} error={authError} requireAuth={requireAuth} />
+          <AuthPanel
+            user={user}
+            onAuth={onAuth}
+            error={authError}
+            requireAuth={requireAuth}
+            loginOpen={loginOpen}
+            onLoginOpenChange={setLoginOpen}
+          />
         </div>
       </header>
       <div className="import">
@@ -1012,6 +1020,7 @@ function ImportScreen({
             requireAuth={requireAuth}
             onAuth={onAuth}
             onActivateLicense={onActivateLicense}
+            onRequestLogin={() => setLoginOpen(true)}
           />
           <div
             className="intake"
@@ -1413,13 +1422,20 @@ function AuthPanel({
   onAuth,
   error = "",
   requireAuth = false,
+  loginOpen,
+  onLoginOpenChange,
 }: {
   user: CurrentUser | null;
   onAuth: (user: CurrentUser | null) => void;
   error?: string;
   requireAuth?: boolean;
+  loginOpen?: boolean;
+  onLoginOpenChange?: (open: boolean) => void;
 }) {
-  const [open, setOpen] = useState(false);
+  const [popoverOpen, setPopoverOpen] = useState(false);
+  const [internalLoginOpen, setInternalLoginOpen] = useState(false);
+  const guestLoginOpen = loginOpen ?? internalLoginOpen;
+  const setGuestLoginOpen = onLoginOpenChange ?? setInternalLoginOpen;
   async function logout() {
     await logoutAccount();
     onAuth(null);
@@ -1428,12 +1444,12 @@ function AuthPanel({
     const trialLabel = `已学习素材 ${user.trial.used} / ${user.trial.limit}`;
     return (
       <div className="account-compact">
-        <button type="button" className="account-status" onClick={() => setOpen(!open)}>
+        <button type="button" className="account-status" onClick={() => setPopoverOpen(!popoverOpen)}>
           <strong>{user.membership.status === "active" ? "Enprato Pro" : "免费体验"}</strong>
           <span>{user.membership.status === "active" ? "" : `已学习素材 ${user.trial.used} / ${user.trial.limit}`}</span>
           <b>我的账号</b>
         </button>
-        {open ? (
+        {popoverOpen ? (
           <div className="account-popover">
             <p className="account-email">{user.login_label || user.email || "已登录"}</p>
             <p>会员状态：{user.membership.status === "active" ? "Enprato Pro" : "免费体验"}</p>
@@ -1445,19 +1461,20 @@ function AuthPanel({
       </div>
     );
   }
-  if (!requireAuth) return null;
   return (
     <>
-      <button type="button" className="account-register" onClick={() => setOpen(true)}>登录</button>
-      {open ? (
-        <div className="auth-modal-backdrop" onClick={() => setOpen(false)}>
+      {requireAuth ? (
+        <button type="button" className="account-register" onClick={() => setGuestLoginOpen(true)}>登录</button>
+      ) : null}
+      {guestLoginOpen ? (
+        <div className="auth-modal-backdrop" onClick={() => setGuestLoginOpen(false)}>
           <div
             className="auth-modal"
             role="dialog"
             aria-label="登录 / 注册"
             onClick={(event) => event.stopPropagation()}
           >
-            <button type="button" className="auth-modal-close" aria-label="关闭" onClick={() => setOpen(false)}>
+            <button type="button" className="auth-modal-close" aria-label="关闭" onClick={() => setGuestLoginOpen(false)}>
               ×
             </button>
             <h2>登录 / 注册</h2>
@@ -1465,7 +1482,7 @@ function AuthPanel({
               error={error}
               onAuthed={(next) => {
                 onAuth(next);
-                setOpen(false);
+                setGuestLoginOpen(false);
               }}
             />
           </div>
@@ -1483,6 +1500,7 @@ function PayPanel({
   requireAuth = false,
   onAuth,
   onActivateLicense,
+  onRequestLogin,
 }: {
   user: CurrentUser | null;
   license: LicenseStatus | null;
@@ -1491,6 +1509,7 @@ function PayPanel({
   requireAuth?: boolean;
   onAuth: (user: CurrentUser | null) => void;
   onActivateLicense: (key: string) => void | Promise<void>;
+  onRequestLogin?: () => void;
 }) {
   const [code, setCode] = useState("");
   const [message, setMessage] = useState("");
@@ -1549,8 +1568,17 @@ function PayPanel({
     };
   }, [payOrder, onAuth]);
 
+  function requestLogin() {
+    setMessage("");
+    onRequestLogin?.();
+  }
+
   function describeTrial() {
-    if (memberActive && user) {
+    if (!user) {
+      requestLogin();
+      return;
+    }
+    if (memberActive) {
       setMessage(`会员有效期至 ${formatLicenseDate(user.membership.expires_at)}`);
       return;
     }
@@ -1561,10 +1589,10 @@ function PayPanel({
     setMessage("免费深度学习的 5 个素材已用完。开通会员后可继续学习新的素材。");
   }
 
-  async function startPay(plan: "monthly_30d" | "yearly_365d") {
+  async function startPay(plan: "monthly_30d" | "quarterly_90d" | "yearly_365d") {
     setMessage("");
     if (!user) {
-      setMessage("请先登录后再开通会员");
+      requestLogin();
       return;
     }
     setBusy(true);
@@ -1609,7 +1637,7 @@ function PayPanel({
         setCode("");
         setMessage("兑换成功。");
       } else {
-        setMessage("请先登录后再兑换。");
+        requestLogin();
       }
     } catch (err) {
       setMessage(err instanceof Error ? err.message : "兑换码无效");
@@ -1618,8 +1646,9 @@ function PayPanel({
     }
   }
 
+  const payPlan = payOrder?.plan || payOrder?.plan_code;
   const payLabel =
-    payOrder?.plan === "yearly_365d" || payOrder?.plan_code === "yearly_365d" ? "199元/年" : "19.9元/月";
+    payPlan === "yearly_365d" ? "199元/年" : payPlan === "quarterly_90d" ? "59元/三个月" : "19.9元/月";
 
   return (
     <section className={`license-panel ${memberActive ? "license-ok" : "license-locked"}`} aria-label="开通会员">
@@ -1641,13 +1670,24 @@ function PayPanel({
           <strong>19.9元/月</strong>
           <span>适合持续练习，按月续费</span>
         </button>
+        <button type="button" className="price-card price-card-featured" disabled={payBusy} onClick={() => void startPay("quarterly_90d")}>
+          <em className="price-card-badge">推荐</em>
+          <strong>59元/三个月</strong>
+          <span>挑战3个月掌握一门外语。</span>
+        </button>
         <button type="button" className="price-card" disabled={payBusy} onClick={() => void startPay("yearly_365d")}>
           <strong>199元/年</strong>
           <span>适合长期练习，按年续费</span>
         </button>
       </div>
       {loadError ? <p className="err">{loadError}</p> : null}
-      {message ? <p className={/成功|开通|还可免费|有效期/.test(message) ? "pay-ok" : "err"}>{message}</p> : null}
+      {!user ? (
+        <button type="button" className="pay-login-cta" onClick={requestLogin}>
+          请先登录后再开通会员
+        </button>
+      ) : message ? (
+        <p className={/成功|开通|还可免费|有效期/.test(message) ? "pay-ok" : "err"}>{message}</p>
+      ) : null}
       {payOrder && payOrder.status !== "paid" ? (
         <div className="pay-inline">
           <div className="pay-inline-head">

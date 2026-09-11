@@ -1325,13 +1325,18 @@ button {
 }
 
 .stage-home .import-source .price-grid {
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
 }
 
 .stage-home .import-source .price-card {
   padding: 8px 10px;
   gap: 2px;
   width: 100%;
+}
+
+.stage-home .import-source .price-card strong {
+  overflow-wrap: normal;
+  white-space: nowrap;
 }
 
 .stage-home .import-source .pay-hint {
@@ -2036,7 +2041,7 @@ button {
 
 .price-grid {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 8px;
   min-width: 0;
   width: 100%;
@@ -2071,6 +2076,34 @@ button {
   line-height: 1.3;
 }
 
+.price-card-featured {
+  border-color: #1f766b;
+  background: #ecfdf8;
+  box-shadow: inset 0 0 0 1px #1f766b;
+}
+
+.price-card-featured:hover {
+  border-color: #14564e;
+  background: #d9f6ee;
+}
+
+.price-card-badge {
+  justify-self: start;
+  margin: 0;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: #1f766b;
+  color: #fff;
+  font-size: 11px;
+  font-style: normal;
+  font-weight: 700;
+  line-height: 1.4;
+}
+
+.price-card-featured strong {
+  color: #14564e;
+}
+
 .pay-qr-img {
   width: 180px;
   height: 180px;
@@ -2097,6 +2130,27 @@ button {
 .pay-ok {
   margin: 6px 0 0;
   color: #0f766e;
+}
+
+.pay-login-cta {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: fit-content;
+  max-width: 100%;
+  margin: 4px 0 0;
+  padding: 8px 12px;
+  border: 1px solid var(--en-action-dark);
+  border-radius: var(--en-radius);
+  background: var(--en-action);
+  color: var(--en-action-text);
+  font: inherit;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.pay-login-cta:hover {
+  filter: brightness(0.98);
 }
 
 .pay-inline {
@@ -2550,6 +2604,7 @@ button {
 
 @media (max-width: 720px) {
   .price-grid,
+  .stage-home .import-source .price-grid,
   .license-activate {
     grid-template-columns: 1fr;
   }

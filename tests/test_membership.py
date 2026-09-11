@@ -90,6 +90,13 @@ class MembershipTests(unittest.TestCase):
                 yearly_status = db.membership_status(user["id"])
                 self.assertEqual(yearly_status["plan"], "yearly_365d")
                 self.assertTrue(yearly_status["active"])
+                quarterly = db.create_order(user["id"], "quarterly_90d", "mock")
+                self.assertEqual(quarterly["amount_fen"], 5900)
+                self.assertEqual(quarterly["duration_days"], 90)
+                self.assertEqual(db.complete_payment(provider="mock", event_id="q1", payload_hash="q", order_no=quarterly["order_no"], trade_no="t4", amount_fen=5900, payment_status="SUCCESS"), "paid")
+                quarterly_status = db.membership_status(user["id"])
+                self.assertEqual(quarterly_status["plan"], "quarterly_90d")
+                self.assertTrue(quarterly_status["active"])
             finally:
                 db.DB_PATH = old
 
