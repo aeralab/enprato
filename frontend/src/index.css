@@ -1218,7 +1218,7 @@ button {
   width: 100%;
   min-width: 0;
   max-width: none;
-  flex: 1 1 auto;
+  flex: 0 0 auto;
   min-height: 0;
   box-sizing: border-box;
 }
@@ -1275,12 +1275,11 @@ button {
   grid-area: source;
   width: 100%;
   min-width: 0;
-  height: min(380px, 42vh);
-  max-height: min(380px, 42vh);
+  height: auto;
+  max-height: none;
   min-height: 0;
   align-self: start;
-  overflow-x: auto;
-  overflow-y: auto;
+  overflow: visible;
   border: 1px solid var(--en-border-soft);
   border-radius: var(--en-radius);
   padding: 10px 12px;
