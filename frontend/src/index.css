@@ -1421,7 +1421,10 @@ button {
   grid-template-columns: repeat(2, minmax(0, 1fr));
   column-gap: clamp(32px, 5vw, 72px);
   row-gap: 24px;
-  margin: 0;
+  margin-left: auto;
+  margin-right: auto;
+  margin-top: 0;
+  margin-bottom: 0;
 }
 
 .stage-home .method-steps li {
@@ -2086,20 +2089,11 @@ button {
   background: #d9f6ee;
 }
 
-.price-card-badge {
-  justify-self: start;
-  margin: 0;
-  padding: 1px 7px;
-  border-radius: 999px;
-  background: #1f766b;
-  color: #fff;
-  font-size: 11px;
-  font-style: normal;
-  font-weight: 700;
-  line-height: 1.4;
+.price-card-featured strong {
+  color: #14564e;
 }
 
-.price-card-featured strong {
+.price-card-featured span:last-child {
   color: #14564e;
 }
 
@@ -2129,6 +2123,63 @@ button {
 .pay-ok {
   margin: 6px 0 0;
   color: #0f766e;
+}
+
+.group-invite-modal {
+  width: min(560px, 100%);
+  text-align: center;
+  justify-items: center;
+}
+
+.group-invite-modal p {
+  margin: 0;
+  color: #4b5563;
+  font-size: 14px;
+  line-height: 1.55;
+}
+
+.group-invite-qrs {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+  width: 100%;
+}
+
+.group-invite-qr-item {
+  margin: 0;
+  display: grid;
+  gap: 6px;
+  justify-items: center;
+}
+
+.group-invite-qr-item figcaption {
+  font-size: 13px;
+  color: #374151;
+}
+
+.group-invite-qr {
+  width: 168px;
+  height: 168px;
+  object-fit: contain;
+  border-radius: 12px;
+  background: #fff;
+}
+
+@media (max-width: 520px) {
+  .group-invite-qrs {
+    grid-template-columns: 1fr;
+  }
+}
+
+.group-invite-reopen {
+  margin-top: 6px;
+  width: fit-content;
+  padding: 4px 10px;
+  font-size: 12px;
+}
+
+.license-summary .group-invite-reopen {
+  justify-self: start;
 }
 
 .pay-login-cta {

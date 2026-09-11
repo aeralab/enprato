@@ -1516,11 +1516,23 @@ function PayPanel({
   const [busy, setBusy] = useState(false);
   const [payOrder, setPayOrder] = useState<Order | null>(null);
   const [qrSrc, setQrSrc] = useState("");
+  const [groupInviteOpen, setGroupInviteOpen] = useState(false);
   const memberActive = user?.membership.status === "active";
+  const quarterlyMember = memberActive && user?.membership.plan === "quarterly_90d";
   const trialUsed = user ? user.trial.used : license?.trial_uses ?? 0;
   const trialLimit = user ? user.trial.limit : license?.trial_uses_limit ?? 5;
   const trialRemaining = user ? user.trial.remaining : Math.max(0, trialLimit - trialUsed);
   const payBusy = busy || licenseBusy;
+
+  function isQuarterlyOrder(order: Order | null) {
+    return (order?.plan || order?.plan_code) === "quarterly_90d";
+  }
+
+  function markPaid(order: Order) {
+    setPayOrder(order);
+    setMessage("支付成功，会员已开通。");
+    if (isQuarterlyOrder(order)) setGroupInviteOpen(true);
+  }
 
   useEffect(() => {
     const url = payOrder?.payment?.code_url || "";
@@ -1551,10 +1563,9 @@ function PayPanel({
             ? await fetchOrder(payOrder.order_no)
             : await syncWechatOrder(payOrder.order_no).catch(() => fetchOrder(payOrder.order_no));
         if (cancelled || latest.status !== "paid") return;
-        setPayOrder(latest);
         const me = await fetchCurrentUser();
         if (me) onAuth(me);
-        setMessage("支付成功，会员已开通。");
+        markPaid(latest);
       } catch {
         /* keep polling until paid or cancelled */
       }
@@ -1612,8 +1623,7 @@ function PayPanel({
       await confirmMockPay(payOrder.order_no);
       const me = await fetchCurrentUser();
       if (me) onAuth(me);
-      setPayOrder({ ...payOrder, status: "paid" });
-      setMessage("支付成功，会员已开通。");
+      markPaid({ ...payOrder, status: "paid" });
     } catch (err) {
       setMessage(err instanceof Error ? err.message : "确认支付失败");
     } finally {
@@ -1657,6 +1667,11 @@ function PayPanel({
           <div>
             <strong>会员已开通</strong>
             <span>有效期至 {formatLicenseDate(user.membership.expires_at)}</span>
+            {quarterlyMember ? (
+              <button type="button" className="ghost group-invite-reopen" onClick={() => setGroupInviteOpen(true)}>
+                查看学习群二维码
+              </button>
+            ) : null}
           </div>
           <b>可用</b>
         </div>
@@ -1671,9 +1686,9 @@ function PayPanel({
           <span>适合持续练习，按月续费</span>
         </button>
         <button type="button" className="price-card price-card-featured" disabled={payBusy} onClick={() => void startPay("quarterly_90d")}>
-          <em className="price-card-badge">推荐</em>
           <strong>59元/三个月</strong>
           <span>挑战3个月掌握一门外语。</span>
+          <span>付款后扫码进学习群。</span>
         </button>
         <button type="button" className="price-card" disabled={payBusy} onClick={() => void startPay("yearly_365d")}>
           <strong>199元/年</strong>
@@ -1727,6 +1742,32 @@ function PayPanel({
           </button>
         </form>
       </details>
+      {groupInviteOpen ? (
+        <div className="auth-modal-backdrop" onClick={() => setGroupInviteOpen(false)}>
+          <div
+            className="auth-modal group-invite-modal"
+            role="dialog"
+            aria-label="加入学习群"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <button type="button" className="auth-modal-close" aria-label="关闭" onClick={() => setGroupInviteOpen(false)}>
+              ×
+            </button>
+            <h2>加入学习群</h2>
+            <p>这是 59元/三个月 会员专属联系方式。扫码加微信或企业微信，进群打卡学习。</p>
+            <div className="group-invite-qrs">
+              <figure className="group-invite-qr-item">
+                <img className="group-invite-qr" src="/quarterly-wechat-qr.jpg" alt="微信二维码" />
+                <figcaption>微信</figcaption>
+              </figure>
+              <figure className="group-invite-qr-item">
+                <img className="group-invite-qr" src="/quarterly-wecom-qr.jpg" alt="企业微信二维码" />
+                <figcaption>企业微信</figcaption>
+              </figure>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </section>
   );
 }
