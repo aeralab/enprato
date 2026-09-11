@@ -108,14 +108,44 @@ class PrepareBilibiliVideoTests(unittest.TestCase):
         video.write_bytes(b"v" * 400)
         audio.write_bytes(b"a" * 400)
         dest.write_bytes(b"merged" * 400)
+        seen: list[list[str]] = []
 
         def fake_run(args, timeout=None):
+            seen.append(list(args))
             self.assertIn("-f", args)
             self.assertEqual(args[args.index("-f") + 1], "mp4")
             self.assertEqual(args[-1], str(dest))
 
         with patch("backend.app.bilibili.run_ffmpeg", side_effect=fake_run):
             merge_dash(video, audio, dest)
+        self.assertEqual(len(seen), 1)
+        args = seen[0]
+        self.assertEqual(args[args.index("-c:a") + 1], "copy")
+        self.assertNotIn("192k", args)
+
+    def test_merge_falls_back_to_aac_when_copy_fails(self):
+        from backend.app.bilibili import merge_dash
+
+        folder = Path(tempfile.mkdtemp())
+        video = folder / "dash_video.m4s"
+        audio = folder / "playback.m4a"
+        dest = folder / "source.mp4.tmp"
+        video.write_bytes(b"v" * 400)
+        audio.write_bytes(b"a" * 400)
+        calls: list[list[str]] = []
+
+        def fake_run(args, timeout=None):
+            calls.append(list(args))
+            if args[args.index("-c:a") + 1] == "copy":
+                raise RuntimeError("copy failed")
+            dest.write_bytes(b"merged" * 400)
+
+        with patch("backend.app.bilibili.run_ffmpeg", side_effect=fake_run):
+            merge_dash(video, audio, dest)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0][calls[0].index("-c:a") + 1], "copy")
+        self.assertEqual(calls[1][calls[1].index("-c:a") + 1], "aac")
+        self.assertIn("192k", calls[1])
 
 
 class BilibiliMediaJobTests(unittest.TestCase):

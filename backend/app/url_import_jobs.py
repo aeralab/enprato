@@ -13,7 +13,9 @@ from .ingest import (
     classify_ingest_error,
     log_url_import_stage,
     public_url_import_error,
+    read_import_duration,
     read_import_title,
+    read_subtitle_status,
     url_host_family,
     url_preview,
 )
@@ -37,10 +39,10 @@ STAGE_FAILED = "failed"
 
 STAGE_MESSAGES = {
     STAGE_QUEUED: "正在排队…",
-    STAGE_METADATA: "正在读取视频信息…",
-    STAGE_DOWNLOADING: "正在准备视频…",
+    STAGE_METADATA: "正在检查是否有英文字幕…",
+    STAGE_DOWNLOADING: "正在检查英文字幕并准备音频…",
     STAGE_AUDIO: "正在处理音频…",
-    STAGE_TRANSCRIBING: "正在识别语音…",
+    STAGE_TRANSCRIBING: "没有英文字幕，正在语音识别生成句子，请耐心等待。",
     STAGE_FINALIZING: "正在生成听写内容…",
     STAGE_READY: "准备完成",
     STAGE_FAILED: "导入失败",
@@ -151,6 +153,50 @@ def get_job(job_id: str) -> dict[str, Any] | None:
         conn.close()
 
 
+def asr_wait_hint(duration_sec: int | None = None) -> str:
+    duration = int(duration_sec or 0)
+    if duration <= 0:
+        wait = "大约 1–3 分钟"
+        video = ""
+    else:
+        minutes = max(1, int(round(duration / 60)))
+        video = f"视频约 {minutes} 分钟，"
+        if duration < 8 * 60:
+            wait = "大约 1 分钟"
+        elif duration < 25 * 60:
+            wait = "大约 1–3 分钟"
+        elif duration < 40 * 60:
+            wait = "大约 2–4 分钟"
+        else:
+            wait = "大约 3–6 分钟"
+    need = wait.replace("大约 ", "")
+    return f"没有英文字幕，正在语音识别生成句子。{video}大概需要 {need}，请耐心等待。"
+
+
+def job_progress_message(job: dict[str, Any]) -> str:
+    status = str(job.get("status") or "")
+    stage = str(job.get("stage") or "")
+    if status == STATUS_FAILED:
+        return str(job.get("error_message") or STAGE_MESSAGES[STAGE_FAILED])
+    if status == STATUS_READY:
+        return STAGE_MESSAGES[STAGE_READY]
+    folder = None
+    session_id = str(job.get("session_id") or "")
+    if session_id:
+        from . import main as app_main
+
+        candidate = app_main.DATA / session_id
+        if candidate.is_dir():
+            folder = candidate
+    subtitle = read_subtitle_status(folder) if folder is not None else "unknown"
+    duration = read_import_duration(folder) if folder is not None else 0
+    if subtitle == "ok":
+        return "已找到英文字幕，正在按字幕分句，无需语音识别。"
+    if subtitle in {"unavailable", "rate_limited"} or stage == STAGE_TRANSCRIBING:
+        return asr_wait_hint(duration)
+    return STAGE_MESSAGES.get(stage, STAGE_MESSAGES[STAGE_QUEUED])
+
+
 def public_job(job: dict[str, Any]) -> dict[str, Any]:
     status = str(job.get("status") or "")
     stage = str(job.get("stage") or "")
@@ -159,7 +205,7 @@ def public_job(job: dict[str, Any]) -> dict[str, Any]:
         "session_id": job.get("session_id"),
         "status": status,
         "stage": stage,
-        "message": STAGE_MESSAGES.get(stage, STAGE_MESSAGES[STAGE_QUEUED]),
+        "message": job_progress_message(job),
     }
     if status == STATUS_FAILED:
         payload["error_kind"] = job.get("error_kind") or "import_failed"

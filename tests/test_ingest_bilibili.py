@@ -183,6 +183,16 @@ class BilibiliNativePathTests(unittest.TestCase):
         self.assertEqual(picked["height"], 480)
         self.assertIn("avc", picked["codecs"])
 
+    def test_pick_dash_prefers_360_when_available(self):
+        streams = [
+            {"id": 16, "height": 360, "codecs": "avc1.64001E", "bandwidth": 400000, "baseUrl": "https://upos-sz-mirrorcos.bilivideo.com/v360.m4s"},
+            {"id": 32, "height": 480, "codecs": "avc1.64001F", "bandwidth": 800000, "baseUrl": "https://upos-sz-mirrorcos.bilivideo.com/v480.m4s"},
+            {"id": 64, "height": 720, "codecs": "avc1.64001F", "bandwidth": 1600000, "baseUrl": "https://upos-sz-mirrorcos.bilivideo.com/v720.m4s"},
+        ]
+        picked = pick_dash_video(streams)
+        self.assertEqual(picked["height"], 360)
+        self.assertIn("avc", picked["codecs"])
+
     def test_pick_dash_audio_prefers_aac(self):
         streams = [
             {"codecs": "ec-3", "bandwidth": 400000, "baseUrl": "https://upos-sz-mirrorcos.bilivideo.com/e.m4s"},

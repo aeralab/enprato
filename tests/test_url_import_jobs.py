@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 import threading
@@ -371,3 +372,144 @@ class AsyncUrlImportTests(unittest.TestCase):
         self.assertNotIn("Aliyun", job.get("message") or "")
         self.assertNotIn("Whisper", job.get("message") or "")
         self.assertEqual(client.get("/api/auth/me").json()["user"]["trial"]["used"], 0)
+
+    def test_status_message_when_no_english_captions(self):
+        client = self._client("nocap@example.com")
+        hold = threading.Event()
+
+        def hang(_audio):
+            hold.wait(5)
+            return ASR_SENTENCE
+
+        def fake_ingest(_url, folder, **_kwargs):
+            (folder / "import_meta.json").write_text(
+                json.dumps({"subtitle_status": "unavailable", "duration": 1320}),
+                encoding="utf-8",
+            )
+            return _ok_media(folder, None)
+
+        with patch.object(main, "ingest_url", side_effect=fake_ingest), patch.object(
+            main, "transcribe_sentences", side_effect=hang
+        ):
+            res = client.post("/api/prepare-url", json={"url": "https://www.youtube.com/watch?v=nocap"})
+            job_id = res.json()["job_id"]
+            seen = ""
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                seen = client.get("/api/import-status/" + job_id).json()["message"]
+                if "没有英文字幕" in seen:
+                    break
+                time.sleep(0.05)
+            hold.set()
+            wait_job(client, job_id)
+        self.assertIn("没有英文字幕", seen)
+        self.assertIn("请耐心等待", seen)
+        self.assertIn("22 分钟", seen)
+        self.assertIn("1–3 分钟", seen)
+
+    def test_status_message_when_english_captions(self):
+        client = self._client("hascap@example.com")
+        asr_calls: list[str] = []
+
+        def fake_ingest(_url, folder, **_kwargs):
+            (folder / "import_meta.json").write_text(
+                json.dumps({"subtitle_status": "ok", "duration": 600}),
+                encoding="utf-8",
+            )
+            time.sleep(0.2)
+            return _ok_media(folder, CAPTION)
+
+        def track_asr(_audio):
+            asr_calls.append("called")
+            return ASR_SENTENCE
+
+        with patch.object(main, "ingest_url", side_effect=fake_ingest), patch.object(
+            main, "transcribe_sentences", side_effect=track_asr
+        ):
+            res = client.post("/api/prepare-url", json={"url": "https://www.youtube.com/watch?v=hascap"})
+            job_id = res.json()["job_id"]
+            seen = ""
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                seen = client.get("/api/import-status/" + job_id).json()["message"]
+                if "已找到英文字幕" in seen:
+                    break
+                if seen == "准备完成":
+                    break
+                time.sleep(0.05)
+            wait_job(client, job_id)
+        self.assertIn("已找到英文字幕", seen)
+        self.assertEqual(asr_calls, [])
+
+
+class ProgressMessageTests(unittest.TestCase):
+    def test_asr_wait_hint_scales_with_duration(self):
+        unknown = url_import_jobs.asr_wait_hint(None)
+        self.assertIn("没有英文字幕", unknown)
+        self.assertIn("1–3 分钟", unknown)
+        self.assertIn("请耐心等待", unknown)
+        short = url_import_jobs.asr_wait_hint(180)
+        self.assertIn("视频约 3 分钟", short)
+        self.assertIn("1 分钟", short)
+        mid = url_import_jobs.asr_wait_hint(1320)
+        self.assertIn("视频约 22 分钟", mid)
+        self.assertIn("1–3 分钟", mid)
+        long = url_import_jobs.asr_wait_hint(45 * 60)
+        self.assertIn("3–6 分钟", long)
+
+    def test_job_progress_uses_caption_meta(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data = Path(tmp) / "sessions"
+            session_id = "sessok"
+            folder = data / session_id
+            folder.mkdir(parents=True)
+            (folder / "import_meta.json").write_text(
+                json.dumps({"subtitle_status": "ok", "duration": 600}),
+                encoding="utf-8",
+            )
+            with patch.object(main, "DATA", data):
+                msg = url_import_jobs.job_progress_message(
+                    {
+                        "status": "processing",
+                        "stage": "processing_audio",
+                        "session_id": session_id,
+                    }
+                )
+                none = url_import_jobs.job_progress_message(
+                    {
+                        "status": "processing",
+                        "stage": "transcribing",
+                        "session_id": "missing",
+                    }
+                )
+            self.assertIn("已找到英文字幕", msg)
+            self.assertIn("无需语音识别", msg)
+            self.assertIn("没有英文字幕", none)
+
+    def test_job_progress_unavailable_shows_wait(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data = Path(tmp) / "sessions"
+            session_id = "sessno"
+            folder = data / session_id
+            folder.mkdir(parents=True)
+            (folder / "import_meta.json").write_text(
+                json.dumps({"subtitle_status": "unavailable", "duration": 1320}),
+                encoding="utf-8",
+            )
+            with patch.object(main, "DATA", data):
+                msg = url_import_jobs.job_progress_message(
+                    {
+                        "status": "processing",
+                        "stage": "processing_audio",
+                        "session_id": session_id,
+                    }
+                )
+            self.assertIn("没有英文字幕", msg)
+            self.assertIn("22 分钟", msg)
+            self.assertIn("请耐心等待", msg)
+
+    def test_queued_job_keeps_queue_copy(self):
+        msg = url_import_jobs.job_progress_message(
+            {"status": "queued", "stage": "queued", "session_id": ""}
+        )
+        self.assertIn("排队", msg)

@@ -638,7 +638,11 @@ export default function App() {
     if (!file && !url) return;
     const token = loadGateRef.current.bump();
     setPhase("preparing");
-    setImportMessage("正在排队…");
+    setImportMessage(
+      file
+        ? "没有英文字幕，正在语音识别生成句子。大概需要 1–3 分钟，请耐心等待。"
+        : "正在检查是否有英文字幕…",
+    );
     try {
       if (!file) {
         const existing = history.find((item) => sameSourceUrl(item.source_url, url));
@@ -703,7 +707,7 @@ export default function App() {
     setSourceUrl(clean);
     setError("");
     setPhase("preparing");
-    setImportMessage("正在排队…");
+    setImportMessage("正在检查是否有英文字幕…");
     try {
       const prepared = await prepareSessionFromUrl(clean, false, (status) => {
         if (!loadGateRef.current.isCurrent(token)) return;
@@ -945,9 +949,12 @@ function ImportScreen({
         <p>
           {importMessage ||
             (sourceUrl.trim()
-              ? "正在准备视频…"
-              : "第一遍不会显示字幕。有现成英文字幕会快很多；没有则用语音模型整段识别后再按句切开，片源越长越慢。")}
+              ? "正在检查是否有英文字幕…"
+              : "没有英文字幕时会做语音识别。视频较长大约需要 1–3 分钟，请耐心等待。")}
         </p>
+        {/请耐心等待|已找到英文字幕/.test(importMessage) ? null : (
+          <p className="preparing-hint">视频较长时可能需要 1–3 分钟，请耐心等待。</p>
+        )}
         <div className="pulse" />
       </div>
     );

@@ -2513,6 +2513,14 @@ button {
   color: #4b5563;
 }
 
+.preparing .preparing-hint {
+  margin: 8px 0 0;
+  max-width: 22em;
+  font-size: 14px;
+  line-height: 1.5;
+  color: #9ca3af;
+}
+
 .preparing .pulse {
   width: 72px;
   height: 8px;

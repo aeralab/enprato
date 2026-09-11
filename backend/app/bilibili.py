@@ -297,13 +297,15 @@ def pick_dash_video(streams: list[dict]) -> dict | None:
         codecs = str(stream.get("codecs") or "").lower()
         bandwidth = int(stream.get("bandwidth") or 0)
         score = 0
-        if 1 <= height <= 480:
-            score += 200
+        if 1 <= height <= 360:
+            score += 220
+        elif height <= 480:
+            score += 160
         elif height <= 720:
             score += 80
         if "avc" in codecs:
             score += 60
-        score -= abs((height or 480) - 480)
+        score -= abs((height or 360) - 360)
         scored.append((score, -bandwidth, stream))
     if not scored:
         return None
@@ -382,30 +384,33 @@ def remux_dash_audio(src: Path, dest: Path) -> None:
         raise BilibiliIngestError("bilibili_media_download_failed", "audio remux missing")
 
 
+def _merge_dash_args(video: Path, audio: Path, dest: Path, audio_codec: list[str]) -> list[str]:
+    return [
+        "-i",
+        str(video),
+        "-i",
+        str(audio),
+        "-c:v",
+        "copy",
+        *audio_codec,
+        "-shortest",
+        "-movflags",
+        "+faststart",
+        "-f",
+        "mp4",
+        str(dest),
+    ]
+
+
 def merge_dash(video: Path, audio: Path, dest: Path) -> None:
+    dest.parent.mkdir(parents=True, exist_ok=True)
     try:
-        run_ffmpeg(
-            [
-                "-i",
-                str(video),
-                "-i",
-                str(audio),
-                "-c:v",
-                "copy",
-                "-c:a",
-                "aac",
-                "-b:a",
-                "192k",
-                "-shortest",
-                "-movflags",
-                "+faststart",
-                "-f",
-                "mp4",
-                str(dest),
-            ]
-        )
-    except Exception as exc:
-        raise BilibiliIngestError("bilibili_merge_failed", "ffmpeg merge failed") from exc
+        run_ffmpeg(_merge_dash_args(video, audio, dest, ["-c:a", "copy"]))
+    except Exception:
+        try:
+            run_ffmpeg(_merge_dash_args(video, audio, dest, ["-c:a", "aac", "-b:a", "192k"]))
+        except Exception as exc:
+            raise BilibiliIngestError("bilibili_merge_failed", "ffmpeg merge failed") from exc
     if not dest.is_file() or dest.stat().st_size < 200:
         raise BilibiliIngestError("bilibili_merge_failed", "merged file missing")
 

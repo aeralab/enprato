@@ -390,6 +390,18 @@ def read_subtitle_status(folder: Path) -> str:
     return str(payload.get("subtitle_status") or "unknown")
 
 
+def read_import_duration(folder: Path) -> int:
+    path = folder / IMPORT_META_NAME
+    if not path.is_file():
+        return 0
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        value = int(payload.get("duration") or 0)
+    except Exception:
+        return 0
+    return value if value > 0 else 0
+
+
 def _write_import_meta(folder: Path, **fields: object) -> None:
     path = folder / IMPORT_META_NAME
     current: dict[str, object] = {}
