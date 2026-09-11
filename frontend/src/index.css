@@ -1324,7 +1324,7 @@ button {
 }
 
 .stage-home .import-source .price-grid {
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1.32fr) minmax(0, 1fr);
 }
 
 .stage-home .import-source .price-card {
@@ -1400,6 +1400,7 @@ button {
   min-width: 0;
   margin-left: auto;
   margin-right: auto;
+  justify-self: center;
 }
 
 .stage-home .method-head {
@@ -1437,22 +1438,32 @@ button {
 }
 
 .stage-home .method-sources {
+  justify-self: center;
   gap: 16px;
   padding-top: 16px;
 }
 
 .stage-home .method-sources ul {
   gap: 16px 24px;
+  justify-items: center;
+}
+
+.stage-home .method-sources li {
+  width: 100%;
+  text-align: center;
+  justify-items: center;
 }
 
 .stage-home .method-wish {
-  margin: 12px 0 0;
+  justify-self: center;
+  margin: 12px auto 0;
   padding: 0;
   line-height: 1.55;
 }
 
 .stage-home .method-copy {
-  margin: 8px 0 0;
+  justify-self: center;
+  margin: 8px auto 0;
 }
 
 .stage-home .import p {
@@ -2043,7 +2054,7 @@ button {
 
 .price-grid {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1.32fr) minmax(0, 1fr);
   gap: 8px;
   min-width: 0;
   width: 100%;
@@ -2082,6 +2093,8 @@ button {
   border-color: #1f766b;
   background: #ecfdf8;
   box-shadow: inset 0 0 0 1px #1f766b;
+  padding-left: 12px;
+  padding-right: 12px;
 }
 
 .price-card-featured:hover {
