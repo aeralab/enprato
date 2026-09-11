@@ -18,6 +18,7 @@ from .bilibili import BilibiliIngestError, ingest_bilibili
 from .media import ensure_playback_audio, extract_wav, find_ffmpeg, is_ipad_media, make_browser_mp4, media_has_audio, run_ffmpeg, stream_codec
 
 logger = logging.getLogger(__name__)
+_stage_log = logging.getLogger("enprato")
 
 VIDEO_EXTS = {".mp4", ".webm", ".mkv", ".m4v", ".mov", ".avi"}
 AUDIO_EXTS = {".m4a", ".mp3", ".opus", ".ogg", ".wav", ".aac"}
@@ -363,7 +364,7 @@ def log_url_import_stage(host: str, stage: str, elapsed_ms: int | None = None, *
         if value is None:
             continue
         parts.append(f"{key}={value}")
-    logger.info(" ".join(parts))
+    _stage_log.info(" ".join(parts))
 
 
 def read_import_title(folder: Path) -> str | None:

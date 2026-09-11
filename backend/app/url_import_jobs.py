@@ -309,9 +309,6 @@ def _kick_session_video(
     host: str,
     started: float,
 ) -> None:
-    playback = folder / "playback.m4a"
-    if not playback.is_file() or playback.stat().st_size < 200:
-        return
     try:
         from .bilibili_media import kick_bilibili_media
 
@@ -349,6 +346,15 @@ def run_job(job: dict[str, Any]) -> None:
         return (time.monotonic() - claimed_at) > JOB_MAX_WALL_SEC
 
     try:
+        folder.mkdir(parents=True, exist_ok=True)
+        _kick_session_video(
+            url=url,
+            folder=folder,
+            session_id=session_id,
+            job_id=job_id,
+            host=host,
+            started=started,
+        )
         stage(STAGE_METADATA)
         if timed_out():
             fail_job(job, "import_timeout", public_url_import_error("导入时间过长"))

@@ -2023,6 +2023,7 @@ function Studio({
   const [playerSrc, setPlayerSrc] = useState(videoUrl);
   const pendingSeekRef = useRef<{ time: number; play: boolean; sessionId: string } | null>(null);
   const switchingMediaRef = useRef(false);
+  const switchingMediaAtRef = useRef(0);
   const hasVideoRef = useRef(initialHasVideo);
   const remoteAfterRef = useRef(0);
   const userPausedRef = useRef(userPaused);
@@ -2477,8 +2478,12 @@ function Studio({
           setMediaStatus(status);
           return;
         }
-        if (switchingMediaRef.current) return;
+        if (switchingMediaRef.current) {
+          if (Date.now() - switchingMediaAtRef.current < 8000) return;
+          switchingMediaRef.current = false;
+        }
         switchingMediaRef.current = true;
+        switchingMediaAtRef.current = Date.now();
         const node = videoRef.current;
         const wasPaused = node ? node.paused : true;
         const time = node && Number.isFinite(node.currentTime) ? node.currentTime : sentencesRef.current[indexRef.current]?.start ?? 0;
@@ -3368,14 +3373,25 @@ function Studio({
           <div ref={monitorRef} className={`monitor hide-burn-subs${showAudioOnly ? " audio-only" : ""}`}>
             {showAudioOnly ? (
               <div className="audio-only-panel" aria-hidden="true">
-                <strong>{audioOnlyCopy.title}</strong>
-                <p>{audioOnlyCopy.body}</p>
+                <img
+                  className="audio-only-cover"
+                  src={sessionThumbUrl(sessionId)}
+                  alt=""
+                  onError={(e) => {
+                    e.currentTarget.style.display = "none";
+                  }}
+                />
+                <div className="audio-only-copy">
+                  <strong>{audioOnlyCopy.title}</strong>
+                  <p>{audioOnlyCopy.body}</p>
+                </div>
               </div>
             ) : null}
             <div className="monitor-clip">
               <video
                 ref={videoRef}
                 src={playerSrc}
+                poster={sessionThumbUrl(sessionId)}
                 playsInline
                 preload="auto"
                 onError={() => {
@@ -3429,6 +3445,8 @@ function Studio({
                     const nextOrientation = orientationFromSize(node.videoWidth, node.videoHeight);
                     applyBurnWipeLayout(monitorRef.current, node, nextOrientation);
                     if (!isHotSwitch) onOrientation(nextOrientation);
+                  } else {
+                    switchingMediaRef.current = false;
                   }
                   for (const track of Array.from(node.textTracks)) {
                     track.mode = "disabled";

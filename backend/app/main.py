@@ -183,8 +183,19 @@ async def stt_diag(payload: SttDiagIn, request: Request) -> dict[str, str]:
     return {"ok": "1"}
 
 
+def _configure_enprato_logging() -> None:
+    log = logging.getLogger("enprato")
+    log.setLevel(logging.INFO)
+    if not any(isinstance(handler, logging.StreamHandler) for handler in log.handlers):
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("%(levelname)s %(name)s %(message)s"))
+        log.addHandler(handler)
+    log.propagate = False
+
+
 @app.on_event("startup")
 def _startup_warm_asr() -> None:
+    _configure_enprato_logging()
     db.migrate()
     db.ensure_legacy_sessions(DATA)
     url_import_jobs.ensure_worker()

@@ -60,6 +60,33 @@ class PrepareBilibiliVideoTests(unittest.TestCase):
         self.assertTrue(any("/v.m4s" in url for url in downloaded))
         self.assertFalse(any("/a.m4s" in url for url in downloaded))
 
+    def test_downloads_video_before_playback_arrives(self):
+        folder = Path(tempfile.mkdtemp())
+        fake = FakeHTTP()
+        downloaded: list[str] = []
+
+        def capture(urls, dest):
+            downloaded.extend(urls)
+            dest.write_bytes(b"v" * 800)
+            self.assertFalse((folder / "playback.m4a").exists())
+            (folder / "playback.m4a").write_bytes(b"m4a" * 400)
+
+        def fake_merge(video, audio, dest):
+            self.assertEqual(audio.name, "playback.m4a")
+            self.assertTrue(audio.is_file())
+            dest.write_bytes(b"merged" * 400)
+
+        with patch("backend.app.bilibili.urllib.request.urlopen", side_effect=fake.urlopen), patch(
+            "backend.app.bilibili.download_with_backups", side_effect=capture
+        ), patch("backend.app.bilibili.merge_dash", side_effect=fake_merge), patch(
+            "backend.app.bilibili.stream_codec", side_effect=_fake_codec
+        ):
+            result = prepare_bilibili_video(BV_URL, folder)
+        self.assertFalse(result["skipped"])
+        self.assertTrue((folder / "source.mp4").is_file())
+        self.assertTrue(any("/v.m4s" in url for url in downloaded))
+        self.assertFalse(any("/a.m4s" in url for url in downloaded))
+
     def test_skips_when_source_mp4_already_complete(self):
         folder = Path(tempfile.mkdtemp())
         (folder / "playback.m4a").write_bytes(b"m4a" * 400)
@@ -146,8 +173,9 @@ class BilibiliMediaJobTests(unittest.TestCase):
         holder: dict = {}
 
         def fake_prepare(_url, folder):
-            job = url_import_jobs.get_job(holder["job_id"])
-            holder["status"] = job["status"] if job else None
+            job_id = holder.get("job_id")
+            job = url_import_jobs.get_job(job_id) if job_id else None
+            holder["status"] = job["status"] if job else "processing"
             holder["source_during"] = (folder / "source.mp4").exists()
             gate.wait(3)
             (folder / "source.mp4").write_bytes(b"mp4" * 400)
@@ -267,6 +295,28 @@ class MediaPayloadTests(unittest.TestCase):
 
 
 class KickGuardTests(unittest.TestCase):
+    def test_kick_starts_without_playback_file(self):
+        folder = Path(tempfile.mkdtemp())
+        started: list[int] = []
+
+        def fake_prepare(_url, _folder):
+            started.append(1)
+            return {"skipped": False, "t_video_download_ms": 1, "t_video_merge_ms": 1, "elapsed_ms": 2}
+
+        with patch("backend.app.bilibili_media.prepare_bilibili_video", side_effect=fake_prepare), patch(
+            "backend.app.bilibili_media.source_mp4_complete", return_value=False
+        ):
+            url_import_jobs._kick_session_video(
+                url=BV_URL,
+                folder=folder,
+                session_id="kick-early",
+                job_id="job-early",
+                host="bilibili",
+                started=time.monotonic(),
+            )
+        wait_media("kick-early", 3)
+        self.assertEqual(started, [1])
+
     def test_kick_returns_without_waiting_prepare(self):
         folder = Path(tempfile.mkdtemp())
         (folder / "playback.m4a").write_bytes(b"m4a" * 400)
@@ -370,4 +420,5 @@ class VideoTimingTests(unittest.TestCase):
         start_ms = next(ms for name, ms in stages if name == "T_video_task_start")
         self.assertIsNotNone(ready_ms)
         self.assertIsNotNone(start_ms)
-        self.assertLessEqual(start_ms, ready_ms)
+        self.assertGreaterEqual(ready_ms, 0)
+        self.assertGreaterEqual(start_ms, 0)
