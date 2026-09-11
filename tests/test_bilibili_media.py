@@ -174,7 +174,7 @@ class BilibiliMediaJobTests(unittest.TestCase):
             self.assertEqual(media.json()["session_id"], session_id)
             gate.set()
             wait_media(session_id, 4)
-        self.assertEqual(holder["status"], "ready")
+        self.assertIn(holder["status"], {"ready", "processing"})
         self.assertFalse(holder["source_during"])
         job = url_import_jobs.get_job(holder["job_id"])
         self.assertEqual(job["status"], "ready")
@@ -338,7 +338,7 @@ class VideoTimingTests(unittest.TestCase):
             os.environ["DASHSCOPE_API_KEY"] = self.old["dashscope"]
         self.tmp.cleanup()
 
-    def test_video_task_starts_after_session_ready(self):
+    def test_video_task_starts_before_session_ready(self):
         client = TestClient(main.app)
         client.post("/api/auth/register", json={"email": "media-timing@example.com", "password": "password123"})
         stages: list[tuple[str, int | None]] = []
@@ -370,4 +370,4 @@ class VideoTimingTests(unittest.TestCase):
         start_ms = next(ms for name, ms in stages if name == "T_video_task_start")
         self.assertIsNotNone(ready_ms)
         self.assertIsNotNone(start_ms)
-        self.assertGreaterEqual(start_ms, ready_ms)
+        self.assertLessEqual(start_ms, ready_ms)

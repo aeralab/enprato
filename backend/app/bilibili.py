@@ -5,6 +5,7 @@ import json
 import re
 import socket
 import ssl
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -320,7 +321,7 @@ def pick_dash_audio(streams: list[dict]) -> dict | None:
         score = 0
         if "mp4a" in codecs or "aac" in codecs:
             score += 50
-        target = 120000
+        target = 64000
         score -= abs((bandwidth or target) - target) // 1000
         scored.append((score, -bandwidth, stream))
     if not scored:
@@ -489,9 +490,17 @@ def ingest_bilibili(url: str, folder: Path, *, include_video: bool = False) -> t
     view = fetch_view(url)
     play = fetch_playurl(view["bvid"], view["cid"])
     view["t_metadata_ms"] = int((time.monotonic() - t0) * 1000)
+    captions_box: dict[str, str | None] = {"text": None}
     t1 = time.monotonic()
-    captions = fetch_english_captions(view)
-    view["t_subtitle_ms"] = int((time.monotonic() - t1) * 1000)
+
+    def _load_captions() -> None:
+        try:
+            captions_box["text"] = fetch_english_captions(view)
+        except Exception:
+            captions_box["text"] = None
+
+    cap_thread = threading.Thread(target=_load_captions, name="bili-captions", daemon=True)
+    cap_thread.start()
     folder.mkdir(parents=True, exist_ok=True)
     playback = folder / "playback.m4a"
     dash = play.get("dash") if isinstance(play.get("dash"), dict) else None
@@ -540,6 +549,9 @@ def ingest_bilibili(url: str, folder: Path, *, include_video: bool = False) -> t
         remux_dash_audio(dest, playback)
         view["t_audio_prepare_ms"] = int((time.monotonic() - t3) * 1000)
         dest = playback
+    cap_thread.join(timeout=API_TIMEOUT_SEC)
+    captions = captions_box["text"]
+    view["t_subtitle_ms"] = int((time.monotonic() - t1) * 1000)
     view["elapsed_ms"] = int((time.monotonic() - started) * 1000)
     view["captions"] = bool(captions)
     view["audio_only"] = not include_video

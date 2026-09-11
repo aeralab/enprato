@@ -300,6 +300,37 @@ def _cues_from_text(raw: str) -> list[dict[str, Any]]:
     return parse_srt(raw)
 
 
+def _kick_session_video(
+    *,
+    url: str,
+    folder: Any,
+    session_id: str,
+    job_id: str,
+    host: str,
+    started: float,
+) -> None:
+    playback = folder / "playback.m4a"
+    if not playback.is_file() or playback.stat().st_size < 200:
+        return
+    try:
+        from .bilibili_media import kick_bilibili_media
+
+        kick_bilibili_media(
+            url=url,
+            folder=folder,
+            session_id=session_id,
+            job_id=job_id,
+            host=host,
+            started=started,
+        )
+    except Exception:
+        logger.exception(
+            "url_import_job media_kick_failed job_id=%s session_id=%s",
+            job_id,
+            session_id,
+        )
+
+
 def run_job(job: dict[str, Any]) -> None:
     from . import main as app_main
 
@@ -337,6 +368,14 @@ def run_job(job: dict[str, Any]) -> None:
                 raise
             media, audio, caption_text = app_main.ingest_url(url, folder)
         stage(STAGE_AUDIO)
+        _kick_session_video(
+            url=url,
+            folder=folder,
+            session_id=session_id,
+            job_id=job_id,
+            host=host,
+            started=started,
+        )
         sentences: list[dict[str, Any]] = []
         t_split0 = time.monotonic()
         if caption_text:
@@ -410,23 +449,14 @@ def run_job(job: dict[str, Any]) -> None:
             session_id,
             ready_ms,
         )
-        try:
-            from .bilibili_media import kick_bilibili_media
-
-            kick_bilibili_media(
-                url=url,
-                folder=folder,
-                session_id=session_id,
-                job_id=job_id,
-                host=host,
-                started=started,
-            )
-        except Exception:
-            logger.exception(
-                "url_import_job media_kick_failed job_id=%s session_id=%s",
-                job_id,
-                session_id,
-            )
+        _kick_session_video(
+            url=url,
+            folder=folder,
+            session_id=session_id,
+            job_id=job_id,
+            host=host,
+            started=started,
+        )
     except Exception as exc:
         detail = str(getattr(exc, "detail", "") or exc)
         kind = classify_ingest_error(detail)

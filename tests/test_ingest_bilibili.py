@@ -191,6 +191,14 @@ class BilibiliNativePathTests(unittest.TestCase):
         picked = pick_dash_audio(streams)
         self.assertIn("mp4a", picked["codecs"])
 
+    def test_pick_dash_audio_prefers_64k_over_132k(self):
+        streams = [
+            {"codecs": "mp4a.40.2", "bandwidth": 132000, "baseUrl": "https://upos-sz-mirrorcos.bilivideo.com/hi.m4s"},
+            {"codecs": "mp4a.40.2", "bandwidth": 64000, "baseUrl": "https://upos-sz-mirrorcos.bilivideo.com/lo.m4s"},
+        ]
+        picked = pick_dash_audio(streams)
+        self.assertEqual(picked["bandwidth"], 64000)
+
     def test_ssrf_blocks_private_media_hosts(self):
         self.assertFalse(is_allowed_bilibili_media_url("http://127.0.0.1/secret"))
         self.assertFalse(is_allowed_bilibili_media_url("http://192.168.1.4/v.m4s"))
