@@ -70,6 +70,7 @@ from .speaker import play_speaker, stop_speaker
 from . import stt_jobs, stt_log
 from . import url_import_jobs
 from . import wechat_oauth
+from . import ops
 from .store import (
     find_session_id_by_url,
     list_sessions,
@@ -494,6 +495,22 @@ def auth_me(user=Depends(current_user)):
     if auth_required():
         raise HTTPException(401, "请先登录")
     return {"user": None, "require_auth": False}
+
+
+@app.get("/api/ops")
+def ops_page(request: Request):
+    ops.enforce_ops(request)
+    ops.require_ops(request)
+    if request.query_params.get("k"):
+        return ops.ops_login_redirect(request)
+    return ops.ops_page_response()
+
+
+@app.get("/api/ops/stats")
+def ops_stats(request: Request):
+    ops.enforce_ops(request)
+    ops.require_ops(request)
+    return ops.ops_json_response(db.ops_overview())
 
 
 @app.get("/api/auth/methods")

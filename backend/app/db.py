@@ -76,6 +76,15 @@ def ensure_learning_session_study_columns(conn: sqlite3.Connection) -> None:
     )
 
 
+def ensure_user_last_seen_column(conn: sqlite3.Connection) -> None:
+    _add_column_if_missing(
+        conn,
+        "users",
+        "last_seen_at",
+        "ALTER TABLE users ADD COLUMN last_seen_at TEXT",
+    )
+
+
 def migrate(path: Path | None = None) -> None:
     conn = connect(path)
     try:
@@ -91,6 +100,7 @@ def migrate(path: Path | None = None) -> None:
                     raise
             conn.execute("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)", (file.name, iso()))
         ensure_learning_session_study_columns(conn)
+        ensure_user_last_seen_column(conn)
     finally:
         conn.close()
     refund_historical_prepare_trials(path)
@@ -625,11 +635,51 @@ def hash_token(raw: str) -> str:
 def user_for_token(raw: str) -> sqlite3.Row | None:
     conn = connect()
     try:
-        return conn.execute(
+        row = conn.execute(
             "SELECT u.* FROM auth_sessions s JOIN users u ON u.id=s.user_id "
             "WHERE s.token_hash=? AND s.expires_at>? AND u.status='active'",
             (hash_token(raw), iso()),
         ).fetchone()
+        if row:
+            touch_last_seen(conn, str(row["id"]))
+        return row
+    finally:
+        conn.close()
+
+
+def touch_last_seen(conn: sqlite3.Connection, user_id: str) -> None:
+    now = iso()
+    cutoff = iso(utc_now() - timedelta(seconds=60))
+    conn.execute(
+        "UPDATE users SET last_seen_at=? WHERE id=? AND (last_seen_at IS NULL OR last_seen_at='' OR last_seen_at<?)",
+        (now, user_id, cutoff),
+    )
+
+
+def ops_overview(online_minutes: int = 5) -> dict[str, Any]:
+    now = iso()
+    online_since = iso(utc_now() - timedelta(minutes=max(1, online_minutes)))
+    conn = connect()
+    try:
+        def count(sql: str, args=()):
+            return int(conn.execute(sql, args).fetchone()[0])
+
+        paid_fen = count("SELECT COALESCE(SUM(amount_fen),0) FROM orders WHERE status='paid'")
+        return {
+            "registered_users": count("SELECT COUNT(*) FROM users"),
+            "paid_users": count("SELECT COUNT(DISTINCT user_id) FROM orders WHERE status='paid'"),
+            "paid_amount_yuan": round(paid_fen / 100, 2),
+            "online_users": count(
+                "SELECT COUNT(*) FROM users WHERE last_seen_at IS NOT NULL AND last_seen_at!='' AND last_seen_at>=?",
+                (online_since,),
+            ),
+            "active_members": count(
+                "SELECT COUNT(DISTINCT user_id) FROM memberships WHERE status='active' AND expires_at>?",
+                (now,),
+            ),
+            "as_of": now,
+            "online_window_minutes": max(1, online_minutes),
+        }
     finally:
         conn.close()
 

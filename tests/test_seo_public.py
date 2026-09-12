@@ -27,6 +27,7 @@ class PublicSeoFilesTests(unittest.TestCase):
         self.assertIn("User-agent: *", text)
         self.assertIn("Allow: /", text)
         self.assertIn("Disallow: /api/", text)
+        self.assertIn("Disallow: /ops", text)
         self.assertIn("Sitemap: https://enprato.site/sitemap.xml", text)
         self.assertNotIn("www.enprato.site", text)
 
