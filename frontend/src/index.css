@@ -1049,7 +1049,7 @@ button {
   flex: 1 0 100%;
 }
 
-@media (hover: none) and (pointer: coarse) {
+@media (hover: none) and (pointer: coarse) and (max-width: 720px) {
   .draft-stack {
     padding-bottom: 92px;
   }
@@ -2116,10 +2116,6 @@ button {
 }
 
 .price-card-featured strong {
-  color: #14564e;
-}
-
-.price-card-featured span:last-child {
   color: #14564e;
 }
 

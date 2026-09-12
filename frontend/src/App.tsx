@@ -1796,7 +1796,6 @@ function PayPanel({
         <button type="button" className="price-card price-card-featured" disabled={payBusy} onClick={() => void startPay("quarterly_90d")}>
           <strong>59元/三个月</strong>
           <span>挑战3个月掌握一门外语。</span>
-          <span>付款后扫码进学习群。</span>
         </button>
         <button type="button" className="price-card" disabled={payBusy} onClick={() => void startPay("yearly_365d")}>
           <strong>199元/年</strong>

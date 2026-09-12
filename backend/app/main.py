@@ -352,6 +352,11 @@ class RedeemBody(BaseModel):
 
 
 ALLOWED_PAY_PLANS = {"monthly_30d", "quarterly_90d", "yearly_365d"}
+PAY_DESCRIPTIONS = {
+    "monthly_30d": "Enprato 月度会员",
+    "quarterly_90d": "Enprato 季度会员",
+    "yearly_365d": "Enprato 年度会员",
+}
 
 
 def public_user(user):
@@ -628,7 +633,11 @@ def api_create_order(request: Request, body: OrderBody, user: dict[str, Any] = D
         if mock_provider_enabled():
             logger.warning("payment mock order created order=%s provider=mock", order["order_no"])
             return {**order, "payment": {"provider": "mock", "code_url": "mock://" + order["order_no"]}}
-        payment = provider_for(body.provider).create_native_payment(order_no=order["order_no"], description=str(order.get("plan_name") or "Enprato 会员"), amount_fen=order["amount_fen"])
+        payment = provider_for(body.provider).create_native_payment(
+            order_no=order["order_no"],
+            description=PAY_DESCRIPTIONS.get(body.plan) or str(order.get("plan_name") or "Enprato 会员"),
+            amount_fen=order["amount_fen"],
+        )
         logger.info("payment order created order=%s provider=%s", order["order_no"], body.provider)
         return {**order, "payment": payment}
     except (ValueError, PaymentConfigError) as exc:
