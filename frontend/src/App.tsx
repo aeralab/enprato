@@ -1517,6 +1517,7 @@ function PayPanel({
   const [payOrder, setPayOrder] = useState<Order | null>(null);
   const [qrSrc, setQrSrc] = useState("");
   const [groupInviteOpen, setGroupInviteOpen] = useState(false);
+  const [guestPrompt, setGuestPrompt] = useState<"pay" | "trial" | null>(null);
   const memberActive = user?.membership.status === "active";
   const quarterlyMember = memberActive && user?.membership.plan === "quarterly_90d";
   const trialUsed = user ? user.trial.used : license?.trial_uses ?? 0;
@@ -1586,9 +1587,11 @@ function PayPanel({
 
   function describeTrial() {
     if (!user) {
-      requestLogin();
+      setMessage("");
+      setGuestPrompt("trial");
       return;
     }
+    setGuestPrompt(null);
     if (memberActive) {
       setMessage(`会员有效期至 ${formatLicenseDate(user.membership.expires_at)}`);
       return;
@@ -1603,9 +1606,10 @@ function PayPanel({
   async function startPay(plan: "monthly_30d" | "quarterly_90d" | "yearly_365d") {
     setMessage("");
     if (!user) {
-      requestLogin();
+      setGuestPrompt("pay");
       return;
     }
+    setGuestPrompt(null);
     setBusy(true);
     try {
       setPayOrder(await createOrder(plan));
@@ -1696,9 +1700,13 @@ function PayPanel({
         </button>
       </div>
       {loadError ? <p className="err">{loadError}</p> : null}
-      {!user ? (
+      {!user && guestPrompt === "pay" ? (
         <button type="button" className="pay-login-cta" onClick={requestLogin}>
           请先登录后再开通会员
+        </button>
+      ) : !user && guestPrompt === "trial" ? (
+        <button type="button" className="pay-login-cta" onClick={requestLogin}>
+          请登录
         </button>
       ) : message ? (
         <p className={/成功|开通|还可免费|有效期/.test(message) ? "pay-ok" : "err"}>{message}</p>

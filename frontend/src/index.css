@@ -1538,26 +1538,10 @@ button {
   white-space: nowrap;
 }
 
-.method-head-copy {
-  display: block;
-  text-align: center;
-  width: 100%;
-  max-width: 100%;
-  min-width: 0;
-  justify-self: center;
-  margin: 0;
-  color: #6b7280;
-  font-size: 14px;
-  font-weight: 400;
-  line-height: 1.55;
-  white-space: normal;
-  overflow-wrap: anywhere;
-}
-
 .method-head h2 {
   margin: 0;
   font-size: 20px;
-  font-weight: 650;
+  font-weight: 800;
   letter-spacing: 0.02em;
   color: #1a1d24;
 }
@@ -1569,6 +1553,25 @@ button {
   color: #6b7280;
   font-size: 14px;
   line-height: 1.55;
+}
+
+.method-head-copy {
+  display: block;
+  text-align: center;
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  justify-self: center;
+  margin: 0;
+  color: #1a1d24;
+  font-size: 14px;
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+
+.method-head p.method-head-copy {
+  color: #1a1d24;
+  font-weight: 700;
 }
 
 .method-steps {
@@ -1592,8 +1595,9 @@ button {
 .method-num {
   font-family: "IBM Plex Mono", monospace;
   font-size: 12px;
+  font-weight: 700;
   letter-spacing: 0.08em;
-  color: #c5cad3;
+  color: #6b7280;
   padding-top: 3px;
 }
 
@@ -1601,14 +1605,20 @@ button {
   display: block;
   margin-bottom: 4px;
   font-size: 15px;
-  font-weight: 650;
+  font-weight: 800;
   color: #1a1d24;
 }
 
 .method-steps p {
   font-size: 13px;
+  font-weight: 700;
   line-height: 1.55;
-  color: #6b7280;
+  color: #1a1d24;
+}
+
+.method-block .method-steps p {
+  color: #1a1d24;
+  font-weight: 700;
 }
 
 .method-summary {

@@ -24,6 +24,15 @@ class HomeBootDoesNotAutoOpenStudioTests(unittest.TestCase):
         self.assertIn("极短的时间、极低的成本、极高效的方法", APP)
         self.assertNotIn("if (requireAuth && !user) {\n    return (\n      <AuthScreen", APP)
 
+    def test_guest_pay_cta_waits_for_plan_click(self):
+        self.assertIn('useState<"pay" | "trial" | null>(null)', APP)
+        self.assertIn('setGuestPrompt("pay")', APP)
+        self.assertIn('setGuestPrompt("trial")', APP)
+        self.assertIn('guestPrompt === "pay"', APP)
+        self.assertIn('guestPrompt === "trial"', APP)
+        self.assertIn("请先登录后再开通会员", APP)
+        self.assertIn("请登录", APP)
+
     def test_boot_still_loads_history_only(self):
         self.assertIn("const rows = await listSessions();", APP)
         self.assertIn("setHistory(rows);", APP)
