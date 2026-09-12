@@ -43,6 +43,7 @@ import { resumeTimeInSentence, splitWords } from "./diffWords";
 import { applyBurnWipeLayout } from "./videoBurnLayout";
 import { audioOnlyPanel, inferInitialMediaStatus, shouldAcceptMediaPoll, type SessionMediaStatus } from "./mediaStatus";
 import { canEnterDictation, DICTATION_LOCKED_MESSAGE } from "./studioAccess";
+import { micBusyAfterServerAsr, shouldLockMicForServerAsr } from "./micBusy";
 import {
   createLoadGate,
   captureLearningSnapshot,
@@ -183,20 +184,24 @@ function loadDraftsForSession(detail: SessionDetail, userId: string): Record<num
   return merged;
 }
 
-function dedupeParagraphs(parts: string[]): string[] {
-  const out: string[] = [];
-  const seen = new Set<string>();
-  for (const raw of parts) {
-    const p = (raw || "").trim();
-    if (!p) {
-      out.push("");
-      continue;
-    }
-    if (seen.has(p)) continue;
-    seen.add(p);
-    out.push(p);
+function autosizeDraftLine(el: HTMLTextAreaElement | null) {
+  if (!el) return;
+  el.style.height = "auto";
+  el.style.height = `${Math.max(el.scrollHeight, 28)}px`;
+}
+
+function visibleDraftIndexes(drafts: Record<number, string>, index: number, sentenceCount: number): number[] {
+  const seen = new Set<number>();
+  const add = (i: number) => {
+    if (!Number.isFinite(i) || i < 0) return;
+    if (sentenceCount > 0 && i >= sentenceCount) return;
+    seen.add(Math.floor(i));
+  };
+  add(index);
+  for (const k of Object.keys(drafts)) {
+    if (String(drafts[Number(k)] ?? "").trim()) add(Number(k));
   }
-  return out;
+  return Array.from(seen).sort((a, b) => a - b);
 }
 
 function normDictationWords(text: string): string[] {
@@ -301,80 +306,6 @@ function preferCleanerDraft(cur: string, incoming: string): string {
   if (nBloated && !cBloated) return cc;
   if (cBloated && nBloated) return nn.length >= cc.length ? nn : cc;
   return nn.length >= cc.length ? nn : cc;
-}
-
-type DraftTextRow = {
-  sentenceIndex: number;
-  start: number;
-  end: number;
-  text: string;
-};
-
-function draftTextRows(drafts: Record<number, string>, index: number): { text: string; rows: DraftTextRow[] } {
-  let end = index;
-  for (const k of Object.keys(drafts)) {
-    const i = Number(k);
-    if (Number.isFinite(i)) end = Math.max(end, i);
-  }
-  const lines = Array.from({ length: end + 1 }, (_, i) => dedupeRepeatedClauses(String(drafts[i] ?? "")));
-  let lastNonEmpty = -1;
-  for (let i = lines.length - 1; i >= 0; i--) {
-    if (lines[i].trim()) {
-      lastNonEmpty = i;
-      break;
-    }
-  }
-  if (lastNonEmpty < 0) return { text: "", rows: [] };
-
-  const kept = lines.slice(0, lastNonEmpty + 1);
-  const rows: DraftTextRow[] = [];
-  let pos = 0;
-  for (let i = 0; i < kept.length; i += 1) {
-    const text = kept[i] || "";
-    rows.push({ sentenceIndex: i, start: pos, end: pos + text.length, text });
-    pos += text.length;
-    if (i < kept.length - 1) pos += 2;
-  }
-  return { text: kept.join("\n\n"), rows };
-}
-
-function draftsToText(drafts: Record<number, string>, index: number): string {
-  return draftTextRows(drafts, index).text;
-}
-
-type DraftBeforeInput = {
-  value: string;
-  selectionStart: number;
-  selectionEnd: number;
-  inputType: string;
-  rows: DraftTextRow[];
-};
-
-function isDraftDeleteInput(inputType: string): boolean {
-  return inputType.startsWith("delete");
-}
-
-function selectedDraftIndexes(before: DraftBeforeInput): number[] {
-  const start = Math.min(before.selectionStart, before.selectionEnd);
-  const end = Math.max(before.selectionStart, before.selectionEnd);
-  if (end <= start) return [];
-
-  const touched: { index: number; overlap: number; length: number; fullySelected: boolean }[] = [];
-  for (const row of before.rows) {
-    const overlap = Math.min(end, row.end) - Math.max(start, row.start);
-    if (row.text.trim() && overlap > 0) {
-      touched.push({
-        index: row.sentenceIndex,
-        overlap,
-        length: Math.max(1, row.end - row.start),
-        fullySelected: start <= row.start && end >= row.end,
-      });
-    }
-  }
-  if (touched.length > 1) return touched.map((item) => item.index);
-  return touched
-    .filter((item) => item.fullySelected || item.overlap / item.length >= 0.65)
-    .map((item) => item.index);
 }
 
 function mediaSrc(path: string): string {
@@ -2175,6 +2106,8 @@ function Studio({
   const segmentEndRef = useRef<number | null>(null);
   const playTokenRef = useRef(0);
   const draftTextareaRef = useRef<HTMLTextAreaElement>(null);
+  const draftListRef = useRef<HTMLDivElement>(null);
+  const draftCurrentRowRef = useRef<HTMLDivElement>(null);
   const prevPhaseRef = useRef(phase);
   const repeatClickRef = useRef({ at: 0, baseIndex: initialIndex, count: 0 });
   const speechRecRef = useRef<BrowserSpeechRecognition | null>(null);
@@ -2236,7 +2169,6 @@ function Studio({
   const draftManualEditAtRef = useRef<Record<number, number>>({});
   const draftServerSnapRef = useRef("");
   const draftBaselineRef = useRef("");
-  const draftBeforeInputRef = useRef<DraftBeforeInput | null>(null);
   const [draftCanRestore, setDraftCanRestore] = useState(false);
   const stripRef = useRef<HTMLDivElement>(null);
   const stripBrowseUntilRef = useRef(0);
@@ -2350,68 +2282,77 @@ function Studio({
     }
   }
 
-  function clearSelectedDraftSentences(before: DraftBeforeInput, nextText: string): boolean {
-    if (!isDraftDeleteInput(before.inputType)) return false;
-    if (nextText.length >= before.value.length) return false;
-    const cleared = selectedDraftIndexes(before).filter((i) => i >= 0 && i < sentences.length);
-    if (!cleared.length) return false;
-
-    const editedAt = Date.now();
-    const next = { ...draftsRef.current };
-    for (const i of cleared) {
-      next[i] = "";
-      draftManualEditAtRef.current[i] = editedAt;
-    }
-    const first = cleared[0];
-    draftsRef.current = next;
-    setDrafts(next);
-    draftLocalEditUntilRef.current = editedAt + 8000;
-    indexRef.current = first;
-    setIndex(first);
+  function goToSentence(i: number) {
+    if (i < 0 || i >= sentences.length) return;
+    stripBrowseUntilRef.current = 0;
+    repeatClickRef.current = { at: 0, baseIndex: i, count: 0 };
+    indexRef.current = i;
+    setIndex(i);
+    pauseAtRef.current = sentences[i].start;
     setPhase("listen");
     setCaptionMode("off");
+    playAt(sentences[i].start);
+    persistDraftsCache(draftsRef.current, i);
+    void saveProgress(
+      sessionId,
+      sessionProgressPayload(
+        {
+          phase: "listen",
+          index: i,
+          drafts: fullDraftSnapshot(draftsRef.current, sentencesRef.current.length),
+          highlights,
+          score,
+          orientation,
+        },
+        { includeIndex: true },
+      ),
+    );
+  }
+
+  function updateSentenceDraft(i: number, value: string) {
+    const editedAt = Date.now();
+    draftLocalEditUntilRef.current = editedAt + 8000;
+    draftManualEditAtRef.current[i] = editedAt;
+    const next = { ...draftsRef.current, [i]: value };
+    draftsRef.current = next;
+    setDrafts(next);
+    markStudyActivity();
     setDraftCanRestore(JSON.stringify(next) !== draftBaselineRef.current);
-    persistDraftsCache(next, first);
+  }
+
+  function persistOpenDrafts() {
+    if (!sessionId) return;
     void saveProgress(
       sessionId,
       sessionProgressPayload({
-        phase: "listen",
-        index: first,
-        drafts: currentDraftSnapshot(next),
+        phase: phaseRef.current,
+        index: indexRef.current,
+        drafts: fullDraftSnapshot(draftsRef.current, sentencesRef.current.length),
         highlights,
         score,
         orientation,
       }),
     );
-    const target = sentences[first];
-    if (target && !recording) {
-      pauseAtRef.current = target.start;
-      playAt(target.start);
-    }
-    return true;
+    persistDraftsCache(draftsRef.current, indexRef.current);
   }
 
   function revealDraftEnd() {
     const el = draftTextareaRef.current;
-    if (!el) return;
-    const pos = draftContentEnd(el.value || "");
     const apply = () => {
-      try {
-        el.setSelectionRange(pos, pos);
-      } catch {
-        /* ignore */
+      if (el) {
+        const pos = draftContentEnd(el.value || "");
+        try {
+          el.setSelectionRange(pos, pos);
+        } catch {
+          /* ignore */
+        }
+        autosizeDraftLine(el);
       }
-      const style = window.getComputedStyle(el);
-      let lh = parseFloat(style.lineHeight);
-      if (!Number.isFinite(lh) || lh < 8) lh = (parseFloat(style.fontSize) || 16) * 1.7;
-      const before = (el.value || "").slice(0, pos);
-      const line = Math.max(1, before.split("\n").length);
-      const maxScroll = Math.max(0, el.scrollHeight - el.clientHeight);
-      el.scrollTop = Math.min(maxScroll, Math.max(0, line * lh - el.clientHeight * 0.4));
+      draftCurrentRowRef.current?.scrollIntoView({ block: "nearest" });
     };
     apply();
     requestAnimationFrame(apply);
-    setTimeout(apply, 120);
+    window.setTimeout(apply, 120);
   }
 
   useEffect(() => {
@@ -2421,6 +2362,12 @@ function Studio({
       window.setTimeout(() => revealDraftEnd(), 80);
     }
   }, [phase, index]);
+
+  useEffect(() => {
+    const list = draftListRef.current;
+    if (!list) return;
+    list.querySelectorAll<HTMLTextAreaElement>("textarea.draft-line").forEach(autosizeDraftLine);
+  }, [drafts, index]);
 
   function cycleCaption() {
     setCaptionMode((mode) => (mode === "off" ? "en" : mode === "en" ? "bi" : "off"));
@@ -2449,13 +2396,15 @@ function Studio({
     speechRecRef.current = null;
     if (!rec) return;
     try {
-      rec.onresult = null;
-      rec.onerror = null;
-      rec.onend = null;
       rec.stop();
     } catch {
       /* ignore */
     }
+    window.setTimeout(() => {
+      rec.onresult = null;
+      rec.onerror = null;
+      rec.onend = null;
+    }, 500);
   }
 
   function scheduleRevealWhileMic() {
@@ -3375,6 +3324,7 @@ function Studio({
       return;
     }
     setError("");
+    setBusy(false);
     const i = indexRef.current;
     const target = sentences[i]?.text || "";
     micBaseDraftRef.current = String(draftsRef.current[i] ?? "");
@@ -3403,6 +3353,9 @@ function Studio({
           micRevealTimerRef.current = 0;
         }
         setRecording(false);
+        await new Promise<void>((resolve) => {
+          window.setTimeout(resolve, 250);
+        });
         const blob = new Blob(chunksRef.current, { type: recorder.mimeType || "audio/webm" });
         const base = micBaseDraftRef.current;
         const liveCur = String(draftsRef.current[i] ?? "").trim();
@@ -3415,6 +3368,7 @@ function Studio({
               return next;
             });
           }
+          setBusy(micBusyAfterServerAsr());
           setError("没有录到声音。请允许麦克风后靠近再说；说完再点停止语音输入。");
           return;
         }
@@ -3427,10 +3381,10 @@ function Studio({
           });
           setPhase("dictate");
           setError("");
+          setBusy(micBusyAfterServerAsr());
           window.setTimeout(() => revealDraftEnd(), 80);
-        } else {
-          setBusy(true);
         }
+        if (shouldLockMicForServerAsr(hasLiveDraft)) setBusy(true);
 
         // Browser speech recognition gives us an immediate draft. Whisper refines it in the background.
         void (async () => {
@@ -3463,7 +3417,7 @@ function Studio({
           } catch (err) {
             if (!hasLiveDraft) setError(err instanceof Error ? err.message : "识别失败");
           } finally {
-            if (!hasLiveDraft) setBusy(false);
+            setBusy(micBusyAfterServerAsr());
           }
         })();
       };
@@ -3754,31 +3708,7 @@ function Studio({
                 type="button"
                 className={`beat ${i === index ? "now" : ""} ${(drafts[i] ?? drafts[item.id]) ? "done" : ""}`}
                 title={`${i + 1}. ${item.text}`}
-                onClick={() => {
-                  stripBrowseUntilRef.current = 0;
-                  repeatClickRef.current = { at: 0, baseIndex: i, count: 0 };
-                  indexRef.current = i;
-                  setIndex(i);
-                  pauseAtRef.current = sentences[i].start;
-                  setPhase("listen");
-                  setCaptionMode("off");
-                  playAt(sentences[i].start);
-                  persistDraftsCache( draftsRef.current, i);
-                  void saveProgress(
-                    sessionId,
-                    sessionProgressPayload(
-                      {
-                        phase: "listen",
-                        index: i,
-                        drafts: fullDraftSnapshot(draftsRef.current, sentencesRef.current.length),
-                        highlights,
-                        score,
-                        orientation,
-                      },
-                      { includeIndex: true },
-                    ),
-                  );
-                }}
+                onClick={() => goToSentence(i)}
               >
                 {i + 1}
               </button>
@@ -3845,66 +3775,51 @@ function Studio({
                 ) : null}
               </div>
               <div className="draft-stack">
-                <textarea
-                  ref={draftTextareaRef}
-                  className={`draft${recording ? " draft-listening" : ""}`}
-                  value={draftsToText(drafts, index)}
-                  placeholder="听写内容会出现在这里"
-                  onFocus={(e) => {
-                    const el = e.currentTarget;
-                    if (!draftCanRestore) {
-                      draftBaselineRef.current = snapshotDraftBaseline();
-                    }
-                    const val = el.value || "";
-                    if (val.trim() && el.selectionStart <= 2 && el.selectionEnd <= 2) {
-                      window.setTimeout(() => revealDraftEnd(), 0);
-                    }
-                  }}
-                  onBeforeInput={(e) => {
-                    const el = e.currentTarget;
-                    const native = e.nativeEvent as InputEvent;
-                    draftBeforeInputRef.current = {
-                      value: el.value,
-                      selectionStart: el.selectionStart,
-                      selectionEnd: el.selectionEnd,
-                      inputType: native.inputType || "",
-                      rows: draftTextRows(draftsRef.current, indexRef.current).rows,
-                    };
-                  }}
-                  onChange={(e) => {
-                    const before = draftBeforeInputRef.current;
-                    draftBeforeInputRef.current = null;
-                    if (before && clearSelectedDraftSentences(before, e.target.value)) return;
-                    const editedAt = Date.now();
-                    draftLocalEditUntilRef.current = editedAt + 8000;
-                    const parts = dedupeParagraphs(e.target.value.split(/\n\s*\n/));
-                    const end = Math.max(index, parts.length - 1);
-                    const next: Record<number, string> = { ...draftsRef.current };
-                    for (let i = 0; i <= end; i++) {
-                      next[i] = (parts[i] || "").trim();
-                      draftManualEditAtRef.current[i] = editedAt;
-                    }
-                    draftsRef.current = next;
-                    setDrafts(next);
-                    markStudyActivity();
-                    setDraftCanRestore(JSON.stringify(next) !== draftBaselineRef.current);
-                  }}
-                  onBlur={() => {
-                    if (!sessionId) return;
-                    void saveProgress(
-                      sessionId,
-                      sessionProgressPayload({
-                        phase: phaseRef.current,
-                        index: indexRef.current,
-                        drafts: fullDraftSnapshot(draftsRef.current, sentencesRef.current.length),
-                        highlights,
-                        score,
-                        orientation,
-                      }),
+                <div className="draft-list" ref={draftListRef}>
+                  {visibleDraftIndexes(drafts, index, sentences.length).map((i) => {
+                    const text = String(drafts[i] ?? "");
+                    const done = !!text.trim();
+                    const isNow = i === index;
+                    return (
+                      <div
+                        key={i}
+                        className={`draft-row${isNow ? " draft-row-now" : ""}${done ? " draft-row-done" : ""}`}
+                        ref={isNow ? draftCurrentRowRef : undefined}
+                      >
+                        <button
+                          type="button"
+                          className="draft-no"
+                          title={`跳到第 ${i + 1} 句`}
+                          onClick={() => goToSentence(i)}
+                        >
+                          {i + 1}
+                        </button>
+                        <textarea
+                          ref={isNow ? draftTextareaRef : undefined}
+                          className={`draft draft-line${isNow && recording ? " draft-listening" : ""}`}
+                          value={text}
+                          rows={1}
+                          placeholder={isNow ? (recording ? "正在听写…" : "听写内容会出现在这里") : "（未听写）"}
+                          onFocus={(e) => {
+                            const el = e.currentTarget;
+                            if (!draftCanRestore) {
+                              draftBaselineRef.current = snapshotDraftBaseline();
+                            }
+                            if (isNow && text.trim() && el.selectionStart <= 2 && el.selectionEnd <= 2) {
+                              window.setTimeout(() => revealDraftEnd(), 0);
+                            }
+                            autosizeDraftLine(el);
+                          }}
+                          onChange={(e) => {
+                            updateSentenceDraft(i, e.target.value);
+                            autosizeDraftLine(e.currentTarget);
+                          }}
+                          onBlur={persistOpenDrafts}
+                        />
+                      </div>
                     );
-                    persistDraftsCache( draftsRef.current, indexRef.current);
-                  }}
-                />
+                  })}
+                </div>
                 <div className={`voice-pad${ipadStudio ? " voice-pad-ipad" : ""}`}>
                   {!ipadStudio ? (
                     <>
@@ -3912,7 +3827,6 @@ function Studio({
                         type="button"
                         className={recording ? "mic-on primary" : "primary"}
                         onClick={() => void toggleMic()}
-                        disabled={busy}
                       >
                         {recording ? "停止语音输入" : busy ? "正在识别..." : "语音输入"}
                       </button>
@@ -4139,3 +4053,5 @@ function fmt(seconds: number): string {
   const s = Math.floor(seconds % 60);
   return `${m}:${String(s).padStart(2, "0")}`;
 }
+
+
