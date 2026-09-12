@@ -1489,7 +1489,6 @@ function AuthPanel({
   user,
   onAuth,
   error = "",
-  requireAuth = false,
   loginOpen,
   onLoginOpenChange,
 }: {
