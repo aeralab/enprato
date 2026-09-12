@@ -1245,15 +1245,83 @@ function friendlyAuthError(err: unknown): string {
   return raw;
 }
 
+const CHEERS = {
+  welcome: ["哇！终于等到你，", "好棒啊！"],
+  payMonthly: ["哇，你这么美，还这么上进！", "真是太棒啦！"],
+  paidMonthly: ["请争取用最短的时间花最少的钱", "掌握一门语言哦。"],
+  payQuarterly: ["哇，你这么美，还这么有勇气，", "你一定行！"],
+  paidQuarterly: ["请一定要挑战成功哦，", "加油！"],
+  payYearly: ["哇，你这么美，还这么舍得投资自己，", "你真的太棒啦！"],
+  paidYearly: ["既然花了199，", "学会三门语言再走吧！"],
+} as const;
+
+type PayPlanCode = "monthly_30d" | "quarterly_90d" | "yearly_365d";
+type CheerLines = readonly string[];
+
+function payCheerText(plan: PayPlanCode): CheerLines {
+  if (plan === "quarterly_90d") return CHEERS.payQuarterly;
+  if (plan === "yearly_365d") return CHEERS.payYearly;
+  return CHEERS.payMonthly;
+}
+
+function paidCheerText(plan: PayPlanCode): CheerLines {
+  if (plan === "quarterly_90d") return CHEERS.paidQuarterly;
+  if (plan === "yearly_365d") return CHEERS.paidYearly;
+  return CHEERS.paidMonthly;
+}
+
+function CheerModal({
+  lines,
+  action,
+  onClose,
+}: {
+  lines: CheerLines;
+  action: string;
+  onClose: () => void;
+}) {
+  return (
+    <div className="auth-modal-backdrop cheer-backdrop" onClick={onClose}>
+      <div
+        className="auth-modal cheer-modal"
+        role="dialog"
+        aria-label="招呼"
+        onClick={(event) => event.stopPropagation()}
+      >
+        <p className="cheer-text">
+          {lines.map((line, index) => (
+            <span key={line}>
+              {line}
+              {index === lines.length - 1 ? (
+                <img className="cheer-heart" src="/cheer-heart.png" alt="" />
+              ) : null}
+            </span>
+          ))}
+        </p>
+        <button type="button" className="cheer-go" onClick={onClose}>
+          {action}
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function AuthScreen({ error, onAuthed }: { error: string; onAuthed: (user: CurrentUser) => void }) {
+  const [welcomeOpen, setWelcomeOpen] = useState(false);
   return (
     <div className="auth-gate">
       <div className="auth-gate-panel">
         <p className="auth-wordmark">ENPRATO</p>
         <h1>学习你感兴趣的语言，<br className="auth-title-break" />用最快的时间掌握它。</h1>
         <p className="auth-lead">导入你喜欢的视频或音频，通过听、说、写反复练习。</p>
-        <EmailAuthForm error={error} onAuthed={onAuthed} />
+        <EmailAuthForm
+          error={error}
+          onAuthed={(user, meta) => {
+            onAuthed(user);
+            if (meta?.firstRegister) setWelcomeOpen(true);
+          }}
+        />
       </div>
+      {welcomeOpen ? <CheerModal lines={CHEERS.welcome} action="好" onClose={() => setWelcomeOpen(false)} /> : null}
     </div>
   );
 }
@@ -1263,7 +1331,7 @@ function EmailAuthForm({
   onAuthed,
 }: {
   error?: string;
-  onAuthed: (user: CurrentUser) => void;
+  onAuthed: (user: CurrentUser, meta?: { firstRegister?: boolean }) => void;
 }) {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -1282,7 +1350,7 @@ function EmailAuthForm({
     try {
       try {
         const user = await registerAccount(trimmed, password);
-        onAuthed(user);
+        onAuthed(user, { firstRegister: true });
         return;
       } catch (err) {
         const raw = err instanceof Error ? err.message : String(err || "");
@@ -1434,38 +1502,51 @@ function AuthPanel({
 }) {
   const [popoverOpen, setPopoverOpen] = useState(false);
   const [internalLoginOpen, setInternalLoginOpen] = useState(false);
+  const [welcomeOpen, setWelcomeOpen] = useState(false);
   const guestLoginOpen = loginOpen ?? internalLoginOpen;
   const setGuestLoginOpen = onLoginOpenChange ?? setInternalLoginOpen;
   async function logout() {
-    await logoutAccount();
+    try {
+      await logoutAccount();
+    } catch {
+      /* still leave this browser session so another account can log in */
+    }
+    setPopoverOpen(false);
+    setGuestLoginOpen(true);
     onAuth(null);
   }
   if (user) {
     const trialLabel = `已学习素材 ${user.trial.used} / ${user.trial.limit}`;
     return (
-      <div className="account-compact">
-        <button type="button" className="account-status" onClick={() => setPopoverOpen(!popoverOpen)}>
-          <strong>{user.membership.status === "active" ? "Enprato Pro" : "免费体验"}</strong>
-          <span>{user.membership.status === "active" ? "" : `已学习素材 ${user.trial.used} / ${user.trial.limit}`}</span>
-          <b>我的账号</b>
-        </button>
-        {popoverOpen ? (
-          <div className="account-popover">
-            <p className="account-email">{user.login_label || user.email || "已登录"}</p>
-            <p>会员状态：{user.membership.status === "active" ? "Enprato Pro" : "免费体验"}</p>
-            <p>{trialLabel}</p>
-            {user.membership.status === "active" ? <p>到期时间：{formatLicenseDate(user.membership.expires_at)}</p> : null}
-            <button type="button" className="ghost" onClick={() => void logout()}>退出登录</button>
-          </div>
-        ) : null}
-      </div>
+      <>
+        <div className="account-compact">
+          <button type="button" className="account-status" onClick={() => setPopoverOpen(!popoverOpen)}>
+            <strong>{user.membership.status === "active" ? "Enprato Pro" : "免费体验"}</strong>
+            <span>{user.membership.status === "active" ? "" : `已学习素材 ${user.trial.used} / ${user.trial.limit}`}</span>
+            <b>我的账号</b>
+          </button>
+          <button type="button" className="account-logout" onClick={() => void logout()}>
+            退出登录
+          </button>
+          {popoverOpen ? (
+            <div className="account-popover">
+              <p className="account-email">{user.login_label || user.email || "已登录"}</p>
+              <p>会员状态：{user.membership.status === "active" ? "Enprato Pro" : "免费体验"}</p>
+              <p>{trialLabel}</p>
+              {user.membership.status === "active" ? <p>到期时间：{formatLicenseDate(user.membership.expires_at)}</p> : null}
+              <button type="button" className="account-logout" onClick={() => void logout()}>
+                退出登录
+              </button>
+            </div>
+          ) : null}
+        </div>
+        {welcomeOpen ? <CheerModal lines={CHEERS.welcome} action="好" onClose={() => setWelcomeOpen(false)} /> : null}
+      </>
     );
   }
   return (
     <>
-      {requireAuth ? (
-        <button type="button" className="account-register" onClick={() => setGuestLoginOpen(true)}>登录</button>
-      ) : null}
+      <button type="button" className="account-register" onClick={() => setGuestLoginOpen(true)}>登录</button>
       {guestLoginOpen ? (
         <div className="auth-modal-backdrop" onClick={() => setGuestLoginOpen(false)}>
           <div
@@ -1480,9 +1561,10 @@ function AuthPanel({
             <h2>登录 / 注册</h2>
             <EmailAuthForm
               error={error}
-              onAuthed={(next) => {
+              onAuthed={(next, meta) => {
                 onAuth(next);
                 setGuestLoginOpen(false);
+                if (meta?.firstRegister) setWelcomeOpen(true);
               }}
             />
           </div>
@@ -1518,6 +1600,8 @@ function PayPanel({
   const [qrSrc, setQrSrc] = useState("");
   const [groupInviteOpen, setGroupInviteOpen] = useState(false);
   const [guestPrompt, setGuestPrompt] = useState<"pay" | "trial" | null>(null);
+  const [payCheer, setPayCheer] = useState<PayPlanCode | null>(null);
+  const [paidCheer, setPaidCheer] = useState<PayPlanCode | null>(null);
   const memberActive = user?.membership.status === "active";
   const quarterlyMember = memberActive && user?.membership.plan === "quarterly_90d";
   const trialUsed = user ? user.trial.used : license?.trial_uses ?? 0;
@@ -1525,14 +1609,16 @@ function PayPanel({
   const trialRemaining = user ? user.trial.remaining : Math.max(0, trialLimit - trialUsed);
   const payBusy = busy || licenseBusy;
 
-  function isQuarterlyOrder(order: Order | null) {
-    return (order?.plan || order?.plan_code) === "quarterly_90d";
+  function planFromOrder(order: Order): PayPlanCode {
+    const code = order.plan || order.plan_code;
+    if (code === "quarterly_90d" || code === "yearly_365d") return code;
+    return "monthly_30d";
   }
 
   function markPaid(order: Order) {
     setPayOrder(order);
-    setMessage("支付成功，会员已开通。");
-    if (isQuarterlyOrder(order)) setGroupInviteOpen(true);
+    setMessage("");
+    setPaidCheer(planFromOrder(order));
   }
 
   useEffect(() => {
@@ -1603,13 +1689,19 @@ function PayPanel({
     setMessage("免费深度学习的 5 个素材已用完。开通会员后可继续学习新的素材。");
   }
 
-  async function startPay(plan: "monthly_30d" | "quarterly_90d" | "yearly_365d") {
+  async function startPay(plan: PayPlanCode) {
     setMessage("");
     if (!user) {
       setGuestPrompt("pay");
       return;
     }
     setGuestPrompt(null);
+    setPayOrder(null);
+    setQrSrc("");
+    setPayCheer(plan);
+  }
+
+  async function createPayOrder(plan: PayPlanCode) {
     setBusy(true);
     try {
       setPayOrder(await createOrder(plan));
@@ -1618,6 +1710,19 @@ function PayPanel({
     } finally {
       setBusy(false);
     }
+  }
+
+  function closePayCheer() {
+    const plan = payCheer;
+    setPayCheer(null);
+    if (plan) void createPayOrder(plan);
+  }
+
+  function closePaidCheer() {
+    const plan = paidCheer;
+    setPaidCheer(null);
+    setMessage("会员已开通。");
+    if (plan === "quarterly_90d") setGroupInviteOpen(true);
   }
 
   async function mockConfirm() {
@@ -1750,6 +1855,12 @@ function PayPanel({
           </button>
         </form>
       </details>
+      {payCheer ? (
+        <CheerModal lines={payCheerText(payCheer)} action="去支付" onClose={closePayCheer} />
+      ) : null}
+      {paidCheer ? (
+        <CheerModal lines={paidCheerText(paidCheer)} action="好" onClose={closePaidCheer} />
+      ) : null}
       {groupInviteOpen ? (
         <div className="auth-modal-backdrop" onClick={() => setGroupInviteOpen(false)}>
           <div
