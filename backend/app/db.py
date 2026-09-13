@@ -656,6 +656,48 @@ def touch_last_seen(conn: sqlite3.Connection, user_id: str) -> None:
     )
 
 
+def shanghai_calendar_date(value: str | datetime) -> str:
+    dt = value if isinstance(value, datetime) else parse_time(value)
+    return (dt + timedelta(hours=8)).date().isoformat()
+
+
+def shanghai_today() -> str:
+    return shanghai_calendar_date(utc_now())
+
+
+def ops_daily_series(conn: sqlite3.Connection, days: int = 30) -> list[dict[str, Any]]:
+    today = datetime.fromisoformat(shanghai_today())
+    start = today - timedelta(days=max(1, days) - 1)
+    registered: dict[str, int] = {}
+    paid_fen: dict[str, int] = {}
+    for (created_at,) in conn.execute(
+        "SELECT created_at FROM users WHERE created_at IS NOT NULL AND created_at!=''"
+    ):
+        day = shanghai_calendar_date(created_at)
+        registered[day] = registered.get(day, 0) + 1
+    for row in conn.execute(
+        "SELECT COALESCE(NULLIF(paid_at,''), created_at) AS paid_time, amount_fen "
+        "FROM orders WHERE status='paid'"
+    ):
+        if not row["paid_time"]:
+            continue
+        day = shanghai_calendar_date(row["paid_time"])
+        paid_fen[day] = paid_fen.get(day, 0) + int(row["amount_fen"] or 0)
+    series: list[dict[str, Any]] = []
+    cursor = start.date()
+    for _ in range(max(1, days)):
+        key = cursor.isoformat()
+        series.append(
+            {
+                "date": key,
+                "registered": registered.get(key, 0),
+                "paid_amount_yuan": round(paid_fen.get(key, 0) / 100, 2),
+            }
+        )
+        cursor += timedelta(days=1)
+    return series
+
+
 def ops_overview(online_minutes: int = 5) -> dict[str, Any]:
     now = iso()
     online_since = iso(utc_now() - timedelta(minutes=max(1, online_minutes)))
@@ -665,6 +707,8 @@ def ops_overview(online_minutes: int = 5) -> dict[str, Any]:
             return int(conn.execute(sql, args).fetchone()[0])
 
         paid_fen = count("SELECT COALESCE(SUM(amount_fen),0) FROM orders WHERE status='paid'")
+        daily = ops_daily_series(conn)
+        today = daily[-1] if daily else {"registered": 0, "paid_amount_yuan": 0.0}
         return {
             "registered_users": count("SELECT COUNT(*) FROM users"),
             "paid_users": count("SELECT COUNT(DISTINCT user_id) FROM orders WHERE status='paid'"),
@@ -679,6 +723,11 @@ def ops_overview(online_minutes: int = 5) -> dict[str, Any]:
             ),
             "as_of": now,
             "online_window_minutes": max(1, online_minutes),
+            "timezone": "Asia/Shanghai",
+            "daily_days": len(daily),
+            "daily": daily,
+            "today_registered": today["registered"],
+            "today_paid_amount_yuan": today["paid_amount_yuan"],
         }
     finally:
         conn.close()

@@ -58,12 +58,43 @@ class OpsStatsTests(unittest.TestCase):
         self.assertEqual(body["paid_users"], 1)
         self.assertEqual(body["paid_amount_yuan"], 19.9)
         self.assertEqual(body["online_users"], 1)
+        self.assertEqual(body["timezone"], "Asia/Shanghai")
+        self.assertEqual(len(body["daily"]), 30)
+        self.assertEqual(body["daily"][-1]["date"], db.shanghai_today())
+        self.assertEqual(body["daily"][-1]["registered"], 1)
+        self.assertEqual(body["daily"][-1]["paid_amount_yuan"], 19.9)
+        self.assertEqual(body["today_registered"], 1)
+        self.assertEqual(body["today_paid_amount_yuan"], 19.9)
+        self.assertEqual(sum(day["registered"] for day in body["daily"]), 1)
         self.assertNotIn("email", body)
         self.assertNotIn("ops@example.com", stats.text)
         html = self.client.get("/api/ops?k=ops-token-for-tests-only", follow_redirects=True)
         self.assertEqual(html.status_code, 200)
         self.assertIn("注册人数", html.text)
+        self.assertIn("每日注册", html.text)
+        self.assertIn("每日付费金额", html.text)
+        self.assertIn("regChart", html.text)
+        self.assertIn("chart-svg", html.text)
         self.assertIn("noindex", html.text)
+
+    def test_daily_series_uses_shanghai_calendar_days(self):
+        from datetime import datetime, timedelta, timezone
+
+        user = db.create_user("ops-day@example.com", "hash")
+        today = datetime.fromisoformat(db.shanghai_today())
+        past = (today - timedelta(days=3)).date()
+        stamp = datetime(past.year, past.month, past.day, 4, 0, 0, tzinfo=timezone.utc)
+        conn = db.connect()
+        try:
+            conn.execute("UPDATE users SET created_at=? WHERE id=?", (db.iso(stamp), user["id"]))
+        finally:
+            conn.close()
+        stats = self.client.get("/api/ops/stats?k=ops-token-for-tests-only")
+        body = stats.json()
+        day = next(item for item in body["daily"] if item["date"] == past.isoformat())
+        self.assertEqual(day["registered"], 1)
+        self.assertEqual(body["daily"][-1]["registered"], 0)
+        self.assertNotIn("ops-day@example.com", stats.text)
 
     def test_unset_token_hides_page(self):
         os.environ.pop("ENPRATO_OPS_TOKEN", None)
